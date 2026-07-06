@@ -1,8 +1,46 @@
 # osgb2b3dm — OSGB 到 3D Tiles 转换器
 
-将 OpenSceneGraph Binary (OSGB) 格式的倾斜摄影/城市三维瓦片数据转换为 Cesium 3D Tiles (B3DM + tileset.json) 格式。
+将 OpenSceneGraph Binary (OSGB) 格式的倾斜摄影/城市三维瓦片数据转换为 Cesium 3D Tiles 格式。
 
 基于 [fanvanzh/3dtiles](https://github.com/fanvanzh/3dtiles) 的 Rust 版本改写为 C++17。
+
+## 项目结构
+
+```
+.
+├── CMakeLists.txt              # CMake 构建（两个 target）
+├── README.md
+├── src/                        # 3D Tiles 1.0（输出 .b3dm）
+│   ├── main.cpp                # 入口：环境配置、参数解析
+│   ├── osgb_converter.cpp/.h   # 主控：metadata.xml 解析、坐标初始化、tileset.json 生成
+│   ├── osg_gltf_converter.cpp/.h  # 核心：OSG→glTF→B3DM
+│   ├── coordinate_system.cpp/.h   # 坐标系统抽象 (ENU/EPSG/WKT)
+│   ├── coordinate_transformer.cpp/.h  # WGS84/ECEF/ENU 变换
+│   ├── geoid_height.cpp/.h     # 大地水准面高度校正 (EGM84/96/2008)
+│   ├── mesh_processor.cpp/.h   # 可选压缩 (Draco/KTX2/meshopt)
+│   └── utils.h                 # 日志、文件 I/O、二进制序列化、包围盒
+├── src1.1/                     # 3D Tiles 1.1（输出 .glb + 3DTILES_content_gltf）
+│   └── （文件与 src/ 对应，差异见下方说明）
+├── out/                        # CMake 构建输出
+└── display/                    # CesiumJS 网页查看器（独立 git 仓库）
+    ├── server.js               # Node.js 静态文件服务器
+    ├── index.html              # 主页面
+    ├── index_debug.html        # Debug 诊断页面
+    ├── cli.txt                 # 启动命令备忘
+    └── Cesium/                 # CesiumJS 1.134 预编译包
+```
+
+## 两个版本对比
+
+| | src/ (1.0) | src1.1/ (1.1) |
+|---|---|---|
+| **tileset.json** | `"asset.version": "1.0"` | `"asset.version": "1.1"` + `extensionsUsed`/`extensionsRequired` |
+| **内容格式** | B3DM 封装 (.b3dm) | 原始 glTF (.glb) |
+| **扩展** | 无 | `3DTILES_content_gltf` |
+| **Feature/Batch Table** | 有（28 字节头 + JSON） | 无（直接 GLB） |
+| **构建目标** | `osgb_converter` | `osgb_converter_1_1` |
+
+核心差异：3D Tiles 1.1 原生支持 glTF 内容，不需要 B3DM 包裹。src1.1 调用 `osgb2glb_buf()` 直接输出 GLB，省去了 28 字节头、Feature Table、Batch Table。
 
 ## 快速开始
 
@@ -43,15 +81,15 @@ cmake -B out/build/x64-Debug -G Ninja \
   -DCMAKE_TOOLCHAIN_FILE=D:/vcpkg/scripts/buildsystems/vcpkg.cmake \
   -DCMAKE_BUILD_TYPE=Debug
 
-# 3. 编译
-cmake --build out/build/x64-Debug --config Debug
+# 3. 编译（两个 target 一起编）
+cmake --build out/build/x64-Debug
 
-# 4. 运行程序前准备运行时依赖
-#    程序需要 osgPlugins、GDAL、PROJ 数据文件。
-#    将以下目录复制到可执行文件同级：
-#    - vcpkg/packages/osg_x64-windows/debug/lib/osgPlugins-3.6.5/
-#    - vcpkg/packages/gdal_x64-windows/debug/share/gdal/
-#    - vcpkg/packages/proj_x64-windows/debug/share/proj/
+# 产物：
+#   out/build/x64-Debug/osgb_converter.exe       ← 1.0 版
+#   out/build/x64-Debug/osgb_converter_1_1.exe   ← 1.1 版
+
+# 或只编其中一个：
+cmake --build out/build/x64-Debug --target osgb_converter_1_1
 ```
 
 ### Linux 构建
@@ -105,19 +143,21 @@ input_dir/
 
 ### 配置方式
 
-在 `src/main.cpp` 中直接修改硬编码配置：
+在 `src/main.cpp` 或 `src1.1/main.cpp` 中修改硬编码配置：
 
 ```cpp
 static const HardcodedConfig g_config = {
     /* input_dir         */ R"(E:\learning\data\1)",
-    /* output_dir        */ R"(E:\learning\data\output\tiles)",
-    /* config_json       */ "",                      // JSON: {"x":lon,"y":lat,"max_lvl":20}
-    /* geoid_model       */ "none",                  // none / egm84 / egm96 / egm2008
+    /* output_dir        */ R"(E:\learning\data\output\OSG_CJIAJIAbase3dtiles)",  // 1.0
+    // 或
+    /* output_dir        */ R"(E:\learning\data\output\OSG_CJIAJIAbase3dtiles_1_1)", // 1.1
+    /* config_json       */ "",
+    /* geoid_model       */ "none",         // none / egm84 / egm96 / egm2008
     /* geoid_path        */ "",
-    /* texture_compress  */ false,                   // 需 basisu
-    /* meshopt           */ false,                   // 需 meshoptimizer
-    /* draco             */ false,                   // 需 Draco
-    /* unlit             */ true,                    // KHR_materials_unlit
+    /* texture_compress  */ false,          // 需 basisu
+    /* meshopt           */ false,          // 需 meshoptimizer
+    /* draco             */ false,          // 需 Draco
+    /* unlit             */ true,           // KHR_materials_unlit
     /* override_lon/lat  */ 0.0,
     /* has_override_alt  */ false,
 };
@@ -126,7 +166,11 @@ static const HardcodedConfig g_config = {
 设置 `USE_HARDCODED_CONFIG` 为 `0` 可切换为命令行模式：
 
 ```bash
+# 1.0 版
 ./osgb_converter -i ./input -o ./output -c '{"x":120.0,"y":30.0,"max_lvl":20}' --enable-unlit
+
+# 1.1 版
+./osgb_converter_1_1 -i ./input -o ./output -c '{"x":120.0,"y":30.0,"max_lvl":20}' --enable-unlit
 ```
 
 ### 输出结构
@@ -136,10 +180,40 @@ output_dir/
 ├── tileset.json              ← 3D Tiles 根 tileset
 └── Data/
     └── Tile_-051_+050/
-        ├── Tile_-051_+050.b3dm
-        ├── Tile_-051_+050_L14_0.b3dm
+        ├── Tile_-051_+050.b3dm    ← 1.0 输出
+        ├── Tile_-051_+050.glb     ← 1.1 输出（原始 glTF）
         └── ...
 ```
+
+## 3D Tiles Viewer（display/）
+
+`display/` 是一个独立的 Node.js + CesiumJS 网页服务器，用于在浏览器中查看转换结果。同时支持 1.0 和 1.1。
+
+### 使用
+
+```bash
+cd display
+npm install   # 如果没有 node，去 https://nodejs.org 下载安装
+
+# 启动（默认加载 1.1 输出）
+node server.js
+
+# 或指定其他模型目录
+node server.js E:/learning/data/output/OSG_CJIAJIAbase3dtiles      # 1.0
+node server.js E:/learning/data/output/OSG_CJIAJIAbase3dtiles_1_1  # 1.1
+```
+
+浏览器打开 `http://localhost:8080`。
+
+Debug 页面：`http://localhost:8080/index_debug.html`（显示 tile 加载统计、包围盒等）。
+
+参数：`?model=/tiles/tileset.json` 可指定 tileset 路径。
+
+### 技术栈
+
+- **CesiumJS 1.134** — 预编译包，Cesium/ 目录下
+- **Node.js** 内置模块 — 零 npm 依赖
+- CesiumJS 自动识别 `tileset.json` 中的 `asset.version`，同时支持 1.0 (.b3dm) 和 1.1 (.glb + `3DTILES_content_gltf`)
 
 ## 架构
 
@@ -173,14 +247,15 @@ metadata.xml ──→ osgb_converter.cpp（主控）
     │  WriteGltfSceneToStream() → GLB  │
     └──────────────────────────────────┘
                      │
+          ┌──────────┴──────────┐
+          ▼                     ▼
+    1.0: B3DM 封装          1.1: 直接写 GLB
+    (28B header + FT + BT)  (.glb 文件)
+    → 写入 .b3dm            + 3DTILES_content_gltf
+          │                     │
+          └──────────┬──────────┘
                      ▼
-              B3DM 封装 (28B header)
-              + Feature Table JSON
-              + Batch Table JSON
-              + GLB Binary
-                     │
-                     ▼
-              写入 .b3dm 文件
+              写入 tileset.json
 ```
 
 ### 模块职责
@@ -189,7 +264,7 @@ metadata.xml ──→ osgb_converter.cpp（主控）
 |------|------|
 | `main.cpp` | 入口：环境配置 (GDAL/PROJ)、参数解析、调用 `convert_osgb()` |
 | `osgb_converter.cpp/.h` | 主控：metadata.xml 解析、坐标系统初始化、瓦片遍历、tileset.json 输出 |
-| `osg_gltf_converter.cpp/.h` | 核心转换：OSG 场景图→glTF Model→GLB buffer→B3DM buffer |
+| `osg_gltf_converter.cpp/.h` | 核心转换：OSG 场景图→glTF Model→GLB buffer→B3DM buffer（1.0）/ GLB file（1.1） |
 | `coordinate_system.cpp/.h` | 坐标系统抽象层 (ENU/EPSG/WKT)，`std::variant` 多态 |
 | `coordinate_transformer.cpp/.h` | 坐标变换：WGS84↔ECEF↔局部ENU、Z-up↔Y-up 轴转换 |
 | `geoid_height.cpp/.h` | GeographicLib 封装，大地水准面高度校正 (EGM84/96/2008) |
@@ -203,6 +278,21 @@ metadata.xml ──→ osgb_converter.cpp（主控）
 2. **硬编码配置**：开发阶段不需要每次传命令行参数，直接修改 `main.cpp` 中的 `g_config` 结构体即可。
 
 3. **`model.buffers` 陷阱**：`tinygltf::Buffer` 写入数据后，**必须** `model.buffers.push_back(buffer)`，否则 GLB 不包含 BIN chunk，Cesium 加载后无模型显示。
+
+4. **CMakeLists.txt 重构**：公共依赖提取为 `osgb_converter_deps` INTERFACE 库，通过 `configure_osgb_target()` CMake 函数消除两个 target 的重复配置。新增 target 只需 3 行：`set(SOURCES)` → `add_executable` → `configure_osgb_target`。
+
+### 1.0 到 1.1 代码差异
+
+src1.1 相比 src 只改了 4 个文件：
+
+| 文件 | 改动 |
+|------|------|
+| `osg_gltf_converter.h` | 新增 `do_tile_job_1_1()`、`encode_tile_json_1_1()` 声明 |
+| `osg_gltf_converter.cpp` | 新增两个函数：输出 .glb 而非 .b3dm；JSON 含 `3DTILES_content_gltf` 扩展 |
+| `osgb_converter.cpp` | `version: "1.1"`、`extensionsUsed`/`extensionsRequired`、调用 1.1 函数 |
+| `main.cpp` | 输出目录改为 `..._1_1` |
+
+其余 10 个文件（坐标系统、大地水准面、网格处理等）完全相同。
 
 ## 参数说明
 
