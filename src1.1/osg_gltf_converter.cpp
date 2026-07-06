@@ -1168,10 +1168,8 @@ std::string encode_tile_json_1_1(osg_tree& tree, double x, double y) {
         std::string uri = "./" + replace(file_name, ".osgb", tree.type != 2 ? ".glb" : "o.glb");
         tile += "\"" + uri + "\",";
         // 3D Tiles 1.1: declare 3DTILES_content_gltf extension on content
-        // Note: no content-level boundingVolume — CesiumJS will use
-        // the tile-level bbox (already extended from children) or
-        // compute from geometry, avoiding tight-box culling gaps.
-        tile += " \"extensions\":{\"3DTILES_content_gltf\":{}}";
+        tile += " \"extensions\":{\"3DTILES_content_gltf\":{}},";
+        tile += bbox_str;
         tile += "}";
     }
 
