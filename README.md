@@ -312,3 +312,21 @@ src1.1 相比 src 只改了 4 个文件：
 ## 许可证
 
 基于 [fanvanzh/3dtiles](https://github.com/fanvanzh/3dtiles) 改写，遵循原项目许可证。
+
+## 仓库
+
+| 目录 | 仓库 | 远程 |
+|------|------|------|
+| `osg_cjiajia_base3dtiles/` | 转换器主仓库 | `github.com/Elionjack/osg_c-_base_fanvanzh-3dtiles` |
+| `display/` | CesiumJS 查看器（独立仓库） | 本地，未推送 |
+
+### 转换器提交历史
+
+```
+7c420d4 Restore content-level boundingVolume in 1.1 tile JSON
+0d6aded Fix tile-edge gaps: remove tight content-level boundingVolume
+5565de1 Update README: document both 1.0/1.1 targets + display viewer
+84a8569 Add 3D Tiles 1.1 output support (src1.1/)
+582cad3 Add README with usage guide and architecture docs
+0aef0a0 Initial commit: osgb2b3dm - OSGB to 3D Tiles converter
+```
