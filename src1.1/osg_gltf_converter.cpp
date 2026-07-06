@@ -1,0 +1,1189 @@
+#include "osg_gltf_converter.h"
+#include "coordinate_transformer.h"
+
+#include <osg/Material>
+#include <osg/PagedLOD>
+#include <osgDB/ReadFile>
+#include <osgDB/ConvertUTF>
+#include <osgUtil/SmoothingVisitor>
+#include <Eigen/Eigen>
+
+#include <set>
+#include <map>
+#include <sstream>
+#include <cstdint>
+#include <limits>
+#include <cstdlib>
+
+#define TINYGLTF_IMPLEMENTATION
+#include <tiny_gltf.h>
+
+#ifdef HAS_STB
+#include <stb_image_write.h>   // stbi_write_jpg_to_mem
+#endif
+
+// OSG plugin registration (needed for static linking on Linux/macOS)
+#if defined(__unix__) || defined(__APPLE__)
+#include <osgDB/Registry>
+USE_OSGPLUGIN(osg)
+USE_OSGPLUGIN(osg2)
+USE_OSGPLUGIN(rgb)
+USE_OSGPLUGIN(tga)
+USE_OSGPLUGIN(jpeg)
+USE_OSGPLUGIN(png)
+USE_SERIALIZER_WRAPPER_LIBRARY(osg)
+#endif
+
+using namespace std;
+
+#ifdef max
+#undef max
+#endif
+#ifdef min
+#undef min
+#endif
+
+// ============================================================
+// Global transformer (replaces Rust-exposed global state)
+// ============================================================
+static coords::CoordinateTransformer* g_transformer = nullptr;
+
+coords::CoordinateTransformer* GetGlobalTransformer() {
+    return g_transformer;
+}
+
+void SetGlobalTransformer(coords::CoordinateTransformer* t) {
+    g_transformer = t;
+}
+
+// ============================================================
+// OSG path encoding helpers
+// ============================================================
+static std::string normalize_path(const char* path) {
+    if (!path) return std::string();
+#ifdef _WIN32
+    std::string p(path);
+    const std::string uncPrefix = R"(\\?\UNC\)";
+    if (p.rfind(uncPrefix, 0) == 0) return R"(\\)" + p.substr(uncPrefix.length());
+    const std::string longPrefix = R"(\\?\)";
+    if (p.rfind(longPrefix, 0) == 0) return p.substr(longPrefix.length());
+    return p;
+#else
+    return std::string(path);
+#endif
+}
+
+static std::string osg_string(const char* path) {
+#ifdef WIN32
+    return osgDB::convertStringFromUTF8toCurrentCodePage(normalize_path(path));
+#else
+    return std::string(path);
+#endif
+}
+
+static std::string utf8_string(const char* path) {
+#ifdef WIN32
+    return osgDB::convertStringFromCurrentCodePageToUTF8(path);
+#else
+    return std::string(path);
+#endif
+}
+
+// ============================================================
+// OSG Plugin logging
+// ============================================================
+static void log_osg_plugin_info() {
+    fprintf(stderr, "\n=== OpenSceneGraph Plugin Loading ===\n");
+    osgDB::Registry* registry = osgDB::Registry::instance();
+    const char* osg_lib_path = getenv("OSG_LIBRARY_PATH");
+    fprintf(stderr, "OSG_LIBRARY_PATH: %s\n", osg_lib_path ? osg_lib_path : "NOT SET");
+    const auto& libPaths = registry->getLibraryFilePathList();
+    fprintf(stderr, "OSG Library Search Paths (%zu):\n", libPaths.size());
+    for (size_t i = 0; i < libPaths.size(); ++i)
+        fprintf(stderr, "  [%zu] %s\n", i, libPaths[i].c_str());
+    fprintf(stderr, "=== End OSG Plugin Info ===\n\n");
+}
+
+// ============================================================
+// InfoVisitor - traverse OSG node tree to collect geometry
+// ============================================================
+class InfoVisitor : public osg::NodeVisitor {
+    std::string path;
+public:
+    InfoVisitor(std::string _path, bool loadAllType = false)
+        : osg::NodeVisitor(TRAVERSE_ALL_CHILDREN)
+        , path(_path), is_loadAllType(loadAllType), is_pagedlod(loadAllType) {}
+
+    ~InfoVisitor() {}
+
+    void apply(osg::Geometry& geometry) {
+        if (geometry.getVertexArray() == nullptr
+            || geometry.getVertexArray()->getDataSize() == 0U
+            || geometry.getNumPrimitiveSets() == 0U)
+            return;
+
+        if (is_pagedlod)
+            geometry_array.push_back(&geometry);
+        else
+            other_geometry_array.push_back(&geometry);
+
+        // Coordinate correction using global transformer
+        coords::CoordinateTransformer* transformer = GetGlobalTransformer();
+        bool needs_transform = transformer && transformer->HasGeoReference();
+
+        if (needs_transform) {
+            osg::Vec3Array* vertexArr = (osg::Vec3Array*)geometry.getVertexArray();
+
+            // 1. Compute bounding box
+            glm::dvec3 Min(DBL_MAX), Max(-DBL_MAX);
+            for (int vi = 0; vi < (int)vertexArr->size(); vi++) {
+                osg::Vec3d v = vertexArr->at(vi);
+                glm::dvec3 vert(v.x(), v.y(), v.z());
+                Min = glm::min(vert, Min);
+                Max = glm::max(vert, Max);
+            }
+
+            // 2. Correct 8 corners of bounding box
+            auto Correction = [&](glm::dvec3 pt) { return transformer->ToLocalENU(pt); };
+            vector<glm::dvec4> Orig(8), Corr(8);
+            Orig[0] = glm::dvec4(Min.x, Min.y, Min.z, 1);
+            Orig[1] = glm::dvec4(Max.x, Min.y, Min.z, 1);
+            Orig[2] = glm::dvec4(Min.x, Max.y, Min.z, 1);
+            Orig[3] = glm::dvec4(Min.x, Min.y, Max.z, 1);
+            Orig[4] = glm::dvec4(Max.x, Max.y, Min.z, 1);
+            Orig[5] = glm::dvec4(Min.x, Max.y, Max.z, 1);
+            Orig[6] = glm::dvec4(Max.x, Min.y, Max.z, 1);
+            Orig[7] = glm::dvec4(Max.x, Max.y, Max.z, 1);
+            for (int i = 0; i < 8; i++)
+                Corr[i] = glm::dvec4(Correction(glm::dvec3(Orig[i])), 1);
+
+            // 3. SVD least-squares to find best-fit transform
+            Eigen::MatrixXd A(8, 4), B(8, 4);
+            for (int r = 0; r < 8; r++) {
+                for (int c = 0; c < 4; c++) {
+                    A(r, c) = (&Orig[r].x)[c];
+                    B(r, c) = (&Corr[r].x)[c];
+                }
+            }
+            Eigen::BDCSVD<Eigen::MatrixXd> SVD(A, Eigen::ComputeThinU | Eigen::ComputeThinV);
+            Eigen::MatrixXd X = SVD.solve(B);
+
+            // 4. Apply correction matrix to all vertices
+            glm::dmat4 Transform(
+                X(0,0), X(0,1), X(0,2), X(0,3),
+                X(1,0), X(1,1), X(1,2), X(1,3),
+                X(2,0), X(2,1), X(2,2), X(2,3),
+                X(3,0), X(3,1), X(3,2), X(3,3));
+
+            for (int vi = 0; vi < (int)vertexArr->size(); vi++) {
+                osg::Vec3d v = vertexArr->at(vi);
+                glm::dvec4 v4 = Transform * glm::dvec4(v.x(), v.y(), v.z(), 1);
+                vertexArr->at(vi) = osg::Vec3d(v4.x, v4.y, v4.z);
+            }
+        }
+
+        // Collect texture
+        if (auto ss = geometry.getStateSet()) {
+            osg::Texture* tex = dynamic_cast<osg::Texture*>(ss->getTextureAttribute(0, osg::StateAttribute::TEXTURE));
+            if (tex) {
+                if (is_pagedlod)
+                    texture_array.insert(tex);
+                else
+                    other_texture_array.insert(tex);
+                texture_map[&geometry] = tex;
+            }
+        }
+    }
+
+    void apply(osg::PagedLOD& node) {
+        int n = node.getNumFileNames();
+        for (size_t i = 1; i < (size_t)n; i++) {
+            std::string file_name = path + "/" + node.getFileName(i);
+            sub_node_names.push_back(file_name);
+        }
+        if (!is_loadAllType) is_pagedlod = true;
+        traverse(node);
+        if (!is_loadAllType) is_pagedlod = false;
+    }
+
+public:
+    // PagedLOD geometry
+    std::vector<osg::Geometry*> geometry_array;
+    std::set<osg::Texture*> texture_array;
+    std::map<osg::Geometry*, osg::Texture*> texture_map;
+    std::vector<std::string> sub_node_names;
+    bool is_loadAllType;
+    bool is_pagedlod;
+    // Other geometry (non-PagedLOD)
+    std::vector<osg::Geometry*> other_geometry_array;
+    std::set<osg::Texture*> other_texture_array;
+};
+
+// ============================================================
+// Tree traversal
+// ============================================================
+osg_tree get_all_tree(std::string& file_name) {
+    osg_tree root_tile;
+    vector<string> fileNames = { file_name };
+
+    static bool logged = false;
+    if (!logged) { log_osg_plugin_info(); logged = true; }
+
+    InfoVisitor infoVisitor(get_parent(file_name));
+    {
+        osg::ref_ptr<osg::Node> root = osgDB::readNodeFiles(fileNames);
+        if (!root) {
+            std::string name = utf8_string(file_name.c_str());
+            LOG_E("read node files [%s] fail!", name.c_str());
+            return root_tile;
+        }
+        root_tile.file_name = file_name;
+        root_tile.type = 1;
+        root->accept(infoVisitor);
+    }
+
+    for (auto& i : infoVisitor.sub_node_names) {
+        osg_tree tree = get_all_tree(i);
+        if (!tree.file_name.empty()) {
+            if (tree.type == 0) {
+                for (auto& node : tree.sub_nodes)
+                    root_tile.sub_nodes.push_back(node);
+            } else {
+                root_tile.sub_nodes.push_back(tree);
+            }
+        }
+    }
+
+    // If node has both PagedLOD and Other geometry, wrap in a group node
+    if (!infoVisitor.other_geometry_array.empty() && !infoVisitor.geometry_array.empty()) {
+        osg_tree new_root_tile;
+        new_root_tile.type = 0;
+        new_root_tile.file_name = file_name;
+        osg_tree tile;
+        tile.type = 2;
+        tile.file_name = file_name;
+        new_root_tile.sub_nodes.push_back(root_tile);
+        new_root_tile.sub_nodes.push_back(tile);
+        root_tile = new_root_tile;
+    }
+    return root_tile;
+}
+
+// ============================================================
+// Bounding box helpers
+// ============================================================
+void expend_box(TileBox& box, TileBox& box_new) {
+    if (box_new.max.empty() || box_new.min.empty()) return;
+    if (box.max.empty()) { box.max = box_new.max; box.min = box_new.min; return; }
+    for (int i = 0; i < 3; i++) {
+        if (box.min[i] > box_new.min[i]) box.min[i] = box_new.min[i];
+        if (box.max[i] < box_new.max[i]) box.max[i] = box_new.max[i];
+    }
+}
+
+TileBox extend_tile_box(osg_tree& tree) {
+    TileBox box = tree.bbox;
+    for (auto& i : tree.sub_nodes) {
+        TileBox sub = extend_tile_box(i);
+        expend_box(box, sub);
+    }
+    tree.bbox = box;
+    return box;
+}
+
+void calc_geometric_error(osg_tree& tree) {
+    for (auto& i : tree.sub_nodes) calc_geometric_error(i);
+    if (tree.sub_nodes.empty()) {
+        tree.geometricError = get_geometric_error(tree.bbox);
+    } else {
+        double max_sub = 0.0;
+        for (auto& s : tree.sub_nodes)
+            max_sub = std::max(max_sub, s.geometricError);
+        tree.geometricError = max_sub * 2.0;
+    }
+}
+
+// ============================================================
+// Index component type selection
+// ============================================================
+static int pick_index_component_type(uint32_t max_index) {
+    if (max_index <= 255) return TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE;
+    if (max_index <= 65535) return TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT;
+    return TINYGLTF_COMPONENT_TYPE_UNSIGNED_INT;
+}
+
+// ============================================================
+// glTF write helpers
+// ============================================================
+struct OsgBuildState {
+    tinygltf::Buffer* buffer;
+    tinygltf::Model* model;
+    osg::Vec3f point_max;
+    osg::Vec3f point_min;
+    int draw_array_first;
+    int draw_array_count;
+};
+
+static void expand_bbox3d(osg::Vec3f& pmax, osg::Vec3f& pmin, osg::Vec3f p) {
+    pmax.x() = std::max(p.x(), pmax.x()); pmin.x() = std::min(p.x(), pmin.x());
+    pmax.y() = std::max(p.y(), pmax.y()); pmin.y() = std::min(p.y(), pmin.y());
+    pmax.z() = std::max(p.z(), pmax.z()); pmin.z() = std::min(p.z(), pmin.z());
+}
+
+static void expand_bbox2d(osg::Vec2f& pmax, osg::Vec2f& pmin, osg::Vec2f p) {
+    pmax.x() = std::max(p.x(), pmax.x()); pmin.x() = std::min(p.x(), pmin.x());
+    pmax.y() = std::max(p.y(), pmax.y()); pmin.y() = std::min(p.y(), pmin.y());
+}
+
+// Write index buffer and create accessor + buffer view
+static int write_index_vector(const std::vector<uint32_t>& indices, OsgBuildState* osgState,
+                              bool dracoCompressed) {
+    if (indices.empty()) return -1;
+
+    uint32_t max_idx = 0, min_idx = UINT32_MAX;
+    for (auto idx : indices) {
+        max_idx = std::max(max_idx, idx);
+        min_idx = std::min(min_idx, idx);
+    }
+
+    int compType = pick_index_component_type(max_idx);
+    if (dracoCompressed) {
+        tinygltf::Accessor acc;
+        acc.bufferView = -1;
+        acc.type = TINYGLTF_TYPE_SCALAR;
+        acc.componentType = compType;
+        acc.count = (int)indices.size();
+        acc.maxValues = {(double)max_idx};
+        acc.minValues = {(double)min_idx};
+        int accIdx = (int)osgState->model->accessors.size();
+        osgState->model->accessors.push_back(acc);
+        return accIdx;
+    }
+
+    unsigned bufStart = (unsigned)osgState->buffer->data.size();
+    switch (compType) {
+        case TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE:
+            for (auto idx : indices) put_val(osgState->buffer->data, (uint8_t)idx); break;
+        case TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT:
+            for (auto idx : indices) put_val(osgState->buffer->data, (uint16_t)idx); break;
+        default:
+            for (auto idx : indices) put_val(osgState->buffer->data, (uint32_t)idx); break;
+    }
+    alignment_buffer(osgState->buffer->data);
+
+    tinygltf::Accessor acc;
+    acc.bufferView = (int)osgState->model->bufferViews.size();
+    acc.type = TINYGLTF_TYPE_SCALAR;
+    acc.componentType = compType;
+    acc.count = (int)indices.size();
+    acc.maxValues = {(double)max_idx};
+    acc.minValues = {(double)min_idx};
+    int accIdx = (int)osgState->model->accessors.size();
+    osgState->model->accessors.push_back(acc);
+
+    tinygltf::BufferView bfv;
+    bfv.buffer = 0;
+    bfv.target = TINYGLTF_TARGET_ELEMENT_ARRAY_BUFFER;
+    bfv.byteOffset = (int)bufStart;
+    bfv.byteLength = (int)(osgState->buffer->data.size() - bufStart);
+    osgState->model->bufferViews.push_back(bfv);
+    return accIdx;
+}
+
+// Quad/quad-strip triangulation
+static bool triangulate_quads(const std::vector<uint32_t>& indices, GLenum mode,
+                              std::vector<uint32_t>& out) {
+    out.clear();
+    if (mode == GL_QUADS) {
+        if (indices.size() < 4 || indices.size() % 4 != 0) return false;
+        size_t nq = indices.size() / 4;
+        out.reserve(nq * 6);
+        for (size_t q = 0; q < nq; q++) {
+            size_t b = q * 4;
+            out.insert(out.end(), {indices[b], indices[b+1], indices[b+2],
+                                   indices[b], indices[b+2], indices[b+3]});
+        }
+        return !out.empty();
+    }
+    if (mode == GL_QUAD_STRIP) {
+        if (indices.size() < 4 || indices.size() % 2 != 0) return false;
+        size_t np = indices.size() / 2;
+        out.reserve((np - 1) * 6);
+        for (size_t i = 0; i + 1 < np; i++) {
+            size_t b = i * 2;
+            if (b + 3 >= indices.size()) break;
+            out.insert(out.end(), {indices[b], indices[b+1], indices[b+2],
+                                   indices[b+1], indices[b+3], indices[b+2]});
+        }
+        return !out.empty();
+    }
+    return false;
+}
+
+// Write vec3 array (positions or normals)
+static void write_vec3_array(osg::Vec3Array* v3f, OsgBuildState* osgState,
+                             osg::Vec3f& pmax, osg::Vec3f& pmin, bool isNormal = false) {
+    int vs = 0, ve = (int)v3f->size();
+    if (osgState->draw_array_first >= 0) {
+        vs = osgState->draw_array_first;
+        ve = osgState->draw_array_count + vs;
+    }
+    unsigned bufStart = (unsigned)osgState->buffer->data.size();
+    for (int vi = vs; vi < ve; vi++) {
+        osg::Vec3f p = v3f->at(vi);
+        if (isNormal) {
+            float len = p.length();
+            if (len < 0.0001f) p.set(0, 0, 1);
+            else if (std::abs(len - 1.0f) > 0.0001f) p.normalize();
+        }
+        put_val(osgState->buffer->data, p.x());
+        put_val(osgState->buffer->data, p.y());
+        put_val(osgState->buffer->data, p.z());
+        expand_bbox3d(pmax, pmin, p);
+    }
+    alignment_buffer(osgState->buffer->data);
+
+    tinygltf::Accessor acc;
+    acc.bufferView = (int)osgState->model->bufferViews.size();
+    acc.count = ve - vs;
+    acc.componentType = TINYGLTF_COMPONENT_TYPE_FLOAT;
+    acc.type = TINYGLTF_TYPE_VEC3;
+    acc.maxValues = {(double)pmax.x(), (double)pmax.y(), (double)pmax.z()};
+    acc.minValues = {(double)pmin.x(), (double)pmin.y(), (double)pmin.z()};
+    osgState->model->accessors.push_back(acc);
+
+    tinygltf::BufferView bfv;
+    bfv.buffer = 0;
+    bfv.target = TINYGLTF_TARGET_ARRAY_BUFFER;
+    bfv.byteOffset = (int)bufStart;
+    bfv.byteLength = (int)(osgState->buffer->data.size() - bufStart);
+    osgState->model->bufferViews.push_back(bfv);
+}
+
+// Write vec2 array (texcoords)
+static void write_vec2_array(osg::Vec2Array* v2f, OsgBuildState* osgState) {
+    int vs = 0, ve = (int)v2f->size();
+    if (osgState->draw_array_first >= 0) {
+        vs = osgState->draw_array_first;
+        ve = osgState->draw_array_count + vs;
+    }
+    osg::Vec2f pmax(-1e38f, -1e38f), pmin(1e38f, 1e38f);
+    unsigned bufStart = (unsigned)osgState->buffer->data.size();
+    for (int vi = vs; vi < ve; vi++) {
+        osg::Vec2f p = v2f->at(vi);
+        put_val(osgState->buffer->data, p.x());
+        put_val(osgState->buffer->data, p.y());
+        expand_bbox2d(pmax, pmin, p);
+    }
+    alignment_buffer(osgState->buffer->data);
+
+    tinygltf::Accessor acc;
+    acc.bufferView = (int)osgState->model->bufferViews.size();
+    acc.count = ve - vs;
+    acc.componentType = TINYGLTF_COMPONENT_TYPE_FLOAT;
+    acc.type = TINYGLTF_TYPE_VEC2;
+    acc.maxValues = {(double)pmax.x(), (double)pmax.y()};
+    acc.minValues = {(double)pmin.x(), (double)pmin.y()};
+    osgState->model->accessors.push_back(acc);
+
+    tinygltf::BufferView bfv;
+    bfv.buffer = 0;
+    bfv.target = TINYGLTF_TARGET_ARRAY_BUFFER;
+    bfv.byteOffset = (int)bufStart;
+    bfv.byteLength = (int)(osgState->buffer->data.size() - bufStart);
+    osgState->model->bufferViews.push_back(bfv);
+}
+
+struct DracoState {
+    bool compressed = false;
+    int bufferView = -1;
+    int posId = -1, normId = -1, texId = -1, batchId = -1;
+};
+
+// Write a single primitive set
+static void write_primitive(osg::Geometry* g, osg::PrimitiveSet* ps,
+                            OsgBuildState* osgState, int* pmtVertex, int* pmtNormal, int* pmtTexcd,
+                            DracoState* dracoState) {
+    tinygltf::Primitive prim;
+    prim.indices = (int)osgState->model->accessors.size();
+    osgState->draw_array_first = -1;
+
+    const GLenum gl_mode = ps->getMode();
+    const bool needs_tri = (gl_mode == GL_QUADS || gl_mode == GL_QUAD_STRIP);
+    std::vector<uint32_t> tri_indices;
+
+    // Write indices
+    osg::PrimitiveSet::Type t = ps->getType();
+    switch (t) {
+        case osg::PrimitiveSet::DrawElementsUBytePrimitiveType: {
+            auto* de = static_cast<const osg::DrawElementsUByte*>(ps);
+            if (needs_tri) {
+                std::vector<uint32_t> src; src.reserve(de->size());
+                for (unsigned m = 0; m < de->size(); m++) src.push_back(de->at(m));
+                if (triangulate_quads(src, gl_mode, tri_indices))
+                    prim.indices = write_index_vector(tri_indices, osgState, dracoState->compressed);
+            } else {
+                if (dracoState->compressed) {
+                    tinygltf::Accessor acc;
+                    acc.bufferView = -1; acc.type = TINYGLTF_TYPE_SCALAR;
+                    acc.componentType = TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE;
+                    acc.count = (int)de->size();
+                    prim.indices = (int)osgState->model->accessors.size();
+                    osgState->model->accessors.push_back(acc);
+                } else {
+                    std::vector<uint32_t> idx; idx.reserve(de->size());
+                    for (unsigned m = 0; m < de->size(); m++) idx.push_back(de->at(m));
+                    prim.indices = write_index_vector(idx, osgState, false);
+                }
+            }
+            break;
+        }
+        case osg::PrimitiveSet::DrawElementsUShortPrimitiveType: {
+            auto* de = static_cast<const osg::DrawElementsUShort*>(ps);
+            if (needs_tri) {
+                std::vector<uint32_t> src; src.reserve(de->size());
+                for (unsigned m = 0; m < de->size(); m++) src.push_back(de->at(m));
+                if (triangulate_quads(src, gl_mode, tri_indices))
+                    prim.indices = write_index_vector(tri_indices, osgState, dracoState->compressed);
+            } else {
+                if (dracoState->compressed) {
+                    tinygltf::Accessor acc;
+                    acc.bufferView = -1; acc.type = TINYGLTF_TYPE_SCALAR;
+                    acc.componentType = TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT;
+                    acc.count = (int)de->size();
+                    prim.indices = (int)osgState->model->accessors.size();
+                    osgState->model->accessors.push_back(acc);
+                } else {
+                    std::vector<uint32_t> idx; idx.reserve(de->size());
+                    for (unsigned m = 0; m < de->size(); m++) idx.push_back(de->at(m));
+                    prim.indices = write_index_vector(idx, osgState, false);
+                }
+            }
+            break;
+        }
+        case osg::PrimitiveSet::DrawElementsUIntPrimitiveType: {
+            auto* de = static_cast<const osg::DrawElementsUInt*>(ps);
+            if (needs_tri) {
+                std::vector<uint32_t> src; src.reserve(de->size());
+                for (unsigned m = 0; m < de->size(); m++) src.push_back(de->at(m));
+                if (triangulate_quads(src, gl_mode, tri_indices))
+                    prim.indices = write_index_vector(tri_indices, osgState, dracoState->compressed);
+            } else {
+                if (dracoState->compressed) {
+                    tinygltf::Accessor acc;
+                    acc.bufferView = -1; acc.type = TINYGLTF_TYPE_SCALAR;
+                    acc.componentType = TINYGLTF_COMPONENT_TYPE_UNSIGNED_INT;
+                    acc.count = (int)de->size();
+                    prim.indices = (int)osgState->model->accessors.size();
+                    osgState->model->accessors.push_back(acc);
+                } else {
+                    std::vector<uint32_t> idx; idx.reserve(de->size());
+                    for (unsigned m = 0; m < de->size(); m++) idx.push_back(de->at(m));
+                    prim.indices = write_index_vector(idx, osgState, false);
+                }
+            }
+            break;
+        }
+        case osg::PrimitiveSet::DrawArraysPrimitiveType: {
+            prim.indices = -1;
+            auto* da = dynamic_cast<osg::DrawArrays*>(ps);
+            osgState->draw_array_first = da->getFirst();
+            osgState->draw_array_count = da->getCount();
+            if (needs_tri && da->getCount() > 0) {
+                std::vector<uint32_t> src; src.reserve(da->getCount());
+                for (int i = 0; i < da->getCount(); i++) src.push_back(i);
+                if (triangulate_quads(src, gl_mode, tri_indices))
+                    prim.indices = write_index_vector(tri_indices, osgState, dracoState->compressed);
+            }
+            break;
+        }
+        default:
+            LOG_E("unsupported PrimitiveSet type: %d", (int)t);
+            return;
+    }
+
+    // Position
+    auto* varr = (osg::Vec3Array*)g->getVertexArray();
+    if (*pmtVertex > -1 && osgState->draw_array_first == -1) {
+        prim.attributes["POSITION"] = *pmtVertex;
+    } else {
+        if (dracoState->compressed) {
+            tinygltf::Accessor acc;
+            acc.bufferView = -1;
+            acc.componentType = TINYGLTF_COMPONENT_TYPE_FLOAT;
+            acc.count = (osgState->draw_array_first >= 0) ? osgState->draw_array_count : (int)varr->size();
+            acc.type = TINYGLTF_TYPE_VEC3;
+            osg::Vec3f pmax(-1e38f,-1e38f,-1e38f), pmin(1e38f,1e38f,1e38f);
+            int vs = (osgState->draw_array_first >= 0) ? osgState->draw_array_first : 0;
+            int ve = (osgState->draw_array_first >= 0) ? (osgState->draw_array_count + vs) : (int)varr->size();
+            for (int vi = vs; vi < ve; vi++) expand_bbox3d(pmax, pmin, varr->at(vi));
+            acc.minValues = {(double)pmin.x(), (double)pmin.y(), (double)pmin.z()};
+            acc.maxValues = {(double)pmax.x(), (double)pmax.y(), (double)pmax.z()};
+            int accIdx = (int)osgState->model->accessors.size();
+            osgState->model->accessors.push_back(acc);
+            prim.attributes["POSITION"] = accIdx;
+            if (*pmtVertex == -1 && osgState->draw_array_first == -1) *pmtVertex = accIdx;
+            expand_bbox3d(osgState->point_max, osgState->point_min, pmax);
+            expand_bbox3d(osgState->point_max, osgState->point_min, pmin);
+        } else {
+            osg::Vec3f pmax(-1e38f,-1e38f,-1e38f), pmin(1e38f,1e38f,1e38f);
+            prim.attributes["POSITION"] = (int)osgState->model->accessors.size();
+            if (*pmtVertex == -1 && osgState->draw_array_first == -1)
+                *pmtVertex = (int)osgState->model->accessors.size();
+            write_vec3_array(varr, osgState, pmax, pmin);
+            expand_bbox3d(osgState->point_max, osgState->point_min, pmax);
+            expand_bbox3d(osgState->point_max, osgState->point_min, pmin);
+        }
+    }
+
+    // Normal
+    auto* narr = (osg::Vec3Array*)g->getNormalArray();
+    if (narr) {
+        if (*pmtNormal > -1 && osgState->draw_array_first == -1) {
+            prim.attributes["NORMAL"] = *pmtNormal;
+        } else {
+            if (dracoState->compressed) {
+                tinygltf::Accessor acc;
+                acc.bufferView = -1;
+                acc.componentType = TINYGLTF_COMPONENT_TYPE_FLOAT;
+                acc.count = (osgState->draw_array_first >= 0) ? osgState->draw_array_count : (int)narr->size();
+                acc.type = TINYGLTF_TYPE_VEC3;
+                int accIdx = (int)osgState->model->accessors.size();
+                osgState->model->accessors.push_back(acc);
+                prim.attributes["NORMAL"] = accIdx;
+                if (*pmtNormal == -1 && osgState->draw_array_first == -1) *pmtNormal = accIdx;
+            } else {
+                osg::Vec3f pmax(-1e38f,-1e38f,-1e38f), pmin(1e38f,1e38f,1e38f);
+                prim.attributes["NORMAL"] = (int)osgState->model->accessors.size();
+                if (*pmtNormal == -1 && osgState->draw_array_first == -1)
+                    *pmtNormal = (int)osgState->model->accessors.size();
+                write_vec3_array(narr, osgState, pmax, pmin, true);
+            }
+        }
+    }
+
+    // Texcoord
+    auto* tarr = (osg::Vec2Array*)g->getTexCoordArray(0);
+    if (tarr) {
+        if (*pmtTexcd > -1 && osgState->draw_array_first == -1) {
+            prim.attributes["TEXCOORD_0"] = *pmtTexcd;
+        } else {
+            if (dracoState->compressed) {
+                tinygltf::Accessor acc;
+                acc.bufferView = -1;
+                acc.componentType = TINYGLTF_COMPONENT_TYPE_FLOAT;
+                acc.count = (osgState->draw_array_first >= 0) ? osgState->draw_array_count : (int)tarr->size();
+                acc.type = TINYGLTF_TYPE_VEC2;
+                int accIdx = (int)osgState->model->accessors.size();
+                osgState->model->accessors.push_back(acc);
+                prim.attributes["TEXCOORD_0"] = accIdx;
+                if (*pmtTexcd == -1 && osgState->draw_array_first == -1) *pmtTexcd = accIdx;
+            } else {
+                prim.attributes["TEXCOORD_0"] = (int)osgState->model->accessors.size();
+                if (*pmtTexcd == -1 && osgState->draw_array_first == -1)
+                    *pmtTexcd = (int)osgState->model->accessors.size();
+                write_vec2_array(tarr, osgState);
+            }
+        }
+    }
+
+    prim.material = -1;
+
+    // Mode mapping
+    switch (ps->getMode()) {
+        case GL_POINTS:         prim.mode = TINYGLTF_MODE_POINTS; break;
+        case GL_LINES:          prim.mode = TINYGLTF_MODE_LINE; break;
+        case GL_LINE_LOOP:      prim.mode = TINYGLTF_MODE_LINE_LOOP; break;
+        case GL_LINE_STRIP:     prim.mode = TINYGLTF_MODE_LINE_STRIP; break;
+        case GL_TRIANGLES:      prim.mode = TINYGLTF_MODE_TRIANGLES; break;
+        case GL_TRIANGLE_STRIP: prim.mode = TINYGLTF_MODE_TRIANGLE_STRIP; break;
+        case GL_TRIANGLE_FAN:   prim.mode = TINYGLTF_MODE_TRIANGLE_FAN; break;
+        case GL_QUADS:
+        case GL_QUAD_STRIP:     prim.mode = TINYGLTF_MODE_TRIANGLES; break;
+        default:
+            LOG_E("unsupported primitive mode: %d", (int)ps->getMode());
+            return;
+    }
+    osgState->model->meshes.back().primitives.push_back(prim);
+
+    // Draco extension
+    if (dracoState->compressed) {
+        auto& bp = osgState->model->meshes.back().primitives.back();
+        tinygltf::Value::Object dracoExt;
+        dracoExt["bufferView"] = tinygltf::Value(dracoState->bufferView);
+        tinygltf::Value::Object attr;
+        if (dracoState->posId != -1) attr["POSITION"] = tinygltf::Value(dracoState->posId);
+        if (dracoState->normId != -1) attr["NORMAL"] = tinygltf::Value(dracoState->normId);
+        if (dracoState->texId != -1) attr["TEXCOORD_0"] = tinygltf::Value(dracoState->texId);
+        if (dracoState->batchId != -1) attr["_BATCHID"] = tinygltf::Value(dracoState->batchId);
+        dracoExt["attributes"] = tinygltf::Value(attr);
+        bp.extensions["KHR_draco_mesh_compression"] = tinygltf::Value(dracoExt);
+    }
+}
+
+static tinygltf::Material make_default_material(double r = 1.0, double g = 1.0, double b = 1.0) {
+    tinygltf::Material m;
+    m.name = "default";
+    m.pbrMetallicRoughness.baseColorFactor = {r, g, b, 1.0};
+    m.pbrMetallicRoughness.metallicFactor = 0.0;
+    m.pbrMetallicRoughness.roughnessFactor = 1.0;
+    return m;
+}
+
+// ============================================================
+// Main conversion: OSGB geometry → GLB buffer
+// ============================================================
+static void write_osgGeometry(osg::Geometry* g, OsgBuildState* osgState,
+                              bool enable_simplify, bool enable_draco) {
+    // Optional simplification
+    if (enable_simplify) {
+        LOG_I("simplification requested but mesh_processor not linked; skipping");
+    }
+
+    DracoState dracoState;
+    if (enable_draco) {
+        LOG_I("Draco requested but mesh_processor not linked; skipping");
+    }
+
+    int pmtV = -1, pmtN = -1, pmtT = -1;
+    for (unsigned k = 0; k < g->getNumPrimitiveSets(); k++) {
+        osg::PrimitiveSet* ps = g->getPrimitiveSet(k);
+        write_primitive(g, ps, osgState, &pmtV, &pmtN, &pmtT, &dracoState);
+    }
+}
+
+bool osgb2glb_buf(std::string path, std::string& glb_buff, MeshInfo& mesh_info,
+                  int node_type, bool enable_texture_compress,
+                  bool enable_meshopt, bool enable_draco, bool enable_unlit) {
+    vector<string> fileNames = { path };
+    std::string parent_path = get_parent(path);
+
+    static bool logged = false;
+    if (!logged) { log_osg_plugin_info(); logged = true; }
+
+    osg::ref_ptr<osg::Node> root = osgDB::readNodeFiles(fileNames);
+    if (!root.valid()) return false;
+
+    InfoVisitor infoVisitor(parent_path, node_type == -1);
+    root->accept(infoVisitor);
+    if (node_type == 2 || infoVisitor.geometry_array.empty()) {
+        infoVisitor.geometry_array = infoVisitor.other_geometry_array;
+        infoVisitor.texture_array = infoVisitor.other_texture_array;
+    }
+    if (infoVisitor.geometry_array.empty()) return false;
+
+    osgUtil::SmoothingVisitor sv;
+    root->accept(sv);
+
+    tinygltf::TinyGLTF gltf;
+    tinygltf::Model model;
+    tinygltf::Buffer buffer;
+
+    OsgBuildState osgState = { &buffer, &model,
+        osg::Vec3f(-1e38f,-1e38f,-1e38f), osg::Vec3f(1e38f,1e38f,1e38f), -1, -1 };
+
+    model.meshes.resize(1);
+    int primIdx = 0;
+
+    for (auto g : infoVisitor.geometry_array) {
+        if (!g->getVertexArray() || g->getVertexArray()->getDataSize() == 0)
+            continue;
+
+        write_osgGeometry(g, &osgState, enable_meshopt, enable_draco);
+
+        if (!infoVisitor.texture_array.empty()) {
+            for (unsigned k = 0; k < g->getNumPrimitiveSets(); k++) {
+                auto tex = infoVisitor.texture_map[g];
+                if (tex) {
+                    int matIdx = 0;
+                    for (auto t : infoVisitor.texture_array) {
+                        if (tex == t) break;
+                        matIdx++;
+                    }
+                    model.meshes[0].primitives[primIdx].material = matIdx;
+                }
+                primIdx++;
+            }
+        }
+    }
+
+    if (model.meshes[0].primitives.empty()) return false;
+
+    // Fix: ensure all primitives have a valid material index (not -1)
+    // otherwise Cesium may fail to render them
+    for (auto& prim : model.meshes[0].primitives) {
+        if (prim.material < 0) prim.material = 0;
+    }
+
+    mesh_info.min = { (double)osgState.point_min.x(), (double)osgState.point_min.y(), (double)osgState.point_min.z() };
+    mesh_info.max = { (double)osgState.point_max.x(), (double)osgState.point_max.y(), (double)osgState.point_max.z() };
+
+    // Process textures — encode to JPEG using stb_image_write, or skip if unavailable
+#ifdef HAS_STB
+    // stb write callback: append data to a vector
+    static auto stb_append_vec = [](void* ctx, void* data, int size) {
+        auto* vec = static_cast<std::vector<unsigned char>*>(ctx);
+        auto* bytes = static_cast<unsigned char*>(data);
+        vec->insert(vec->end(), bytes, bytes + size);
+    };
+#endif
+
+    for (auto tex : infoVisitor.texture_array) {
+        unsigned bufStart = (unsigned)buffer.data.size();
+        std::vector<unsigned char> imgData;
+        std::string mimeType;
+
+        if (tex && tex->getNumImages() > 0) {
+            osg::Image* img = tex->getImage(0);
+            if (img) {
+                int w = img->s(), h = img->t();
+                int fmt = img->getPixelFormat();
+                const unsigned char* src = img->data();
+
+#ifdef HAS_STB
+                // Properly encode to JPEG using stb_image_write
+                if (fmt == GL_RGB || fmt == GL_RGBA || fmt == GL_BGRA) {
+                    std::vector<unsigned char> rgba;
+                    const unsigned char* pixels = src;
+                    if (fmt == GL_BGRA) {
+                        rgba.resize(w * h * 4);
+                        for (int i = 0; i < w * h; i++) {
+                            rgba[i*4+0] = src[i*4+2];
+                            rgba[i*4+1] = src[i*4+1];
+                            rgba[i*4+2] = src[i*4+0];
+                            rgba[i*4+3] = src[i*4+3];
+                        }
+                        pixels = rgba.data();
+                        fmt = GL_RGBA;
+                    }
+
+                    int quality = 85;
+                    int channels = (fmt == GL_RGB) ? 3 : 4;
+                    if (stbi_write_jpg_to_func(stb_append_vec, &imgData, w, h, channels, pixels, quality) != 0) {
+                        mimeType = "image/jpeg";
+                    }
+                }
+#else
+                // No encoder available — skip (don't embed raw pixels as JPEG)
+                (void)w; (void)fmt; (void)src;
+                LOG_W("Texture skipped: stb_image_write not available");
+#endif
+            }
+        }
+
+        if (!imgData.empty()) {
+            buffer.data.insert(buffer.data.end(), imgData.begin(), imgData.end());
+
+            tinygltf::Image imgObj;
+            imgObj.mimeType = mimeType;
+            imgObj.bufferView = (int)model.bufferViews.size();
+            model.images.push_back(imgObj);
+
+            tinygltf::BufferView bfv;
+            bfv.buffer = 0;
+            bfv.byteOffset = (int)bufStart;
+            alignment_buffer(buffer.data);
+            bfv.byteLength = (int)(buffer.data.size() - bufStart);
+            model.bufferViews.push_back(bfv);
+        }
+    }
+
+    // Node
+    tinygltf::Node node; node.mesh = 0;
+    model.nodes.push_back(node);
+
+    // Scene
+    tinygltf::Scene scene; scene.nodes.push_back(0);
+    model.scenes = { scene };
+    model.defaultScene = 0;
+
+    // Sampler
+    tinygltf::Sampler samp;
+    samp.magFilter = TINYGLTF_TEXTURE_FILTER_LINEAR;
+    samp.minFilter = TINYGLTF_TEXTURE_FILTER_NEAREST_MIPMAP_LINEAR;
+    samp.wrapS = TINYGLTF_TEXTURE_WRAP_REPEAT;
+    samp.wrapT = TINYGLTF_TEXTURE_WRAP_REPEAT;
+    model.samplers = { samp };
+
+    // Extensions
+    if (enable_unlit) {
+        model.extensionsRequired.push_back("KHR_materials_unlit");
+        model.extensionsUsed.push_back("KHR_materials_unlit");
+    }
+    if (enable_texture_compress) {
+        model.extensionsRequired.push_back("KHR_texture_basisu");
+        model.extensionsUsed.push_back("KHR_texture_basisu");
+    }
+    if (enable_draco) {
+        model.extensionsRequired.push_back("KHR_draco_mesh_compression");
+        model.extensionsUsed.push_back("KHR_draco_mesh_compression");
+    }
+
+    // Materials — always set a visible baseColorFactor so model is visible even without textures
+    {
+        bool has_images = !model.images.empty();
+        if (infoVisitor.texture_array.empty()) {
+            // No textures at all — create one default material with visible gray color
+            auto mat = make_default_material(0.75, 0.75, 0.75);
+            if (enable_unlit)
+                mat.extensions["KHR_materials_unlit"] = tinygltf::Value(tinygltf::Value::Object());
+            model.materials.push_back(mat);
+        } else {
+            for (size_t i = 0; i < infoVisitor.texture_array.size(); i++) {
+                auto mat = make_default_material(0.75, 0.75, 0.75);
+                if (enable_unlit)
+                    mat.extensions["KHR_materials_unlit"] = tinygltf::Value(tinygltf::Value::Object());
+                // Only set texture if we successfully encoded it
+                if (has_images && i < model.images.size())
+                    mat.pbrMetallicRoughness.baseColorTexture.index = (int)i;
+                model.materials.push_back(mat);
+            }
+        }
+    }
+
+    // Textures — only create if we have valid images
+    if (!model.images.empty()) {
+        for (size_t i = 0; i < model.images.size(); i++) {
+            tinygltf::Texture tex;
+            tex.sampler = 0;
+            if (enable_texture_compress) {
+                tinygltf::Value::Object basisu;
+                basisu["source"] = tinygltf::Value((int)i);
+                tex.extensions["KHR_texture_basisu"] = tinygltf::Value(basisu);
+            } else {
+                tex.source = (int)i;
+            }
+            model.textures.push_back(tex);
+        }
+    }
+
+    model.asset.version = "2.0";
+    model.asset.generator = "osgb2b3dm-cpp";
+
+    // CRITICAL: The buffer must be added to model.buffers so that
+    // WriteGltfSceneToStream writes the BIN chunk containing all
+    // vertex data, indices, textures, etc.
+    // Without this, only the JSON chunk is written and Cesium has
+    // nothing to render (the b3dm loads but is invisible).
+    model.buffers.push_back(buffer);
+
+    std::ostringstream ss;
+    if (gltf.WriteGltfSceneToStream(&model, ss, false, true)) {
+        glb_buff = ss.str();
+        return true;
+    }
+    return false;
+}
+
+// ============================================================
+// OSGB → B3DM buffer
+// ============================================================
+bool osgb2b3dm_buf(std::string path, std::string& b3dm_buf, TileBox& tile_box,
+                   int node_type, bool enable_texture_compress,
+                   bool enable_meshopt, bool enable_draco, bool enable_unlit) {
+    using nlohmann::json;
+
+    std::string glb_buf;
+    MeshInfo minfo;
+    if (!osgb2glb_buf(path, glb_buf, minfo, node_type, enable_texture_compress, enable_meshopt, enable_draco, enable_unlit))
+        return false;
+
+    tile_box.max = minfo.max;
+    tile_box.min = minfo.min;
+
+    int mesh_count = 1;
+
+    // Feature Table JSON
+    std::string ft_json = "{\"BATCH_LENGTH\":" + std::to_string(mesh_count) + "}";
+    while ((ft_json.size() + 28) % 8 != 0) ft_json.push_back(' ');
+
+    // Batch Table JSON
+    json batch;
+    batch["batchId"] = {0};
+    batch["name"] = {"mesh_0"};
+    std::string bt_json = batch.dump();
+    while (bt_json.size() % 8 != 0) bt_json.push_back(' ');
+
+    int ft_len = (int)ft_json.size();
+    int bt_len = (int)bt_json.size();
+
+    // B3DM header
+    b3dm_buf = "b3dm";
+    int version = 1;
+    put_val(b3dm_buf, version);
+
+    int totalLenOffset = (int)b3dm_buf.size();
+    put_val(b3dm_buf, 0); // placeholder for total_len
+    put_val(b3dm_buf, ft_len);
+    put_val(b3dm_buf, 0); // feature_bin_len
+    put_val(b3dm_buf, bt_len);
+    put_val(b3dm_buf, 0); // batch_bin_len
+
+    b3dm_buf.append(ft_json);
+    b3dm_buf.append(bt_json);
+
+    // 8-byte align before GLB
+    while (b3dm_buf.size() % 8 != 0) b3dm_buf.push_back(0x00);
+    b3dm_buf.append(glb_buf);
+    while (b3dm_buf.size() % 8 != 0) b3dm_buf.push_back(0x00);
+
+    // Update total length
+    int totalLen = (int)b3dm_buf.size();
+    *reinterpret_cast<int*>(&b3dm_buf[totalLenOffset]) = totalLen;
+
+    return true;
+}
+
+// ============================================================
+// Tile processing
+// ============================================================
+void do_tile_job(osg_tree& tree, std::string out_path, int max_lvl,
+                 bool enable_texture_compress, bool enable_meshopt,
+                 bool enable_draco, bool enable_unlit) {
+    if (tree.file_name.empty()) return;
+    int lvl = get_lvl_num(tree.file_name);
+    if (lvl > max_lvl) return;
+
+    if (tree.type > 0) {
+        std::string b3dm_buf;
+        osgb2b3dm_buf(tree.file_name, b3dm_buf, tree.bbox, tree.type,
+                      enable_texture_compress, enable_meshopt, enable_draco, enable_unlit);
+
+        std::string out_file = out_path + "/" +
+            replace(get_file_name(tree.file_name), ".osgb", tree.type != 2 ? ".b3dm" : "o.b3dm");
+
+        if (!b3dm_buf.empty()) {
+            write_file(out_file.c_str(), b3dm_buf.data(), (unsigned long)b3dm_buf.size());
+        }
+    }
+
+    for (auto& i : tree.sub_nodes) {
+        do_tile_job(i, out_path, max_lvl, enable_texture_compress, enable_meshopt, enable_draco, enable_unlit);
+    }
+}
+
+// ============================================================
+// JSON generation for tile tree
+// ============================================================
+std::string get_boundingBox(TileBox bbox) {
+    std::string s = "\"boundingVolume\":{\"box\":[";
+    auto v = convert_bbox(bbox);
+    for (size_t i = 0; i < v.size(); i++) {
+        s += std::to_string(v[i]);
+        if (i < v.size() - 1) s += ",";
+    }
+    s += "]}";
+    return s;
+}
+
+std::string encode_tile_json(osg_tree& tree, double x, double y) {
+    if (tree.bbox.max.empty() || tree.bbox.min.empty()) return "";
+
+    std::string file_name = get_file_name(tree.file_name);
+    std::string file_path = get_file_name(get_parent(tree.file_name));
+
+    char buf[512];
+    sprintf(buf, "{ \"geometricError\":%.2f,", tree.geometricError);
+    std::string tile = buf;
+    tile += " \"refine\":\"REPLACE\",";
+
+    std::string bbox_str = get_boundingBox(tree.bbox);
+    tile += bbox_str;
+
+    if (tree.type > 0) {
+        tile += ", \"content\":{ \"uri\":";
+        std::string uri = "./" + replace(file_name, ".osgb", tree.type != 2 ? ".b3dm" : "o.b3dm");
+        tile += "\"" + uri + "\",";
+        tile += bbox_str;
+        tile += "}";
+    }
+
+    if (!tree.sub_nodes.empty()) {
+        tile += ",\"children\":[";
+        for (auto& i : tree.sub_nodes) {
+            std::string child = encode_tile_json(i, x, y);
+            if (!child.empty()) {
+                tile += child + ",";
+            }
+        }
+        if (tile.back() == ',') tile.pop_back();
+        tile += "]";
+    }
+    tile += "}";
+    return tile;
+}
+
+// ============================================================
+// 3D Tiles 1.1: Tile processing — outputs raw .glb (no B3DM)
+// ============================================================
+void do_tile_job_1_1(osg_tree& tree, std::string out_path, int max_lvl,
+                     bool enable_texture_compress, bool enable_meshopt,
+                     bool enable_draco, bool enable_unlit) {
+    if (tree.file_name.empty()) return;
+    int lvl = get_lvl_num(tree.file_name);
+    if (lvl > max_lvl) return;
+
+    if (tree.type > 0) {
+        // Get raw GLB buffer directly (skip B3DM wrapping)
+        std::string glb_buf;
+        MeshInfo minfo;
+        if (osgb2glb_buf(tree.file_name, glb_buf, minfo, tree.type,
+                         enable_texture_compress, enable_meshopt, enable_draco, enable_unlit)) {
+            tree.bbox.max = minfo.max;
+            tree.bbox.min = minfo.min;
+
+            std::string out_file = out_path + "/" +
+                replace(get_file_name(tree.file_name), ".osgb", tree.type != 2 ? ".glb" : "o.glb");
+
+            if (!glb_buf.empty()) {
+                write_file(out_file.c_str(), glb_buf.data(), (unsigned long)glb_buf.size());
+            }
+        }
+    }
+
+    for (auto& i : tree.sub_nodes) {
+        do_tile_job_1_1(i, out_path, max_lvl, enable_texture_compress, enable_meshopt, enable_draco, enable_unlit);
+    }
+}
+
+// ============================================================
+// 3D Tiles 1.1: JSON generation with 3DTILES_content_gltf
+// ============================================================
+std::string encode_tile_json_1_1(osg_tree& tree, double x, double y) {
+    if (tree.bbox.max.empty() || tree.bbox.min.empty()) return "";
+
+    std::string file_name = get_file_name(tree.file_name);
+    std::string file_path = get_file_name(get_parent(tree.file_name));
+
+    char buf[512];
+    sprintf(buf, "{ \"geometricError\":%.2f,", tree.geometricError);
+    std::string tile = buf;
+    tile += " \"refine\":\"REPLACE\",";
+
+    std::string bbox_str = get_boundingBox(tree.bbox);
+    tile += bbox_str;
+
+    if (tree.type > 0) {
+        tile += ", \"content\":{ \"uri\":";
+        std::string uri = "./" + replace(file_name, ".osgb", tree.type != 2 ? ".glb" : "o.glb");
+        tile += "\"" + uri + "\",";
+        // 3D Tiles 1.1: declare 3DTILES_content_gltf extension on content
+        tile += " \"extensions\":{\"3DTILES_content_gltf\":{}},";
+        tile += bbox_str;
+        tile += "}";
+    }
+
+    if (!tree.sub_nodes.empty()) {
+        tile += ",\"children\":[";
+        for (auto& i : tree.sub_nodes) {
+            std::string child = encode_tile_json_1_1(i, x, y);
+            if (!child.empty()) {
+                tile += child + ",";
+            }
+        }
+        if (tile.back() == ',') tile.pop_back();
+        tile += "]";
+    }
+    tile += "}";
+    return tile;
+}
