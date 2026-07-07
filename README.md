@@ -323,6 +323,7 @@ src1.1 相比 src 只改了 4 个文件：
 ### 转换器提交历史
 
 ```
+cffd8b2 Fix geometricError: leaf=0, parent=size*0.1, root capped at 2000
 7c420d4 Restore content-level boundingVolume in 1.1 tile JSON
 0d6aded Fix tile-edge gaps: remove tight content-level boundingVolume
 5565de1 Update README: document both 1.0/1.1 targets + display viewer
