@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <fstream>
 #include <cstring>
+#include <algorithm>
 #include <chrono>
 #include <thread>
 #include <functional>
@@ -529,12 +530,12 @@ int convert_osgb(const ConvertOptions& opts) {
     json root_tileset;
     root_tileset["asset"]["version"] = "1.0";
     root_tileset["asset"]["gltfUpAxis"] = "Z";
-    root_tileset["geometricError"] = root_ge * 2.0;
+    root_tileset["geometricError"] = std::min(root_ge, 2000.0);
 
     json root_tile;
     root_tile["transform"] = trans_vec;
     root_tile["boundingVolume"]["box"] = box_to_tileset_box(root_box);
-    root_tile["geometricError"] = root_ge * 2.0;
+    root_tile["geometricError"] = std::min(root_ge, 2000.0);
     root_tile["refine"] = "REPLACE";
     root_tile["children"] = json::array();
 
