@@ -294,12 +294,26 @@ TileBox extend_tile_box(osg_tree& tree) {
 void calc_geometric_error(osg_tree& tree) {
     for (auto& i : tree.sub_nodes) calc_geometric_error(i);
     if (tree.sub_nodes.empty()) {
-        tree.geometricError = get_geometric_error(tree.bbox);
+        //Leaf tile: must be 0.0 per 3D Tiles spec
+        tree.geometricError = 0.0;
     } else {
+        //Check if direct parent of leaves
+        bool all_children_are_leaves = true;
+        for (auto& s : tree.sub_nodes) {
+            if (!s.sub_nodes.empty()) { all_children_are_leaves = false; break; }
+        }
         double max_sub = 0.0;
-        for (auto& s : tree.sub_nodes)
-            max_sub = std::max(max_sub, s.geometricError);
-        tree.geometricError = max_sub * 2.0;
+        if (all_children_are_leaves) {
+            //Direct parent of leaves: physical size * 0.1
+            for (auto& s : tree.sub_nodes)
+                max_sub = std::max(max_sub, get_geometric_error(s.bbox) * 0.1);
+        } else {
+            //Upper parent: max child ge * 2.0
+            for (auto& s : tree.sub_nodes)
+                max_sub = std::max(max_sub, s.geometricError);
+            max_sub = max_sub * 2.0;
+        }
+        tree.geometricError = max_sub;
     }
 }
 
@@ -1108,6 +1122,8 @@ std::string encode_tile_json(osg_tree& tree, double x, double y) {
         }
         if (tile.back() == ',') tile.pop_back();
         tile += "]";
+    } else {
+        tile += ",\"children\":[]";
     }
     tile += "}";
     return tile;
