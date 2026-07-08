@@ -7,33 +7,25 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <cmath>
+#include <algorithm>
 
 // ============================================================
-// Conditional includes for optional dependencies
+// Required dependencies (unconditional — must be available)
 // ============================================================
-#ifdef HAS_BASISU
 #include <basisu/encoder/basisu_comp.h>
 #include <basisu/transcoder/basisu_transcoder.h>
-#endif
-
-#ifdef HAS_MESHOPTIMIZER
 #include <meshoptimizer.h>
-#endif
-
-#ifdef HAS_DRACO
 #include "draco/compression/encode.h"
 #include "draco/core/encoder_buffer.h"
 #include "draco/mesh/mesh.h"
-#endif
 
 // stb_image implementation (needed by tinygltf)
 #define STB_IMAGE_IMPLEMENTATION
 #include <stb_image.h>
 
-#ifdef HAS_STB
-#define STB_IMAGE_WRITE_IMPLEMENTATION
+// stb_image_write implementation provided by osg_gltf_converter.cpp (TINYGLTF_IMPLEMENTATION)
 #include <stb_image_write.h>
-#endif
 
 // Helper function to write buffer data
 static void write_buf_callback(void* context, void* data, int len) {
@@ -46,7 +38,6 @@ static void write_buf_callback(void* context, void* data, int len) {
 // ============================================================
 bool compress_to_ktx2(const std::vector<unsigned char>& rgba_data, int width, int height,
                       std::vector<unsigned char>& ktx2_data) {
-#ifdef HAS_BASISU
     try {
         if (rgba_data.empty() || width <= 0 || height <= 0) return false;
 
@@ -66,10 +57,6 @@ bool compress_to_ktx2(const std::vector<unsigned char>& rgba_data, int width, in
         basisu::basis_free_data(pKTX2_data);
         return true;
     } catch (...) { return false; }
-#else
-    (void)rgba_data; (void)width; (void)height; (void)ktx2_data;
-    return false;
-#endif
 }
 
 // ============================================================
@@ -80,7 +67,6 @@ bool optimize_and_simplify_mesh(
     std::vector<unsigned int>& indices, size_t original_index_count,
     std::vector<unsigned int>& simplified_indices, size_t& simplified_index_count,
     const SimplificationParams& params) {
-#ifdef HAS_MESHOPTIMIZER
     size_t target_index_count = static_cast<size_t>(original_index_count * params.target_ratio);
 
     bool hasNormals = false;
@@ -124,15 +110,9 @@ bool optimize_and_simplify_mesh(
     }
     simplified_indices.resize(simplified_index_count);
     return true;
-#else
-    (void)vertices; (void)vertex_count; (void)indices; (void)original_index_count;
-    (void)simplified_indices; (void)simplified_index_count; (void)params;
-    return false;
-#endif
 }
 
 bool simplify_mesh_geometry(osg::Geometry* geometry, const SimplificationParams& params) {
-#ifdef HAS_MESHOPTIMIZER
     if (!params.enable_simplification || !geometry) return false;
 
     osg::Vec3Array* vertexArray = dynamic_cast<osg::Vec3Array*>(geometry->getVertexArray());
@@ -226,21 +206,16 @@ bool simplify_mesh_geometry(osg::Geometry* geometry, const SimplificationParams&
     geometry->setPrimitiveSet(0, newDE);
 
     return true;
-#else
-    (void)geometry; (void)params;
-    return false;
-#endif
 }
 
 // ============================================================
-// Draco Compression (requires draco)
+// Draco Compression
 // ============================================================
 bool compress_mesh_geometry(osg::Geometry* geometry, const DracoCompressionParams& params,
                            std::vector<unsigned char>& compressed_data, size_t& compressed_size,
                            int* out_position_att_id, int* out_normal_att_id,
                            int* out_texcoord_att_id, int* out_batchid_att_id,
                            const std::vector<float>* batchIds) {
-#ifdef HAS_DRACO
     if (!params.enable_compression || !geometry) return false;
 
     osg::Vec3Array* vertexArray = dynamic_cast<osg::Vec3Array*>(geometry->getVertexArray());
@@ -320,12 +295,139 @@ bool compress_mesh_geometry(osg::Geometry* geometry, const DracoCompressionParam
     compressed_data.resize(compressed_size);
     std::memcpy(compressed_data.data(), buffer.data(), compressed_size);
     return true;
-#else
-    (void)geometry; (void)params; (void)compressed_data; (void)compressed_size;
-    (void)out_position_att_id; (void)out_normal_att_id; (void)out_texcoord_att_id; (void)out_batchid_att_id;
-    (void)batchIds;
-    return false;
-#endif
+}
+
+// ============================================================
+// Meshopt Geometry Compression (EXT_meshopt_compression)
+// ============================================================
+// Uses meshopt_encodeVertexBuffer / meshopt_encodeIndexBuffer
+// to losslessly compress float vertex/attribute data and uint32 index data.
+// Accessor formats stay standard (FLOAT/VEC3 etc.) — the extension tells
+// the decoder to decompress the bufferViews transparently.
+
+bool compress_mesh_geometry_meshopt(osg::Geometry* geometry,
+                                    const MeshoptCompressionParams& params,
+                                    MeshoptCompressionResult& result) {
+    result = MeshoptCompressionResult{};
+    if (!params.enable_compression || !geometry) return false;
+
+    osg::Vec3Array* vertexArray = dynamic_cast<osg::Vec3Array*>(geometry->getVertexArray());
+    if (!vertexArray || vertexArray->empty()) return false;
+
+    const size_t vertexCount = vertexArray->size();
+    result.vertex_count = vertexCount;
+
+    // Extract indices
+    std::vector<uint32_t> indices;
+    if (geometry->getNumPrimitiveSets() > 0) {
+        osg::PrimitiveSet* ps = geometry->getPrimitiveSet(0);
+        unsigned numIndices = ps->getNumIndices();
+        if (numIndices > 0) {
+            indices.resize(numIndices);
+            for (unsigned i = 0; i < numIndices; ++i) indices[i] = ps->index(i);
+        }
+    }
+    result.index_count = indices.size();
+
+    // Check for optional attributes
+    osg::Vec3Array* normalArray = dynamic_cast<osg::Vec3Array*>(geometry->getNormalArray());
+    bool hasNormals = normalArray && normalArray->size() == vertexCount;
+    osg::Vec2Array* texCoordArray = dynamic_cast<osg::Vec2Array*>(geometry->getTexCoordArray(0));
+    bool hasTexCoords = texCoordArray && texCoordArray->size() == vertexCount;
+
+    // ================================================================
+    // Stream 0: Position — raw float32×3, byteStride=12
+    // ================================================================
+    {
+        int byteStride = 3 * static_cast<int>(sizeof(float));
+        std::vector<float> raw(vertexCount * 3);
+        for (size_t i = 0; i < vertexCount; ++i) {
+            osg::Vec3f v = vertexArray->at(i);
+            raw[i * 3 + 0] = v.x();
+            raw[i * 3 + 1] = v.y();
+            raw[i * 3 + 2] = v.z();
+        }
+
+        std::vector<unsigned char> encoded(meshopt_encodeVertexBufferBound(vertexCount, byteStride));
+        size_t encodedSize = meshopt_encodeVertexBuffer(encoded.data(), encoded.size(),
+            raw.data(), vertexCount, byteStride);
+        encoded.resize(encodedSize);
+
+        MeshoptCompressionResult::AttrStream stream;
+        stream.data = std::move(encoded);
+        stream.component_count = 3;
+        stream.byte_stride = byteStride;
+        stream.filter = "NONE";
+        result.attr_streams.push_back(std::move(stream));
+    }
+
+    // ================================================================
+    // Stream 1: Normal — raw float32×3, byteStride=12
+    // ================================================================
+    if (hasNormals) {
+        int byteStride = 3 * static_cast<int>(sizeof(float));
+        std::vector<float> raw(vertexCount * 3);
+        for (size_t i = 0; i < vertexCount; ++i) {
+            osg::Vec3f n = normalArray->at(i);
+            float len = n.length();
+            if (len < 0.0001f) { n.set(0, 0, 1); }
+            else if (std::abs(len - 1.0f) > 0.0001f) { n.normalize(); }
+            raw[i * 3 + 0] = n.x();
+            raw[i * 3 + 1] = n.y();
+            raw[i * 3 + 2] = n.z();
+        }
+
+        std::vector<unsigned char> encoded(meshopt_encodeVertexBufferBound(vertexCount, byteStride));
+        size_t encodedSize = meshopt_encodeVertexBuffer(encoded.data(), encoded.size(),
+            raw.data(), vertexCount, byteStride);
+        encoded.resize(encodedSize);
+
+        MeshoptCompressionResult::AttrStream stream;
+        stream.data = std::move(encoded);
+        stream.component_count = 3;
+        stream.byte_stride = byteStride;
+        stream.filter = "NONE";
+        result.attr_streams.push_back(std::move(stream));
+    }
+
+    // ================================================================
+    // Stream 2: TexCoord — raw float32×2, byteStride=8
+    // ================================================================
+    if (hasTexCoords) {
+        int byteStride = 2 * static_cast<int>(sizeof(float));
+        std::vector<float> raw(vertexCount * 2);
+        for (size_t i = 0; i < vertexCount; ++i) {
+            osg::Vec2f uv = texCoordArray->at(i);
+            raw[i * 2 + 0] = uv.x();
+            raw[i * 2 + 1] = uv.y();
+        }
+
+        std::vector<unsigned char> encoded(meshopt_encodeVertexBufferBound(vertexCount, byteStride));
+        size_t encodedSize = meshopt_encodeVertexBuffer(encoded.data(), encoded.size(),
+            raw.data(), vertexCount, byteStride);
+        encoded.resize(encodedSize);
+
+        MeshoptCompressionResult::AttrStream stream;
+        stream.data = std::move(encoded);
+        stream.component_count = 2;
+        stream.byte_stride = byteStride;
+        stream.filter = "NONE";
+        result.attr_streams.push_back(std::move(stream));
+    }
+
+    // ================================================================
+    // Index stream — delta + entropy encode
+    // ================================================================
+    if (!indices.empty()) {
+        std::vector<unsigned char> encoded(meshopt_encodeIndexBufferBound(indices.size(), vertexCount));
+        size_t encodedSize = meshopt_encodeIndexBuffer(encoded.data(), encoded.size(),
+            indices.data(), indices.size());
+        encoded.resize(encodedSize);
+        result.index_data = std::move(encoded);
+    }
+
+    result.success = true;
+    return true;
 }
 
 // ============================================================
@@ -333,24 +435,52 @@ bool compress_mesh_geometry(osg::Geometry* geometry, const DracoCompressionParam
 // ============================================================
 bool process_texture(osg::Texture* tex, std::vector<unsigned char>& image_data,
                      std::string& mime_type, bool enable_texture_compress) {
-#ifdef HAS_BASISU
+    // KTX2 path (Basis Universal)
     if (enable_texture_compress && tex && tex->getNumImages() > 0) {
         osg::Image* img = tex->getImage(0);
         if (img) {
             int w = img->s(), h = img->t();
             GLenum fmt = img->getPixelFormat();
             const unsigned char* src = img->data();
+            unsigned rowStep = img->getRowStepInBytes();
+            unsigned rowSize = img->getRowSizeInBytes();
+            bool hasRowPadding = (rowStep != rowSize);
 
             std::vector<unsigned char> rgba(w * h * 4);
             if (fmt == GL_RGBA) {
-                rgba.assign(src, src + w * h * 4);
+                if (hasRowPadding) {
+                    for (int row = 0; row < h; row++)
+                        std::memcpy(&rgba[row * w * 4], &src[row * rowStep], w * 4);
+                } else {
+                    rgba.assign(src, src + w * h * 4);
+                }
             } else if (fmt == GL_RGB) {
-                for (int i = 0; i < w * h; i++) {
-                    rgba[i*4]=src[i*3]; rgba[i*4+1]=src[i*3+1]; rgba[i*4+2]=src[i*3+2]; rgba[i*4+3]=255;
+                if (hasRowPadding) {
+                    for (int row = 0; row < h; row++) {
+                        for (int col = 0; col < w; col++) {
+                            int si = row * rowStep + col * 3;
+                            int di = (row * w + col) * 4;
+                            rgba[di]=src[si]; rgba[di+1]=src[si+1]; rgba[di+2]=src[si+2]; rgba[di+3]=255;
+                        }
+                    }
+                } else {
+                    for (int i = 0; i < w * h; i++) {
+                        rgba[i*4]=src[i*3]; rgba[i*4+1]=src[i*3+1]; rgba[i*4+2]=src[i*3+2]; rgba[i*4+3]=255;
+                    }
                 }
             } else if (fmt == GL_BGRA) {
-                for (int i = 0; i < w * h; i++) {
-                    rgba[i*4]=src[i*4+2]; rgba[i*4+1]=src[i*4+1]; rgba[i*4+2]=src[i*4]; rgba[i*4+3]=src[i*4+3];
+                if (hasRowPadding) {
+                    for (int row = 0; row < h; row++) {
+                        for (int col = 0; col < w; col++) {
+                            int si = row * rowStep + col * 4;
+                            int di = (row * w + col) * 4;
+                            rgba[di]=src[si+2]; rgba[di+1]=src[si+1]; rgba[di+2]=src[si]; rgba[di+3]=src[si+3];
+                        }
+                    }
+                } else {
+                    for (int i = 0; i < w * h; i++) {
+                        rgba[i*4]=src[i*4+2]; rgba[i*4+1]=src[i*4+1]; rgba[i*4+2]=src[i*4]; rgba[i*4+3]=src[i*4+3];
+                    }
                 }
             }
             if (!rgba.empty()) {
@@ -363,17 +493,70 @@ bool process_texture(osg::Texture* tex, std::vector<unsigned char>& image_data,
             }
         }
     }
-#else
-    (void)enable_texture_compress;
-#endif
 
-    // Fallback: pass through raw image data
+    // Fallback: JPEG encode via stb
     if (tex && tex->getNumImages() > 0) {
         osg::Image* img = tex->getImage(0);
         if (img) {
-            image_data.assign(img->data(), img->data() + img->getTotalSizeInBytes());
-            mime_type = (img->getPixelFormat() == GL_RGB) ? "image/jpeg" : "image/png";
-            return true;
+            int w = img->s(), h = img->t();
+            GLenum fmt = img->getPixelFormat();
+            const unsigned char* src = img->data();
+            unsigned rowStep = img->getRowStepInBytes();
+            unsigned rowSize = img->getRowSizeInBytes();
+            bool hasRowPadding = (rowStep != rowSize);
+
+            // Convert to tightly-packed RGB for JPEG encoding
+            std::vector<unsigned char> rgb(w * h * 3);
+            switch (fmt) {
+            case GL_RGBA:
+                if (hasRowPadding) {
+                    for (int row = 0; row < h; row++)
+                        for (int col = 0; col < w; col++) {
+                            int si = row * rowStep + col * 4;
+                            int di = (row * w + col) * 3;
+                            rgb[di]=src[si]; rgb[di+1]=src[si+1]; rgb[di+2]=src[si+2];
+                        }
+                } else {
+                    for (int i = 0; i < w * h; i++) {
+                        rgb[i*3]=src[i*4]; rgb[i*3+1]=src[i*4+1]; rgb[i*3+2]=src[i*4+2];
+                    }
+                }
+                break;
+            case GL_BGRA:
+                if (hasRowPadding) {
+                    for (int row = 0; row < h; row++)
+                        for (int col = 0; col < w; col++) {
+                            int si = row * rowStep + col * 4;
+                            int di = (row * w + col) * 3;
+                            rgb[di]=src[si+2]; rgb[di+1]=src[si+1]; rgb[di+2]=src[si];
+                        }
+                } else {
+                    for (int i = 0; i < w * h; i++) {
+                        rgb[i*3]=src[i*4+2]; rgb[i*3+1]=src[i*4+1]; rgb[i*3+2]=src[i*4];
+                    }
+                }
+                break;
+            case GL_RGB:
+                if (hasRowPadding) {
+                    for (int row = 0; row < h; row++)
+                        std::memcpy(&rgb[row * w * 3], &src[row * rowStep], w * 3);
+                } else {
+                    rgb.assign(src, src + w * h * 3);
+                }
+                break;
+            default:
+                break;
+            }
+
+            if (!rgb.empty()) {
+                std::vector<char> buf;
+                stbi_write_jpg_to_func(write_buf_callback, &buf, w, h, 3, rgb.data(), 80);
+                if (!buf.empty()) {
+                    image_data.assign(buf.begin(), buf.end());
+                    mime_type = "image/jpeg";
+                    return true;
+                }
+            }
         }
     }
     return false;

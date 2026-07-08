@@ -19,17 +19,19 @@
 #include <cstdlib>
 #include <string>
 #include <cpl_conv.h>   // CPLSetConfigOption
+#include <filesystem>
 
 #ifdef _WIN32
 #include <windows.h>
 #include <direct.h>
 #endif
+namespace fs = std::filesystem;
 
 // ============================================================
 // 硬编码配置 —— 直接在这里设置参数，无需命令行传参
 // 设置 USE_HARDCODED_CONFIG 为 1 启用，设为 0 则走命令行
 // ============================================================
-#define USE_HARDCODED_CONFIG  1
+#define USE_HARDCODED_CONFIG  0
 
 struct HardcodedConfig {
     const char* input_dir;
@@ -76,45 +78,131 @@ static void setup_environment(const char* exe_path) {
     }
 
     // Set OSG_LIBRARY_PATH for runtime plugin loading
+    // OSG needs to find plugins like osgdb_osg.dll to read .osgb files
     {
-        std::string plugins = exe_dir + "/osgPlugins-3.6.5";
+        std::string osg_plugins;
+
+        // 1) Try vcpkg debug plugins directory first
+        const char* vcpkg_root = getenv("VCPKG_ROOT");
+        if (vcpkg_root) {
+            std::string vcpkg_debug_plugins = std::string(vcpkg_root)
+                + "/installed/x64-windows/debug/plugins/osgPlugins-3.6.5";
+            std::string vcpkg_rel_plugins  = std::string(vcpkg_root)
+                + "/installed/x64-windows/plugins/osgPlugins-3.6.5";
 #ifdef _WIN32
-        if (GetFileAttributesA(plugins.c_str()) != INVALID_FILE_ATTRIBUTES) {
-            _putenv(("OSG_LIBRARY_PATH=" + plugins).c_str());
-            fprintf(stderr, "OSG_LIBRARY_PATH set to: %s\n", plugins.c_str());
-        }
+            if (GetFileAttributesA(vcpkg_debug_plugins.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                osg_plugins = vcpkg_debug_plugins;
+            } else if (GetFileAttributesA(vcpkg_rel_plugins.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                osg_plugins = vcpkg_rel_plugins;
+            }
 #else
-        setenv("OSG_LIBRARY_PATH", plugins.c_str(), 0);
-        fprintf(stderr, "OSG_LIBRARY_PATH set to: %s\n", plugins.c_str());
+            if (fs::exists(vcpkg_debug_plugins)) osg_plugins = vcpkg_debug_plugins;
+            else if (fs::exists(vcpkg_rel_plugins)) osg_plugins = vcpkg_rel_plugins;
+#endif
+        }
+
+        // 2) Fallback: local directory next to executable
+        if (osg_plugins.empty()) {
+            std::string local_plugins = exe_dir + "/osgPlugins-3.6.5";
+#ifdef _WIN32
+            if (GetFileAttributesA(local_plugins.c_str()) != INVALID_FILE_ATTRIBUTES)
+                osg_plugins = local_plugins;
+#else
+            if (fs::exists(local_plugins)) osg_plugins = local_plugins;
+#endif
+        }
+
+        if (!osg_plugins.empty()) {
+            std::string env_str = "OSG_LIBRARY_PATH=" + osg_plugins;
+#ifdef _WIN32
+            _putenv(env_str.c_str());
+#else
+            setenv("OSG_LIBRARY_PATH", osg_plugins.c_str(), 1);
+#endif
+            fprintf(stderr, "OSG_LIBRARY_PATH set to: %s\n", osg_plugins.c_str());
+        } else {
+            fprintf(stderr, "WARNING: OSG_LIBRARY_PATH not set — OSG plugins may not load!\n");
+        }
+    }
+
+    // Find GDAL_DATA and PROJ_LIB — try vcpkg first, then local dirs
+    // Need proj.db (PROJ) and epsg.wkt (GDAL) for coordinate transformations
+    std::string gdal_data_path;
+    std::string proj_lib_path;
+
+    // 1) Check VCPKG_ROOT environment variable
+    {
+        const char* vcpkg_root = getenv("VCPKG_ROOT");
+        if (vcpkg_root) {
+            std::string vcpkg_share = std::string(vcpkg_root) + "/installed/x64-windows/share";
+            std::string vcpkg_gdal = vcpkg_share + "/gdal";
+            std::string vcpkg_proj = vcpkg_share + "/proj";
+#ifdef _WIN32
+            if (GetFileAttributesA((vcpkg_proj + "/proj.db").c_str()) != INVALID_FILE_ATTRIBUTES
+                && GetFileAttributesA((vcpkg_gdal + "/epsg.wkt").c_str()) != INVALID_FILE_ATTRIBUTES) {
+                gdal_data_path = vcpkg_gdal;
+                proj_lib_path = vcpkg_proj;
+            }
+#else
+            if (fs::exists(vcpkg_proj + "/proj.db") && fs::exists(vcpkg_gdal + "/epsg.wkt")) {
+                gdal_data_path = vcpkg_gdal;
+                proj_lib_path = vcpkg_proj;
+            }
+#endif
+        }
+    }
+
+    // 2) Fallback: local directories next to executable
+    if (gdal_data_path.empty()) {
+        std::string gdal_local = exe_dir + "/gdal";
+#ifdef _WIN32
+        if (GetFileAttributesA((gdal_local + "/epsg.wkt").c_str()) != INVALID_FILE_ATTRIBUTES)
+            gdal_data_path = gdal_local;
+#else
+        if (fs::exists(gdal_local + "/epsg.wkt"))
+            gdal_data_path = gdal_local;
+#endif
+    }
+    if (proj_lib_path.empty()) {
+        std::string proj_local = exe_dir + "/proj";
+#ifdef _WIN32
+        if (GetFileAttributesA((proj_local + "/proj.db").c_str()) != INVALID_FILE_ATTRIBUTES)
+            proj_lib_path = proj_local;
+#else
+        if (fs::exists(proj_local + "/proj.db"))
+            proj_lib_path = proj_local;
 #endif
     }
 
-    // Set GDAL_DATA — always override to use vcpkg data next to exe
+    // Set GDAL_DATA
     // IMPORTANT: On Windows, SetEnvironmentVariableA doesn't update CRT's _environ,
     // so getenv() still returns the old value. Must use _putenv() + CPLSetConfigOption.
     {
-        std::string gdal = exe_dir + "/gdal";
-        std::string gdal_env = "GDAL_DATA=" + gdal;
+        std::string gdal_env = "GDAL_DATA=" + gdal_data_path;
 #ifdef _WIN32
         _putenv(gdal_env.c_str());
 #else
-        setenv("GDAL_DATA", gdal.c_str(), 1);
+        setenv("GDAL_DATA", gdal_data_path.c_str(), 1);
 #endif
-        CPLSetConfigOption("GDAL_DATA", gdal.c_str());
-        fprintf(stderr, "GDAL_DATA set to: %s\n", gdal.c_str());
+        CPLSetConfigOption("GDAL_DATA", gdal_data_path.c_str());
+        fprintf(stderr, "GDAL_DATA set to: %s\n", gdal_data_path.c_str());
     }
 
-    // Set PROJ_LIB — always override (critical for WKT SRS parsing)
+    // Set PROJ_LIB — critical for WKT SRS parsing
     {
-        std::string proj = exe_dir + "/proj";
-        std::string proj_env = "PROJ_LIB=" + proj;
+        std::string proj_env = "PROJ_LIB=" + proj_lib_path;
 #ifdef _WIN32
         _putenv(proj_env.c_str());
 #else
-        setenv("PROJ_LIB", proj.c_str(), 1);
+        setenv("PROJ_LIB", proj_lib_path.c_str(), 1);
 #endif
-        CPLSetConfigOption("PROJ_LIB", proj.c_str());
-        fprintf(stderr, "PROJ_LIB set to: %s\n", proj.c_str());
+        CPLSetConfigOption("PROJ_LIB", proj_lib_path.c_str());
+        fprintf(stderr, "PROJ_LIB set to: %s\n", proj_lib_path.c_str());
+    }
+
+    if (gdal_data_path.empty() || proj_lib_path.empty()) {
+        fprintf(stderr, "WARNING: GDAL_DATA or PROJ_LIB not found! "
+                "Coordinate transforms will fail.\n");
     }
 }
 

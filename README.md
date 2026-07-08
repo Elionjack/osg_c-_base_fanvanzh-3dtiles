@@ -62,10 +62,10 @@
 | tinygltf | glTF 2.0 / GLB 序列化 | ✅ |
 | GeographicLib | 大地水准面高度计算 | ✅ |
 | nlohmann_json | JSON 解析 | ✅ |
-| basisu | KTX2 纹理压缩 | ❌ 可选 |
-| Draco | 网格压缩 | ❌ 可选 |
-| meshoptimizer | 网格简化 | ❌ 可选 |
-| stb | 纹理 JPEG 编码 | ❌ 可选 |
+| basisu | KTX2 纹理压缩 (ETC1S) | ✅ |
+| Draco | 网格顶点/索引压缩 | ✅ |
+| meshoptimizer | 网格简化 + EXT_meshopt_compression | ✅ |
+| stb | 纹理 JPEG 编码 | ✅ |
 
 ### 构建
 
@@ -143,34 +143,38 @@ input_dir/
 
 ### 配置方式
 
-在 `src/main.cpp` 或 `src1.1/main.cpp` 中修改硬编码配置：
+**默认命令行模式**（`USE_HARDCODED_CONFIG = 0`）。两种 target 都支持：
+
+```bash
+# 1.0 版（输出 .b3dm）
+./osgb_converter -i E:\learning\data\1 -o E:\learning\data\output\my_test
+
+# 1.1 版（输出 .glb + 3DTILES_content_gltf）
+./osgb_converter_1_1 -i E:\learning\data\1 -o E:\learning\data\output\my_test_1_1
+
+# 启用压缩
+./osgb_converter_1_1 -i E:\learning\data\1 -o E:\learning\data\output\all_on \
+    --enable-simplify --enable-draco --enable-texture-compress
+```
+
+如需恢复硬编码配置，修改 `src/main.cpp` 或 `src1.1/main.cpp`：
 
 ```cpp
+#define USE_HARDCODED_CONFIG  1   // 改回 1，然后修改下方的 g_config
+
 static const HardcodedConfig g_config = {
     /* input_dir         */ R"(E:\learning\data\1)",
-    /* output_dir        */ R"(E:\learning\data\output\OSG_CJIAJIAbase3dtiles)",  // 1.0
-    // 或
-    /* output_dir        */ R"(E:\learning\data\output\OSG_CJIAJIAbase3dtiles_1_1)", // 1.1
+    /* output_dir        */ R"(E:\learning\data\output\OSG_CJIAJIAbase3dtiles)",
     /* config_json       */ "",
-    /* geoid_model       */ "none",         // none / egm84 / egm96 / egm2008
+    /* geoid_model       */ "none",
     /* geoid_path        */ "",
-    /* texture_compress  */ false,          // 需 basisu
-    /* meshopt           */ false,          // 需 meshoptimizer
-    /* draco             */ false,          // 需 Draco
-    /* unlit             */ true,           // KHR_materials_unlit
+    /* texture_compress  */ false,
+    /* meshopt           */ false,
+    /* draco             */ false,
+    /* unlit             */ true,
     /* override_lon/lat  */ 0.0,
     /* has_override_alt  */ false,
 };
-```
-
-设置 `USE_HARDCODED_CONFIG` 为 `0` 可切换为命令行模式：
-
-```bash
-# 1.0 版
-./osgb_converter -i ./input -o ./output -c '{"x":120.0,"y":30.0,"max_lvl":20}' --enable-unlit
-
-# 1.1 版
-./osgb_converter_1_1 -i ./input -o ./output -c '{"x":120.0,"y":30.0,"max_lvl":20}' --enable-unlit
 ```
 
 ### 输出结构
@@ -275,24 +279,33 @@ metadata.xml ──→ osgb_converter.cpp（主控）
 
 1. **坐标修正**（`InfoVisitor::apply`）：对 8 个包围盒角点做 `ToLocalENU` 变换，用 SVD 最小二乘求解最优仿射变换矩阵，批量纠正所有顶点——比逐顶点变换快一个数量级。
 
-2. **硬编码配置**：开发阶段不需要每次传命令行参数，直接修改 `main.cpp` 中的 `g_config` 结构体即可。
+2. **GDAL/PROJ 路径自动检测**：`setup_environment()` 通过 `VCPKG_ROOT` 环境变量自动定位 vcpkg 安装的 GDAL 和 PROJ 数据文件（proj.db、epsg.wkt），fallback 到 exe 同目录。解决 WKT SRS 解析需要 proj.db 的问题。
 
-3. **`model.buffers` 陷阱**：`tinygltf::Buffer` 写入数据后，**必须** `model.buffers.push_back(buffer)`，否则 GLB 不包含 BIN chunk，Cesium 加载后无模型显示。
+3. **OSG 插件路径修复**：OSG Registry 构造函数在 DLL 初始化时执行，早于 `main()`，无法读取环境变量。`log_osg_plugin_info()` 强制将 `OSG_LIBRARY_PATH` 注入 Registry 搜索路径列表，确保 `.osgb` 插件能被加载。
 
-4. **CMakeLists.txt 重构**：公共依赖提取为 `osgb_converter_deps` INTERFACE 库，通过 `configure_osgb_target()` CMake 函数消除两个 target 的重复配置。新增 target 只需 3 行：`set(SOURCES)` → `add_executable` → `configure_osgb_target`。
+4. **网格处理管线**（`write_osgGeometry`）：三步流水线：
+   - Step 1: meshopt 简化（去重、缓存优化、减面 target_ratio=0.5）
+   - Step 2: meshopt 流压缩（仅当 Draco 未启用时，`meshopt_encodeVertexBuffer` / `meshopt_encodeIndexBuffer`）或 Draco 压缩
+   - Step 3: 写入 glTF primitive + 对应扩展（`EXT_meshopt_compression` 或 `KHR_draco_mesh_compression`）
+   - 两种压缩互斥：同时开启时 meshopt 只简化、Draco 负责压缩
+
+5. **纹理处理**：`process_texture()` 支持 KTX2（Basis Universal ETC1S）和 JPEG fallback，统一通过 `mesh_processor.cpp` 调用。
+
+6. **`model.buffers` 陷阱**：`tinygltf::Buffer` 写入数据后，**必须** `model.buffers.push_back(buffer)`，否则 GLB 不包含 BIN chunk，Cesium 加载后无模型显示。
+
+7. **CMakeLists.txt 重构**：公共依赖提取为 `osgb_converter_deps` INTERFACE 库，通过 `configure_osgb_target()` CMake 函数消除两个 target 的重复配置。新增 target 只需 3 行：`set(SOURCES)` → `add_executable` → `configure_osgb_target`。
 
 ### 1.0 到 1.1 代码差异
 
-src1.1 相比 src 只改了 4 个文件：
+src/ 和 src1.1/ 现在共享完整的网格处理管线。核心差异仅在于输出格式：
 
-| 文件 | 改动 |
-|------|------|
-| `osg_gltf_converter.h` | 新增 `do_tile_job_1_1()`、`encode_tile_json_1_1()` 声明 |
-| `osg_gltf_converter.cpp` | 新增两个函数：输出 .glb 而非 .b3dm；JSON 含 `3DTILES_content_gltf` 扩展 |
-| `osgb_converter.cpp` | `version: "1.1"`、`extensionsUsed`/`extensionsRequired`、调用 1.1 函数 |
-| `main.cpp` | 输出目录改为 `..._1_1` |
-
-其余 10 个文件（坐标系统、大地水准面、网格处理等）完全相同。
+| 方面 | src/ (1.0) | src1.1/ (1.1) |
+|------|-----------|---------------|
+| tileset.json version | `"1.0"` | `"1.1"` + `extensionsUsed`/`extensionsRequired` |
+| 内容格式 | B3DM (.b3dm) | 原始 glTF (.glb) |
+| 内容扩展 | 无 | `3DTILES_content_gltf` |
+| Feature/Batch Table | 有 | 无 |
+| 构建目标 | `osgb_converter` | `osgb_converter_1_1` |
 
 ## 参数说明
 
@@ -323,6 +336,14 @@ src1.1 相比 src 只改了 4 个文件：
 ### 转换器提交历史
 
 ```
+NEWEST  Sync src1.1 mesh pipeline to src/, fix GDAL/PROJ/OSG paths, enable CLI
+        ↓
+        - Fix: GDAL_DATA & PROJ_LIB use VCPKG_ROOT auto-detection (proj.db needed for WKT)
+        - Fix: OSG_LIBRARY_PATH force-injected into Registry search list (DLL init order)
+        - Feat: full mesh pipeline in both src/ and src1.1/ (simplify → meshopt/Draco → KTX2)
+        - Feat: CLI mode as default (USE_HARDCODED_CONFIG=0), all switches as CLI args
+        - Refactor: process_texture() unified in mesh_processor, remove HAS_STB conditional
+        
 cffd8b2 Fix geometricError: leaf=0, parent=size*0.1, root capped at 2000
 7c420d4 Restore content-level boundingVolume in 1.1 tile JSON
 0d6aded Fix tile-edge gaps: remove tight content-level boundingVolume

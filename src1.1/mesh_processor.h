@@ -33,6 +33,30 @@ struct DracoCompressionParams {
     bool enable_compression = false;
 };
 
+// Meshopt compression parameters (for EXT_meshopt_compression)
+struct MeshoptCompressionParams {
+    int position_quantization_bits = 14;   // bits per component for positions (uint16)
+    int normal_quantization_bits = 8;      // bits per component for octahedral normals (int8)
+    int tex_coord_quantization_bits = 12;  // bits per component for UVs (uint16)
+    bool enable_compression = false;
+};
+
+// Result of meshopt geometry compression — one stream per attribute + indices
+struct MeshoptCompressionResult {
+    bool success = false;
+    // Compressed attribute streams: [0]=position, [1]=normal(optional), [2]=texcoord(optional)
+    struct AttrStream {
+        std::vector<unsigned char> data;
+        int component_count = 0;   // 3 for vec3, 2 for vec2
+        int byte_stride = 0;       // stride of quantized attribute in bytes
+        std::string filter;        // "NONE" for pos/uv, "OCTAHEDRAL" for normals
+    };
+    std::vector<AttrStream> attr_streams;
+    std::vector<unsigned char> index_data;  // compressed index buffer
+    size_t vertex_count = 0;
+    size_t index_count = 0;
+};
+
 // Function to compress image data to KTX2 using Basis Universal
 bool compress_to_ktx2(const std::vector<unsigned char>& rgba_data, int width, int height,
                       std::vector<unsigned char>& ktx2_data);
@@ -55,6 +79,12 @@ bool compress_mesh_geometry(osg::Geometry* geometry, const DracoCompressionParam
                            int* out_texcoord_att_id = nullptr,
                            int* out_batchid_att_id = nullptr,
                            const std::vector<float>* batchIds = nullptr);
+
+// Compress mesh geometry using meshopt (EXT_meshopt_compression)
+// Produces per-attribute quantized+encoded streams and compressed index stream
+bool compress_mesh_geometry_meshopt(osg::Geometry* geometry,
+                                    const MeshoptCompressionParams& params,
+                                    MeshoptCompressionResult& result);
 
 // Process textures (KTX2 compression)
 bool process_texture(osg::Texture* tex, std::vector<unsigned char>& image_data,
