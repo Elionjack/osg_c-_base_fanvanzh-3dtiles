@@ -1,5 +1,6 @@
 #include "osg_gltf_converter.h"
 #include "coordinate_transformer.h"
+#include "mesh_processor.h"
 
 #include <osg/Material>
 #include <osg/PagedLOD>
@@ -10,6 +11,7 @@
 
 #include <set>
 #include <map>
+#include <algorithm>
 #include <sstream>
 #include <cstdint>
 #include <limits>
@@ -18,9 +20,9 @@
 #define TINYGLTF_IMPLEMENTATION
 #include <tiny_gltf.h>
 
-#ifdef HAS_STB
-#include <stb_image_write.h>   // stbi_write_jpg_to_mem
-#endif
+// stb_image_write used by tinygltf's TINYGLTF_IMPLEMENTATION and by mesh_processor
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include <stb_image_write.h>
 
 // OSG plugin registration (needed for static linking on Linux/macOS)
 #if defined(__unix__) || defined(__APPLE__)
@@ -95,7 +97,32 @@ static std::string utf8_string(const char* path) {
 static void log_osg_plugin_info() {
     fprintf(stderr, "\n=== OpenSceneGraph Plugin Loading ===\n");
     osgDB::Registry* registry = osgDB::Registry::instance();
+
+    // OSG reads OSG_LIBRARY_PATH in Registry constructor, but that may have
+    // run before we set the env var (e.g. during DLL static init). Force-add
+    // any paths from the current OSG_LIBRARY_PATH env var to the search list.
     const char* osg_lib_path = getenv("OSG_LIBRARY_PATH");
+    if (osg_lib_path && osg_lib_path[0]) {
+        std::string env_paths(osg_lib_path);
+        auto& libPaths = registry->getLibraryFilePathList();
+        // Split by ';' (Windows) or ':' (Unix)
+#ifdef _WIN32
+        const char delim = ';';
+#else
+        const char delim = ':';
+#endif
+        size_t start = 0, end;
+        while ((end = env_paths.find(delim, start)) != std::string::npos) {
+            std::string one = env_paths.substr(start, end - start);
+            if (!one.empty() && std::find(libPaths.begin(), libPaths.end(), one) == libPaths.end())
+                libPaths.insert(libPaths.begin(), one);
+            start = end + 1;
+        }
+        std::string last = env_paths.substr(start);
+        if (!last.empty() && std::find(libPaths.begin(), libPaths.end(), last) == libPaths.end())
+            libPaths.insert(libPaths.begin(), last);
+    }
+
     fprintf(stderr, "OSG_LIBRARY_PATH: %s\n", osg_lib_path ? osg_lib_path : "NOT SET");
     const auto& libPaths = registry->getLibraryFilePathList();
     fprintf(stderr, "OSG Library Search Paths (%zu):\n", libPaths.size());
@@ -514,10 +541,28 @@ struct DracoState {
     int posId = -1, normId = -1, texId = -1, batchId = -1;
 };
 
+// Per-primitive state for EXT_meshopt_compression (analogous to DracoState)
+struct MeshoptState {
+    bool compressed = false;
+    struct StreamInfo {
+        int bufferView = -1;     // glTF bufferView index for this compressed stream
+        int count = 0;           // number of elements (vertices or indices)
+        std::string mode;        // "ATTRIBUTES" or "TRIANGLES"
+        std::string filter;      // "NONE" or "OCTAHEDRAL"
+        int byteStride = 0;      // stride of uncompressed data (0 for TRIANGLES mode)
+    };
+    std::vector<StreamInfo> streams;
+    // Which stream belongs to which attribute (-1 = absent)
+    int posStreamIdx = -1;
+    int normStreamIdx = -1;
+    int uvStreamIdx = -1;
+    int idxStreamIdx = -1;
+};
+
 // Write a single primitive set
 static void write_primitive(osg::Geometry* g, osg::PrimitiveSet* ps,
                             OsgBuildState* osgState, int* pmtVertex, int* pmtNormal, int* pmtTexcd,
-                            DracoState* dracoState) {
+                            DracoState* dracoState, MeshoptState* meshoptState) {
     tinygltf::Primitive prim;
     prim.indices = (int)osgState->model->accessors.size();
     osgState->draw_array_first = -1;
@@ -531,7 +576,17 @@ static void write_primitive(osg::Geometry* g, osg::PrimitiveSet* ps,
     switch (t) {
         case osg::PrimitiveSet::DrawElementsUBytePrimitiveType: {
             auto* de = static_cast<const osg::DrawElementsUByte*>(ps);
-            if (needs_tri) {
+            // Meshopt-compressed indices (entire buffer already compressed)
+            if (meshoptState && meshoptState->compressed && meshoptState->idxStreamIdx >= 0 && !needs_tri) {
+                auto& idxS = meshoptState->streams[meshoptState->idxStreamIdx];
+                tinygltf::Accessor acc;
+                acc.bufferView = idxS.bufferView;
+                acc.type = TINYGLTF_TYPE_SCALAR;
+                acc.componentType = TINYGLTF_COMPONENT_TYPE_UNSIGNED_INT;
+                acc.count = idxS.count;
+                prim.indices = (int)osgState->model->accessors.size();
+                osgState->model->accessors.push_back(acc);
+            } else if (needs_tri) {
                 std::vector<uint32_t> src; src.reserve(de->size());
                 for (unsigned m = 0; m < de->size(); m++) src.push_back(de->at(m));
                 if (triangulate_quads(src, gl_mode, tri_indices))
@@ -554,7 +609,17 @@ static void write_primitive(osg::Geometry* g, osg::PrimitiveSet* ps,
         }
         case osg::PrimitiveSet::DrawElementsUShortPrimitiveType: {
             auto* de = static_cast<const osg::DrawElementsUShort*>(ps);
-            if (needs_tri) {
+            // Meshopt-compressed indices
+            if (meshoptState && meshoptState->compressed && meshoptState->idxStreamIdx >= 0 && !needs_tri) {
+                auto& idxS = meshoptState->streams[meshoptState->idxStreamIdx];
+                tinygltf::Accessor acc;
+                acc.bufferView = idxS.bufferView;
+                acc.type = TINYGLTF_TYPE_SCALAR;
+                acc.componentType = TINYGLTF_COMPONENT_TYPE_UNSIGNED_INT;
+                acc.count = idxS.count;
+                prim.indices = (int)osgState->model->accessors.size();
+                osgState->model->accessors.push_back(acc);
+            } else if (needs_tri) {
                 std::vector<uint32_t> src; src.reserve(de->size());
                 for (unsigned m = 0; m < de->size(); m++) src.push_back(de->at(m));
                 if (triangulate_quads(src, gl_mode, tri_indices))
@@ -577,7 +642,17 @@ static void write_primitive(osg::Geometry* g, osg::PrimitiveSet* ps,
         }
         case osg::PrimitiveSet::DrawElementsUIntPrimitiveType: {
             auto* de = static_cast<const osg::DrawElementsUInt*>(ps);
-            if (needs_tri) {
+            // Meshopt-compressed indices
+            if (meshoptState && meshoptState->compressed && meshoptState->idxStreamIdx >= 0 && !needs_tri) {
+                auto& idxS = meshoptState->streams[meshoptState->idxStreamIdx];
+                tinygltf::Accessor acc;
+                acc.bufferView = idxS.bufferView;
+                acc.type = TINYGLTF_TYPE_SCALAR;
+                acc.componentType = TINYGLTF_COMPONENT_TYPE_UNSIGNED_INT;
+                acc.count = idxS.count;
+                prim.indices = (int)osgState->model->accessors.size();
+                osgState->model->accessors.push_back(acc);
+            } else if (needs_tri) {
                 std::vector<uint32_t> src; src.reserve(de->size());
                 for (unsigned m = 0; m < de->size(); m++) src.push_back(de->at(m));
                 if (triangulate_quads(src, gl_mode, tri_indices))
@@ -621,7 +696,27 @@ static void write_primitive(osg::Geometry* g, osg::PrimitiveSet* ps,
     if (*pmtVertex > -1 && osgState->draw_array_first == -1) {
         prim.attributes["POSITION"] = *pmtVertex;
     } else {
-        if (dracoState->compressed) {
+        // Meshopt-compressed position (bufferView already contains compressed data)
+        if (meshoptState && meshoptState->compressed && meshoptState->posStreamIdx >= 0) {
+            auto& posS = meshoptState->streams[meshoptState->posStreamIdx];
+            tinygltf::Accessor acc;
+            acc.bufferView = posS.bufferView;
+            acc.componentType = TINYGLTF_COMPONENT_TYPE_FLOAT;
+            acc.count = posS.count;
+            acc.type = TINYGLTF_TYPE_VEC3;
+            osg::Vec3f pmax(-1e38f,-1e38f,-1e38f), pmin(1e38f,1e38f,1e38f);
+            int vs = (osgState->draw_array_first >= 0) ? osgState->draw_array_first : 0;
+            int ve = (osgState->draw_array_first >= 0) ? (osgState->draw_array_count + vs) : (int)varr->size();
+            for (int vi = vs; vi < ve; vi++) expand_bbox3d(pmax, pmin, varr->at(vi));
+            acc.minValues = {(double)pmin.x(), (double)pmin.y(), (double)pmin.z()};
+            acc.maxValues = {(double)pmax.x(), (double)pmax.y(), (double)pmax.z()};
+            int accIdx = (int)osgState->model->accessors.size();
+            osgState->model->accessors.push_back(acc);
+            prim.attributes["POSITION"] = accIdx;
+            if (*pmtVertex == -1 && osgState->draw_array_first == -1) *pmtVertex = accIdx;
+            expand_bbox3d(osgState->point_max, osgState->point_min, pmax);
+            expand_bbox3d(osgState->point_max, osgState->point_min, pmin);
+        } else if (dracoState->compressed) {
             tinygltf::Accessor acc;
             acc.bufferView = -1;
             acc.componentType = TINYGLTF_COMPONENT_TYPE_FLOAT;
@@ -656,7 +751,19 @@ static void write_primitive(osg::Geometry* g, osg::PrimitiveSet* ps,
         if (*pmtNormal > -1 && osgState->draw_array_first == -1) {
             prim.attributes["NORMAL"] = *pmtNormal;
         } else {
-            if (dracoState->compressed) {
+            // Meshopt-compressed normal
+            if (meshoptState && meshoptState->compressed && meshoptState->normStreamIdx >= 0) {
+                auto& normS = meshoptState->streams[meshoptState->normStreamIdx];
+                tinygltf::Accessor acc;
+                acc.bufferView = normS.bufferView;
+                acc.componentType = TINYGLTF_COMPONENT_TYPE_FLOAT;
+                acc.count = normS.count;
+                acc.type = TINYGLTF_TYPE_VEC3;
+                int accIdx = (int)osgState->model->accessors.size();
+                osgState->model->accessors.push_back(acc);
+                prim.attributes["NORMAL"] = accIdx;
+                if (*pmtNormal == -1 && osgState->draw_array_first == -1) *pmtNormal = accIdx;
+            } else if (dracoState->compressed) {
                 tinygltf::Accessor acc;
                 acc.bufferView = -1;
                 acc.componentType = TINYGLTF_COMPONENT_TYPE_FLOAT;
@@ -682,7 +789,19 @@ static void write_primitive(osg::Geometry* g, osg::PrimitiveSet* ps,
         if (*pmtTexcd > -1 && osgState->draw_array_first == -1) {
             prim.attributes["TEXCOORD_0"] = *pmtTexcd;
         } else {
-            if (dracoState->compressed) {
+            // Meshopt-compressed texcoord
+            if (meshoptState && meshoptState->compressed && meshoptState->uvStreamIdx >= 0) {
+                auto& uvS = meshoptState->streams[meshoptState->uvStreamIdx];
+                tinygltf::Accessor acc;
+                acc.bufferView = uvS.bufferView;
+                acc.componentType = TINYGLTF_COMPONENT_TYPE_FLOAT;
+                acc.count = uvS.count;
+                acc.type = TINYGLTF_TYPE_VEC2;
+                int accIdx = (int)osgState->model->accessors.size();
+                osgState->model->accessors.push_back(acc);
+                prim.attributes["TEXCOORD_0"] = accIdx;
+                if (*pmtTexcd == -1 && osgState->draw_array_first == -1) *pmtTexcd = accIdx;
+            } else if (dracoState->compressed) {
                 tinygltf::Accessor acc;
                 acc.bufferView = -1;
                 acc.componentType = TINYGLTF_COMPONENT_TYPE_FLOAT;
@@ -733,6 +852,22 @@ static void write_primitive(osg::Geometry* g, osg::PrimitiveSet* ps,
         dracoExt["attributes"] = tinygltf::Value(attr);
         bp.extensions["KHR_draco_mesh_compression"] = tinygltf::Value(dracoExt);
     }
+
+    // EXT_meshopt_compression extension (array of per-stream objects)
+    if (meshoptState && meshoptState->compressed && !meshoptState->streams.empty()) {
+        auto& prim = osgState->model->meshes.back().primitives.back();
+        tinygltf::Value::Array meshoptExts;
+        for (auto& si : meshoptState->streams) {
+            tinygltf::Value::Object obj;
+            obj["bufferView"] = tinygltf::Value(si.bufferView);
+            obj["count"] = tinygltf::Value(si.count);
+            obj["byteStride"] = tinygltf::Value(si.byteStride);
+            obj["mode"] = tinygltf::Value(si.mode);
+            obj["filter"] = tinygltf::Value(si.filter);
+            meshoptExts.push_back(tinygltf::Value(obj));
+        }
+        prim.extensions["EXT_meshopt_compression"] = tinygltf::Value(meshoptExts);
+    }
 }
 
 static tinygltf::Material make_default_material(double r = 1.0, double g = 1.0, double b = 1.0) {
@@ -749,20 +884,131 @@ static tinygltf::Material make_default_material(double r = 1.0, double g = 1.0, 
 // ============================================================
 static void write_osgGeometry(osg::Geometry* g, OsgBuildState* osgState,
                               bool enable_simplify, bool enable_draco) {
-    // Optional simplification
+    // ================================================================
+    // Step 1: Mesh simplification (meshoptimizer)
+    // ================================================================
+    MeshoptState meshoptState;
     if (enable_simplify) {
-        LOG_I("simplification requested but mesh_processor not linked; skipping");
+        SimplificationParams sParams;
+        sParams.enable_simplification = true;
+        ::simplify_mesh_geometry(g, sParams);
+
+        // If Draco is NOT also enabled, apply meshopt stream compression
+        // so pure --enable-simplify produces EXT_meshopt_compression output
+        if (!enable_draco) {
+            MeshoptCompressionParams mParams;
+            mParams.enable_compression = true;
+            MeshoptCompressionResult mResult;
+            if (::compress_mesh_geometry_meshopt(g, mParams, mResult)) {
+                meshoptState.compressed = true;
+                auto& model = *osgState->model;
+                auto& buffer = *osgState->buffer;
+
+                // --- Write each attribute stream into its own bufferView ---
+                // attr_streams order: [0]=pos, [1]=normal(opt), [2]=texcoord(opt)
+                int sIdx = 0;
+                for (size_t ai = 0; ai < mResult.attr_streams.size(); ++ai) {
+                    auto& attr = mResult.attr_streams[ai];
+                    unsigned bufStart = (unsigned)buffer.data.size();
+                    buffer.data.insert(buffer.data.end(), attr.data.begin(), attr.data.end());
+                    alignment_buffer(buffer.data);
+
+                    tinygltf::BufferView bv;
+                    bv.buffer = 0;
+                    bv.byteOffset = (int)bufStart;
+                    bv.byteLength = (int)(buffer.data.size() - bufStart);
+                    int bvIdx = (int)model.bufferViews.size();
+                    model.bufferViews.push_back(bv);
+
+                    MeshoptState::StreamInfo si;
+                    si.bufferView = bvIdx;
+                    si.count = (int)mResult.vertex_count;
+                    si.mode = "ATTRIBUTES";
+                    si.filter = attr.filter;
+                    si.byteStride = attr.byte_stride;
+                    meshoptState.streams.push_back(si);
+
+                    // Map stream index to attribute type
+                    if (ai == 0)
+                        meshoptState.posStreamIdx = sIdx;
+                    else if (ai == 1 && attr.component_count == 3)
+                        meshoptState.normStreamIdx = sIdx;
+                    else
+                        meshoptState.uvStreamIdx = sIdx;
+                    ++sIdx;
+                }
+
+                // --- Write compressed index stream ---
+                if (!mResult.index_data.empty()) {
+                    unsigned bufStart = (unsigned)buffer.data.size();
+                    buffer.data.insert(buffer.data.end(),
+                        mResult.index_data.begin(), mResult.index_data.end());
+                    alignment_buffer(buffer.data);
+
+                    tinygltf::BufferView bv;
+                    bv.buffer = 0;
+                    bv.byteOffset = (int)bufStart;
+                    bv.byteLength = (int)(buffer.data.size() - bufStart);
+                    int bvIdx = (int)model.bufferViews.size();
+                    model.bufferViews.push_back(bv);
+
+                    MeshoptState::StreamInfo si;
+                    si.bufferView = bvIdx;
+                    si.count = (int)mResult.index_count;
+                    si.mode = "TRIANGLES";
+                    si.filter = "NONE";
+                    si.byteStride = 0;
+                    meshoptState.streams.push_back(si);
+                    meshoptState.idxStreamIdx = sIdx;
+                }
+            }
+        }
     }
 
+    // ================================================================
+    // Step 2: Draco vertex compression
+    // ================================================================
     DracoState dracoState;
     if (enable_draco) {
-        LOG_I("Draco requested but mesh_processor not linked; skipping");
+        std::vector<unsigned char> compressed_data;
+        size_t compressed_size = 0;
+        DracoCompressionParams draco_params;
+        draco_params.enable_compression = true;
+        int dracoPosId = -1, dracoNormId = -1, dracoTexId = -1, dracoBatchId = -1;
+        bool ok = ::compress_mesh_geometry(g, draco_params,
+            compressed_data, compressed_size,
+            &dracoPosId, &dracoNormId, &dracoTexId, &dracoBatchId, nullptr);
+        if (ok && compressed_size > 0) {
+            auto& model = *osgState->model;
+            auto& buffer = *osgState->buffer;
+            alignment_buffer(buffer.data);
+            unsigned bufOffset = (unsigned)buffer.data.size();
+            buffer.data.resize(bufOffset + compressed_size);
+            std::memcpy(buffer.data.data() + bufOffset, compressed_data.data(), compressed_size);
+
+            tinygltf::BufferView bv;
+            bv.buffer = 0;
+            bv.byteOffset = (int)bufOffset;
+            bv.byteLength = (int)compressed_size;
+            int bvIdx = (int)model.bufferViews.size();
+            model.bufferViews.push_back(bv);
+
+            dracoState.compressed = true;
+            dracoState.bufferView = bvIdx;
+            dracoState.posId = dracoPosId;
+            dracoState.normId = dracoNormId;
+            dracoState.texId = dracoTexId;
+            dracoState.batchId = dracoBatchId;
+        }
     }
 
+    // ================================================================
+    // Step 3: Write per-primitive glTF data
+    // ================================================================
     int pmtV = -1, pmtN = -1, pmtT = -1;
     for (unsigned k = 0; k < g->getNumPrimitiveSets(); k++) {
         osg::PrimitiveSet* ps = g->getPrimitiveSet(k);
-        write_primitive(g, ps, osgState, &pmtV, &pmtN, &pmtT, &dracoState);
+        write_primitive(g, ps, osgState, &pmtV, &pmtN, &pmtT, &dracoState, &meshoptState);
     }
 }
 
@@ -832,60 +1078,13 @@ bool osgb2glb_buf(std::string path, std::string& glb_buff, MeshInfo& mesh_info,
     mesh_info.min = { (double)osgState.point_min.x(), (double)osgState.point_min.y(), (double)osgState.point_min.z() };
     mesh_info.max = { (double)osgState.point_max.x(), (double)osgState.point_max.y(), (double)osgState.point_max.z() };
 
-    // Process textures — encode to JPEG using stb_image_write, or skip if unavailable
-#ifdef HAS_STB
-    // stb write callback: append data to a vector
-    static auto stb_append_vec = [](void* ctx, void* data, int size) {
-        auto* vec = static_cast<std::vector<unsigned char>*>(ctx);
-        auto* bytes = static_cast<unsigned char*>(data);
-        vec->insert(vec->end(), bytes, bytes + size);
-    };
-#endif
-
+    // Process textures via mesh_processor (KTX2 if enabled, JPEG fallback)
     for (auto tex : infoVisitor.texture_array) {
         unsigned bufStart = (unsigned)buffer.data.size();
         std::vector<unsigned char> imgData;
         std::string mimeType;
 
-        if (tex && tex->getNumImages() > 0) {
-            osg::Image* img = tex->getImage(0);
-            if (img) {
-                int w = img->s(), h = img->t();
-                int fmt = img->getPixelFormat();
-                const unsigned char* src = img->data();
-
-#ifdef HAS_STB
-                // Properly encode to JPEG using stb_image_write
-                if (fmt == GL_RGB || fmt == GL_RGBA || fmt == GL_BGRA) {
-                    std::vector<unsigned char> rgba;
-                    const unsigned char* pixels = src;
-                    if (fmt == GL_BGRA) {
-                        rgba.resize(w * h * 4);
-                        for (int i = 0; i < w * h; i++) {
-                            rgba[i*4+0] = src[i*4+2];
-                            rgba[i*4+1] = src[i*4+1];
-                            rgba[i*4+2] = src[i*4+0];
-                            rgba[i*4+3] = src[i*4+3];
-                        }
-                        pixels = rgba.data();
-                        fmt = GL_RGBA;
-                    }
-
-                    int quality = 85;
-                    int channels = (fmt == GL_RGB) ? 3 : 4;
-                    if (stbi_write_jpg_to_func(stb_append_vec, &imgData, w, h, channels, pixels, quality) != 0) {
-                        mimeType = "image/jpeg";
-                    }
-                }
-#else
-                // No encoder available — skip (don't embed raw pixels as JPEG)
-                (void)w; (void)fmt; (void)src;
-                LOG_W("Texture skipped: stb_image_write not available");
-#endif
-            }
-        }
-
-        if (!imgData.empty()) {
+        if (::process_texture(tex, imgData, mimeType, enable_texture_compress)) {
             buffer.data.insert(buffer.data.end(), imgData.begin(), imgData.end());
 
             tinygltf::Image imgObj;
@@ -931,6 +1130,10 @@ bool osgb2glb_buf(std::string path, std::string& glb_buff, MeshInfo& mesh_info,
     if (enable_draco) {
         model.extensionsRequired.push_back("KHR_draco_mesh_compression");
         model.extensionsUsed.push_back("KHR_draco_mesh_compression");
+    }
+    if (enable_meshopt && !enable_draco) {
+        model.extensionsRequired.push_back("EXT_meshopt_compression");
+        model.extensionsUsed.push_back("EXT_meshopt_compression");
     }
 
     // Materials — always set a visible baseColorFactor so model is visible even without textures

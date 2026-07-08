@@ -32,38 +32,23 @@ endif()
 # GeographicLib (geoid height correction)
 find_package(GeographicLib CONFIG REQUIRED)
 
-# Optional: basisu (KTX2 texture compression)
-find_package(basisu CONFIG QUIET)
-if(basisu_FOUND)
-    message(STATUS "basisu found: KTX2 texture compression enabled")
-    add_compile_definitions(HAS_BASISU)
-else()
-    message(WARNING "basisu not found - KTX2 compression disabled")
-endif()
+# Required: basisu (KTX2 texture compression)
+find_package(basisu CONFIG REQUIRED)
+message(STATUS "basisu found: KTX2 texture compression enabled")
 
-# Optional: Draco (mesh compression)
-find_package(draco CONFIG QUIET)
-if(draco_FOUND)
-    message(STATUS "Draco found: mesh compression enabled")
-    add_compile_definitions(HAS_DRACO)
-else()
-    message(WARNING "Draco not found - mesh compression disabled")
-endif()
+# Required: Draco (mesh compression)
+find_package(draco CONFIG REQUIRED)
+message(STATUS "Draco found: mesh compression enabled")
 
-# Optional: meshoptimizer (mesh simplification)
-find_package(meshoptimizer CONFIG QUIET)
-if(meshoptimizer_FOUND)
-    message(STATUS "meshoptimizer found: mesh simplification enabled")
-    add_compile_definitions(HAS_MESHOPTIMIZER)
-else()
-    message(WARNING "meshoptimizer not found - mesh simplification disabled")
-endif()
+# Required: meshoptimizer (mesh simplification)
+find_package(meshoptimizer CONFIG REQUIRED)
+message(STATUS "meshoptimizer found: mesh simplification enabled")
 
-# Optional: stb (image I/O)
-find_package(Stb QUIET)
-if(Stb_FOUND)
-    add_compile_definitions(HAS_STB)
-endif()
+# Required: stb (image I/O)
+find_package(Stb REQUIRED)
+
+# Legacy definitions for src/ files still using #ifdef guards
+add_compile_definitions(HAS_STB HAS_DRACO HAS_MESHOPTIMIZER HAS_BASISU)
 
 # ============================================================
 # Common dependency interface library
@@ -85,15 +70,9 @@ target_link_libraries(osgb_converter_deps INTERFACE
     ${GeographicLib_LIBRARIES}
 )
 
-if(basisu_FOUND)
-    target_link_libraries(osgb_converter_deps INTERFACE basisu::basisu_encoder)
-endif()
-if(draco_FOUND)
-    target_link_libraries(osgb_converter_deps INTERFACE draco::draco)
-endif()
-if(meshoptimizer_FOUND)
-    target_link_libraries(osgb_converter_deps INTERFACE meshoptimizer::meshoptimizer)
-endif()
+target_link_libraries(osgb_converter_deps INTERFACE basisu::basisu_encoder)
+target_link_libraries(osgb_converter_deps INTERFACE draco::draco)
+target_link_libraries(osgb_converter_deps INTERFACE meshoptimizer::meshoptimizer)
 
 # ============================================================
 # Helper: apply per-target settings
