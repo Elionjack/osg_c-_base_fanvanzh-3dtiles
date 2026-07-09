@@ -12,6 +12,9 @@
 #include <algorithm>
 #include <chrono>
 #include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <future>
 #include <functional>
 #include <glm/gtc/type_ptr.hpp>
 
@@ -389,6 +392,27 @@ int convert_osgb(const ConvertOptions& opts) {
         std::vector<double> box_v;
     };
 
+    // ============================================================
+    // Helper: parallel tile processing with concurrency limiter
+    // ============================================================
+    class Semaphore {
+        std::mutex mtx;
+        std::condition_variable cv;
+        size_t count;
+    public:
+        explicit Semaphore(size_t n) : count(n) {}
+        void acquire() {
+            std::unique_lock<std::mutex> lock(mtx);
+            cv.wait(lock, [&] { return count > 0; });
+            --count;
+        }
+        void release() {
+            std::unique_lock<std::mutex> lock(mtx);
+            ++count;
+            cv.notify_one();
+        }
+    };
+
     // Helper: recursively fix content URIs in tile JSON tree
     // so they point to glb files relative to root output directory
     std::function<void(json&, const std::string&)> fix_tile_uris;
@@ -408,7 +432,16 @@ int convert_osgb(const ConvertOptions& opts) {
         }
     };
 
-    std::vector<TileResult> tile_results;
+    // ============================================================
+    // Collect top-level tile directories first (so we can process in parallel)
+    // ============================================================
+    struct TileJob {
+        fs::path tile_dir;
+        std::string stem;
+        fs::path osgb_file;
+        fs::path out_tile_dir;
+    };
+    std::vector<TileJob> jobs;
 
     for (auto& entry : fs::directory_iterator(data_dir)) {
         if (!entry.is_directory()) continue;
@@ -424,52 +457,86 @@ int convert_osgb(const ConvertOptions& opts) {
 
         fs::path out_tile_dir = out_dir / "Data" / stem;
         fs::create_directories(out_tile_dir);
-
-        std::string osgb_path = osgb_file.string();
-        LOG_I("Processing: %s", osgb_path.c_str());
-
-        // Build OSGB tree
-        std::string path_copy = osgb_path;
-        osg_tree root = get_all_tree(path_copy);
-        if (root.file_name.empty()) {
-            LOG_E("Failed to read: %s", osgb_path.c_str());
-            continue;
-        }
-
-        // Convert all tiles in this tree (3D Tiles 1.1: raw .glb output)
-        do_tile_job_1_1(root, out_tile_dir.string(), max_lvl,
-                    opts.enable_texture_compress, opts.enable_meshopt,
-                    opts.enable_draco, opts.enable_unlit);
-
-        // Compute bounding box and geometric error
-        extend_tile_box(root);
-        if (root.bbox.max.empty() || root.bbox.min.empty()) {
-            LOG_E("Empty bounding box for: %s", osgb_path.c_str());
-            continue;
-        }
-
-        calc_geometric_error(root);
-
-        // Generate tile JSON (3D Tiles 1.1 with 3DTILES_content_gltf), parse it,
-        // and fix URIs to point to glb files relative to the root output directory
-        std::string json_str = encode_tile_json_1_1(root, degree2rad(center_x), degree2rad(center_y));
-        json tile_tree = json::parse(json_str.empty() ? "{}" : json_str);
-
-        // Prefix: "/Data/Tile_-051_+050" so URIs become "./Data/Tile_-051_+050/Tile_xxx.glb"
-        std::string uri_prefix = "/Data/" + stem;
-        fix_tile_uris(tile_tree, uri_prefix);
-
-        std::vector<double> box_v;
-        box_v.insert(box_v.end(), root.bbox.max.begin(), root.bbox.max.end());
-        box_v.insert(box_v.end(), root.bbox.min.begin(), root.bbox.min.end());
-
-        root.bbox.extend(0.2);
-        std::vector<double> box_full;
-        box_full.insert(box_full.end(), root.bbox.max.begin(), root.bbox.max.end());
-        box_full.insert(box_full.end(), root.bbox.min.begin(), root.bbox.min.end());
-
-        tile_results.push_back({tile_tree, box_full});
+        jobs.push_back({tile_dir, stem, osgb_file, out_tile_dir});
     }
+
+    LOG_I("Found %zu top-level tiles, processing in parallel...", jobs.size());
+
+    // ============================================================
+    // Process tiles in parallel with concurrency limit
+    // ============================================================
+    std::mutex tile_results_mutex;
+    std::vector<TileResult> tile_results;
+    Semaphore sem(std::thread::hardware_concurrency());
+    std::vector<std::future<void>> futures;
+
+    for (const auto& job : jobs) {
+        sem.acquire();
+
+        // Capture everything by value for thread safety
+        auto task = [&tile_results_mutex, &tile_results, &sem,
+                     fix_tile_uris,
+                     osgb_path = job.osgb_file.string(),
+                     stem = job.stem,
+                     out_tile_dir = job.out_tile_dir,
+                     max_lvl,
+                     &opts,
+                     center_x, center_y]() {
+            LOG_I("Processing: %s", osgb_path.c_str());
+
+            // Build OSGB tree
+            std::string path_copy = osgb_path;
+            osg_tree root = get_all_tree(path_copy);
+            if (root.file_name.empty()) {
+                LOG_E("Failed to read: %s", osgb_path.c_str());
+                sem.release();
+                return;
+            }
+
+            // Convert all tiles in this tree (3D Tiles 1.1: raw .glb output)
+            do_tile_job_1_1(root, out_tile_dir.string(), max_lvl,
+                        opts.enable_texture_compress, opts.enable_meshopt,
+                        opts.enable_draco, opts.enable_unlit);
+
+            // Compute bounding box and geometric error
+            extend_tile_box(root);
+            if (root.bbox.max.empty() || root.bbox.min.empty()) {
+                LOG_E("Empty bounding box for: %s", osgb_path.c_str());
+                sem.release();
+                return;
+            }
+
+            calc_geometric_error(root);
+
+            // Generate tile JSON
+            std::string json_str = encode_tile_json_1_1(root, degree2rad(center_x), degree2rad(center_y));
+            json tile_tree = json::parse(json_str.empty() ? "{}" : json_str);
+
+            std::string uri_prefix = "/Data/" + stem;
+            fix_tile_uris(tile_tree, uri_prefix);
+
+            std::vector<double> box_v;
+            box_v.insert(box_v.end(), root.bbox.max.begin(), root.bbox.max.end());
+            box_v.insert(box_v.end(), root.bbox.min.begin(), root.bbox.min.end());
+
+            root.bbox.extend(0.2);
+            std::vector<double> box_full;
+            box_full.insert(box_full.end(), root.bbox.max.begin(), root.bbox.max.end());
+            box_full.insert(box_full.end(), root.bbox.min.begin(), root.bbox.min.end());
+
+            {
+                std::lock_guard<std::mutex> lock(tile_results_mutex);
+                tile_results.push_back({tile_tree, box_full});
+            }
+
+            sem.release();
+        };
+
+        futures.push_back(std::async(std::launch::async, std::move(task)));
+    }
+
+    // Wait for all tasks to complete
+    for (auto& f : futures) f.get();
 
     if (tile_results.empty()) {
         LOG_E("No tiles were converted");
