@@ -22,6 +22,14 @@ struct ConvertOptions {
     std::string geoid_model = "none";
     std::string geoid_path;
 
+    // Root tile reconstruction (merge coarsest LODs into overview GLB)
+    bool enable_top_reconstruct = false;
+    int  top_texture_max_size = 512;  // max texture dimension for root GLB (0=no limit)
+    double simplify_ratio = 0.5;       // meshopt target_ratio (1.0=no simplify)
+    int  draco_pos_bits = 11;          // Draco position quantization bits
+    int  draco_normal_bits = 10;       // Draco normal quantization bits
+    int  draco_uv_bits = 12;           // Draco texcoord quantization bits
+
     // Override values from config/cli
     double center_x = 0.0;   // longitude
     double center_y = 0.0;   // latitude

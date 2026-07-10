@@ -35,18 +35,27 @@ osg_tree get_all_tree(std::string& file_name);
 bool osgb2glb_buf(std::string path, std::string& glb_buff, MeshInfo& mesh_info,
                   int node_type, bool enable_texture_compress = false,
                   bool enable_meshopt = false, bool enable_draco = false,
-                  bool enable_unlit = true);
+                  bool enable_unlit = true,
+                  double simplify_ratio = 0.5,
+                  int draco_pos_bits = 11, int draco_normal_bits = 10,
+                  int draco_uv_bits = 12);
 
 // Convert OSGB file to B3DM buffer (includes GLB inside)
 bool osgb2b3dm_buf(std::string path, std::string& b3dm_buf, TileBox& tile_box,
                    int node_type, bool enable_texture_compress = false,
                    bool enable_meshopt = false, bool enable_draco = false,
-                   bool enable_unlit = true);
+                   bool enable_unlit = true,
+                   double simplify_ratio = 0.5,
+                   int draco_pos_bits = 11, int draco_normal_bits = 10,
+                   int draco_uv_bits = 12);
 
 // Process all tiles recursively
 void do_tile_job(osg_tree& tree, std::string out_path, int max_lvl,
                  bool enable_texture_compress = false, bool enable_meshopt = false,
-                 bool enable_draco = false, bool enable_unlit = true);
+                 bool enable_draco = false, bool enable_unlit = true,
+                 double simplify_ratio = 0.5,
+                 int draco_pos_bits = 11, int draco_normal_bits = 10,
+                 int draco_uv_bits = 12);
 
 // Bounding box operations
 void expend_box(TileBox& box, TileBox& box_new);
@@ -64,7 +73,10 @@ std::string get_boundingBox(TileBox bbox);
 // Process all tiles recursively — outputs raw .glb (no B3DM wrapper)
 void do_tile_job_1_1(osg_tree& tree, std::string out_path, int max_lvl,
                      bool enable_texture_compress = false, bool enable_meshopt = false,
-                     bool enable_draco = false, bool enable_unlit = true);
+                     bool enable_draco = false, bool enable_unlit = true,
+                     double simplify_ratio = 0.5,
+                     int draco_pos_bits = 11, int draco_normal_bits = 10,
+                     int draco_uv_bits = 12);
 
 // JSON generation for tile trees (3D Tiles 1.1 compatible)
 // Uses 3DTILES_content_gltf extension and .glb URIs
@@ -73,3 +85,29 @@ std::string encode_tile_json_1_1(osg_tree& tree, double x, double y);
 // Global transformer access
 coords::CoordinateTransformer* GetGlobalTransformer();
 void SetGlobalTransformer(coords::CoordinateTransformer* t);
+
+// ============================================================
+// Root tile reconstruction (top-level merge)
+// ============================================================
+
+// Find the file path of the coarsest-LOD node in a tile tree.
+// Returns the file_name of the node with the highest _Lxx level number.
+// Falls back to the tree's own file_name if no coarser children found.
+std::string find_coarsest_node(const osg_tree& tree);
+
+// Build a merged root-level GLB from multiple OSGB files.
+// Loads each file, applies SVD coordinate correction, merges all
+// geometry into one tinygltf::Model, and serializes to GLB.
+// Returns the GLB buffer and combined bounding box via out parameters.
+bool build_merged_root_glb(
+    const std::vector<std::string>& coarsest_paths,
+    std::string& out_glb_buf,
+    TileBox& out_bbox,
+    bool enable_texture_compress,
+    bool enable_meshopt,
+    bool enable_draco,
+    bool enable_unlit,
+    int top_texture_max_size = 512,
+    double simplify_ratio = 0.5,
+    int draco_pos_bits = 11, int draco_normal_bits = 10,
+    int draco_uv_bits = 12);
