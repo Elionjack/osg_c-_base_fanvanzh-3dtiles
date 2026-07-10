@@ -13,6 +13,7 @@
 #include <map>
 #include <algorithm>
 #include <sstream>
+#include <functional>
 #include <cstdint>
 #include <limits>
 #include <cstdlib>
@@ -23,6 +24,10 @@
 // stb_image_write used by tinygltf's TINYGLTF_IMPLEMENTATION and by mesh_processor
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include <stb_image_write.h>
+
+// stb_image_resize for root tile texture downsampling
+#define STB_IMAGE_RESIZE_IMPLEMENTATION
+#include <stb_image_resize2.h>
 
 // OSG plugin registration (needed for static linking on Linux/macOS)
 #if defined(__unix__) || defined(__APPLE__)
@@ -883,7 +888,10 @@ static tinygltf::Material make_default_material(double r = 1.0, double g = 1.0, 
 // Main conversion: OSGB geometry → GLB buffer
 // ============================================================
 static void write_osgGeometry(osg::Geometry* g, OsgBuildState* osgState,
-                              bool enable_simplify, bool enable_draco) {
+                              bool enable_simplify, bool enable_draco,
+                              double simplify_ratio = 0.5,
+                              int draco_pos_bits = 11, int draco_normal_bits = 10,
+                              int draco_uv_bits = 12) {
     // ================================================================
     // Step 1: Mesh simplification (meshoptimizer)
     // ================================================================
@@ -891,6 +899,7 @@ static void write_osgGeometry(osg::Geometry* g, OsgBuildState* osgState,
     if (enable_simplify) {
         SimplificationParams sParams;
         sParams.enable_simplification = true;
+        sParams.target_ratio = (float)simplify_ratio;
         ::simplify_mesh_geometry(g, sParams);
 
         // If Draco is NOT also enabled, apply meshopt stream compression
@@ -974,6 +983,9 @@ static void write_osgGeometry(osg::Geometry* g, OsgBuildState* osgState,
         size_t compressed_size = 0;
         DracoCompressionParams draco_params;
         draco_params.enable_compression = true;
+        draco_params.position_quantization_bits = draco_pos_bits;
+        draco_params.normal_quantization_bits = draco_normal_bits;
+        draco_params.tex_coord_quantization_bits = draco_uv_bits;
         int dracoPosId = -1, dracoNormId = -1, dracoTexId = -1, dracoBatchId = -1;
         bool ok = ::compress_mesh_geometry(g, draco_params,
             compressed_data, compressed_size,
@@ -1014,7 +1026,9 @@ static void write_osgGeometry(osg::Geometry* g, OsgBuildState* osgState,
 
 bool osgb2glb_buf(std::string path, std::string& glb_buff, MeshInfo& mesh_info,
                   int node_type, bool enable_texture_compress,
-                  bool enable_meshopt, bool enable_draco, bool enable_unlit) {
+                  bool enable_meshopt, bool enable_draco, bool enable_unlit,
+                  double simplify_ratio,
+                  int draco_pos_bits, int draco_normal_bits, int draco_uv_bits) {
     vector<string> fileNames = { path };
     std::string parent_path = get_parent(path);
 
@@ -1049,7 +1063,8 @@ bool osgb2glb_buf(std::string path, std::string& glb_buff, MeshInfo& mesh_info,
         if (!g->getVertexArray() || g->getVertexArray()->getDataSize() == 0)
             continue;
 
-        write_osgGeometry(g, &osgState, enable_meshopt, enable_draco);
+        write_osgGeometry(g, &osgState, enable_meshopt, enable_draco,
+                          simplify_ratio, draco_pos_bits, draco_normal_bits, draco_uv_bits);
 
         if (!infoVisitor.texture_array.empty()) {
             for (unsigned k = 0; k < g->getNumPrimitiveSets(); k++) {
@@ -1197,12 +1212,16 @@ bool osgb2glb_buf(std::string path, std::string& glb_buff, MeshInfo& mesh_info,
 // ============================================================
 bool osgb2b3dm_buf(std::string path, std::string& b3dm_buf, TileBox& tile_box,
                    int node_type, bool enable_texture_compress,
-                   bool enable_meshopt, bool enable_draco, bool enable_unlit) {
+                   bool enable_meshopt, bool enable_draco, bool enable_unlit,
+                   double simplify_ratio,
+                   int draco_pos_bits, int draco_normal_bits, int draco_uv_bits) {
     using nlohmann::json;
 
     std::string glb_buf;
     MeshInfo minfo;
-    if (!osgb2glb_buf(path, glb_buf, minfo, node_type, enable_texture_compress, enable_meshopt, enable_draco, enable_unlit))
+    if (!osgb2glb_buf(path, glb_buf, minfo, node_type,
+                      enable_texture_compress, enable_meshopt, enable_draco, enable_unlit,
+                      simplify_ratio, draco_pos_bits, draco_normal_bits, draco_uv_bits))
         return false;
 
     tile_box.max = minfo.max;
@@ -1256,7 +1275,9 @@ bool osgb2b3dm_buf(std::string path, std::string& b3dm_buf, TileBox& tile_box,
 // ============================================================
 void do_tile_job(osg_tree& tree, std::string out_path, int max_lvl,
                  bool enable_texture_compress, bool enable_meshopt,
-                 bool enable_draco, bool enable_unlit) {
+                 bool enable_draco, bool enable_unlit,
+                 double simplify_ratio,
+                 int draco_pos_bits, int draco_normal_bits, int draco_uv_bits) {
     if (tree.file_name.empty()) return;
     int lvl = get_lvl_num(tree.file_name);
     if (lvl > max_lvl) return;
@@ -1264,7 +1285,8 @@ void do_tile_job(osg_tree& tree, std::string out_path, int max_lvl,
     if (tree.type > 0) {
         std::string b3dm_buf;
         osgb2b3dm_buf(tree.file_name, b3dm_buf, tree.bbox, tree.type,
-                      enable_texture_compress, enable_meshopt, enable_draco, enable_unlit);
+                      enable_texture_compress, enable_meshopt, enable_draco, enable_unlit,
+                      simplify_ratio, draco_pos_bits, draco_normal_bits, draco_uv_bits);
 
         std::string out_file = out_path + "/" +
             replace(get_file_name(tree.file_name), ".osgb", tree.type != 2 ? ".b3dm" : "o.b3dm");
@@ -1275,7 +1297,9 @@ void do_tile_job(osg_tree& tree, std::string out_path, int max_lvl,
     }
 
     for (auto& i : tree.sub_nodes) {
-        do_tile_job(i, out_path, max_lvl, enable_texture_compress, enable_meshopt, enable_draco, enable_unlit);
+        do_tile_job(i, out_path, max_lvl,
+                    enable_texture_compress, enable_meshopt, enable_draco, enable_unlit,
+                    simplify_ratio, draco_pos_bits, draco_normal_bits, draco_uv_bits);
     }
 }
 
@@ -1335,7 +1359,9 @@ std::string encode_tile_json(osg_tree& tree, double x, double y) {
 // ============================================================
 void do_tile_job_1_1(osg_tree& tree, std::string out_path, int max_lvl,
                      bool enable_texture_compress, bool enable_meshopt,
-                     bool enable_draco, bool enable_unlit) {
+                     bool enable_draco, bool enable_unlit,
+                     double simplify_ratio,
+                     int draco_pos_bits, int draco_normal_bits, int draco_uv_bits) {
     if (tree.file_name.empty()) return;
     int lvl = get_lvl_num(tree.file_name);
     if (lvl > max_lvl) return;
@@ -1345,7 +1371,8 @@ void do_tile_job_1_1(osg_tree& tree, std::string out_path, int max_lvl,
         std::string glb_buf;
         MeshInfo minfo;
         if (osgb2glb_buf(tree.file_name, glb_buf, minfo, tree.type,
-                         enable_texture_compress, enable_meshopt, enable_draco, enable_unlit)) {
+                         enable_texture_compress, enable_meshopt, enable_draco, enable_unlit,
+                         simplify_ratio, draco_pos_bits, draco_normal_bits, draco_uv_bits)) {
             tree.bbox.max = minfo.max;
             tree.bbox.min = minfo.min;
 
@@ -1359,7 +1386,9 @@ void do_tile_job_1_1(osg_tree& tree, std::string out_path, int max_lvl,
     }
 
     for (auto& i : tree.sub_nodes) {
-        do_tile_job_1_1(i, out_path, max_lvl, enable_texture_compress, enable_meshopt, enable_draco, enable_unlit);
+        do_tile_job_1_1(i, out_path, max_lvl,
+                        enable_texture_compress, enable_meshopt, enable_draco, enable_unlit,
+                        simplify_ratio, draco_pos_bits, draco_normal_bits, draco_uv_bits);
     }
 }
 
@@ -1405,4 +1434,345 @@ std::string encode_tile_json_1_1(osg_tree& tree, double x, double y) {
     }
     tile += "}";
     return tile;
+}
+
+// ============================================================
+// Root tile reconstruction helpers
+// ============================================================
+
+// Recursively find the coarsest (highest _Lxx) node in a tile tree.
+// Higher L numbers = coarser LOD. Files without _Lxx return level -1 (finest).
+// Falls back to the tree's own file if no coarser child is found.
+std::string find_coarsest_node(const osg_tree& tree) {
+    int current_lvl = get_lvl_num(tree.file_name);
+
+    if (tree.sub_nodes.empty()) {
+        return tree.file_name;  // leaf node
+    }
+
+    std::string best_path = tree.file_name;
+    int best_lvl = current_lvl;
+
+    for (const auto& child : tree.sub_nodes) {
+        std::string candidate = find_coarsest_node(child);
+        if (candidate.empty()) continue;
+        int child_lvl = get_lvl_num(candidate);
+        if (child_lvl > best_lvl) {
+            best_lvl = child_lvl;
+            best_path = candidate;
+        }
+    }
+
+    return best_path;
+}
+
+// Merge multiple coarsest-LOD OSGB files into a single root GLB.
+// Each file is loaded independently, its geometry SVD-corrected by
+// InfoVisitor, and all primitives are packed into one tinygltf::Model.
+bool build_merged_root_glb(
+    const std::vector<std::string>& coarsest_paths,
+    std::string& out_glb_buf,
+    TileBox& out_bbox,
+    bool enable_texture_compress,
+    bool enable_meshopt,
+    bool enable_draco,
+    bool enable_unlit,
+    int top_texture_max_size,
+    double simplify_ratio,
+    int draco_pos_bits, int draco_normal_bits, int draco_uv_bits)
+{
+    if (coarsest_paths.empty()) return false;
+
+    tinygltf::TinyGLTF gltf;
+    tinygltf::Model model;
+    tinygltf::Buffer buffer;
+
+    std::vector<osg::Geometry*> all_geometry;
+    std::vector<osg::Texture*> all_textures;         // canonical textures (deduplicated)
+    std::map<size_t, size_t> tex_hash_to_idx;        // hash → index in all_textures
+    std::map<osg::Geometry*, osg::Texture*> geom_to_tex;  // updated to canonical ptrs
+
+    osg::Vec3f global_min(1e38f, 1e38f, 1e38f);
+    osg::Vec3f global_max(-1e38f, -1e38f, -1e38f);
+
+    // Helper: compute hash from texture image data for deduplication
+    auto hash_texture_image = [](osg::Texture* tex) -> size_t {
+        if (!tex || tex->getNumImages() == 0) return 0;
+        osg::Image* img = tex->getImage(0);
+        if (!img || !img->data()) return 0;
+        size_t h = std::hash<int>{}(img->s());
+        h ^= std::hash<int>{}(img->t()) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<int>{}((int)img->getPixelFormat()) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        // Hash raw pixel bytes (sample up to 4KB for speed)
+        int total = img->getImageSizeInBytes();
+        int step = std::max(1, total / 4096);
+        const unsigned char* data = img->data();
+        for (int i = 0; i < total; i += step)
+            h ^= std::hash<unsigned char>{}(data[i]) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        return h;
+    };
+
+    // Phase 1: Load all coarsest files and collect geometry/textures
+    for (const auto& fpath : coarsest_paths) {
+        std::string parent_path = get_parent(fpath);
+        std::vector<std::string> fileNames = { fpath };
+
+        osg::ref_ptr<osg::Node> root = osgDB::readNodeFiles(fileNames);
+        if (!root.valid()) {
+            LOG_W("build_merged_root_glb: failed to load %s, skipping", fpath.c_str());
+            continue;
+        }
+
+        InfoVisitor infoVisitor(parent_path, false);
+        root->accept(infoVisitor);
+
+        // Use fallback geometry if PagedLOD collection is empty
+        auto& geoms = infoVisitor.geometry_array;
+        auto& textures = infoVisitor.texture_array;
+        if (geoms.empty() && !infoVisitor.other_geometry_array.empty()) {
+            geoms = infoVisitor.other_geometry_array;
+            textures = infoVisitor.other_texture_array;
+        }
+
+        if (geoms.empty()) {
+            LOG_W("build_merged_root_glb: no geometry in %s, skipping", fpath.c_str());
+            continue;
+        }
+
+        // Collect geometry. Deduplicate textures by image content hash.
+        for (auto* g : geoms) {
+            all_geometry.push_back(g);
+            auto it = infoVisitor.texture_map.find(g);
+            if (it != infoVisitor.texture_map.end()) {
+                osg::Texture* raw_tex = it->second;
+                size_t h = hash_texture_image(raw_tex);
+                auto dedup_it = tex_hash_to_idx.find(h);
+                if (dedup_it != tex_hash_to_idx.end()) {
+                    // Already seen this texture — reuse canonical pointer
+                    geom_to_tex[g] = all_textures[dedup_it->second];
+                } else {
+                    // First occurrence — register as canonical
+                    tex_hash_to_idx[h] = all_textures.size();
+                    all_textures.push_back(raw_tex);
+                    geom_to_tex[g] = raw_tex;
+                }
+            }
+        }
+    }
+
+    if (all_geometry.empty()) {
+        LOG_E("build_merged_root_glb: no geometry from any source file");
+        return false;
+    }
+
+    LOG_I("build_merged_root_glb: merging %zu geometries, %zu textures",
+          all_geometry.size(), all_textures.size());
+
+    // Phase 2: Build glTF model
+    OsgBuildState osgState = { &buffer, &model,
+        osg::Vec3f(-1e38f,-1e38f,-1e38f), osg::Vec3f(1e38f,1e38f,1e38f), -1, -1 };
+
+    model.meshes.resize(1);
+
+    // Build index mapping: texture* -> material index
+    std::map<osg::Texture*, int> tex_to_mat;
+    {
+        int idx = 0;
+        for (auto* t : all_textures) tex_to_mat[t] = idx++;
+    }
+
+    int primIdx = 0;
+    for (auto* g : all_geometry) {
+        if (!g->getVertexArray() || g->getVertexArray()->getDataSize() == 0)
+            continue;
+
+        write_osgGeometry(g, &osgState, enable_meshopt, enable_draco,
+                          simplify_ratio, draco_pos_bits, draco_normal_bits, draco_uv_bits);
+
+        // Assign material to each new primitive
+        auto* tex = geom_to_tex[g];
+        int matIdx = tex ? tex_to_mat[tex] : 0;
+        for (unsigned k = 0; k < g->getNumPrimitiveSets(); k++) {
+            if (primIdx < (int)model.meshes[0].primitives.size()) {
+                model.meshes[0].primitives[primIdx].material = matIdx;
+            }
+            primIdx++;
+        }
+
+        // Track global bounding box from osgState tracking
+        global_min.x() = std::min(global_min.x(), osgState.point_min.x());
+        global_min.y() = std::min(global_min.y(), osgState.point_min.y());
+        global_min.z() = std::min(global_min.z(), osgState.point_min.z());
+        global_max.x() = std::max(global_max.x(), osgState.point_max.x());
+        global_max.y() = std::max(global_max.y(), osgState.point_max.y());
+        global_max.z() = std::max(global_max.z(), osgState.point_max.z());
+    }
+
+    if (model.meshes[0].primitives.empty()) {
+        LOG_E("build_merged_root_glb: no primitives generated");
+        return false;
+    }
+
+    // Fix any -1 material indices
+    for (auto& prim : model.meshes[0].primitives) {
+        if (prim.material < 0) prim.material = 0;
+    }
+
+    // Phase 3: Process textures (with optional downsampling for root overview)
+    for (auto* tex : all_textures) {
+        // Downsample texture if max_size is set and image exceeds it
+        if (top_texture_max_size > 0 && tex && tex->getNumImages() > 0) {
+            osg::Image* img = tex->getImage(0);
+            if (img && img->data()) {
+                int w = img->s(), h = img->t();
+                int max_dim = std::max(w, h);
+                if (max_dim > top_texture_max_size) {
+                    // Compute new dimensions preserving aspect ratio
+                    double scale = (double)top_texture_max_size / max_dim;
+                    int new_w = std::max(1, (int)(w * scale));
+                    int new_h = std::max(1, (int)(h * scale));
+                    int channels = img->getPixelFormat() == GL_RGB ? 3 : 4;
+
+                    std::vector<unsigned char> resized(new_w * new_h * channels);
+
+                    LOG_I("  downsampling texture %dx%d → %dx%d (%d ch)",
+                          w, h, new_w, new_h, channels);
+
+                    unsigned char* result = stbir_resize_uint8_linear(
+                        img->data(), w, h, img->getRowStepInBytes(),
+                        resized.data(), new_w, new_h, new_w * channels,
+                        (stbir_pixel_layout)channels);
+
+                    if (result) {
+                        // Replace image data with downsampled version
+                        img->setImage(new_w, new_h, 1,
+                            img->getInternalTextureFormat(),
+                            img->getPixelFormat(), img->getDataType(),
+                            resized.data(), osg::Image::NO_DELETE);
+                        // Steal the resized buffer so OSG doesn't copy
+                        unsigned char* stolen = (unsigned char*)malloc(resized.size());
+                        memcpy(stolen, resized.data(), resized.size());
+                        img->setImage(new_w, new_h, 1,
+                            img->getInternalTextureFormat(),
+                            img->getPixelFormat(), img->getDataType(),
+                            stolen, osg::Image::USE_MALLOC_FREE);
+                    }
+                }
+            }
+        }
+
+        unsigned bufStart = (unsigned)buffer.data.size();
+        std::vector<unsigned char> imgData;
+        std::string mimeType;
+
+        if (::process_texture(tex, imgData, mimeType, enable_texture_compress)) {
+            buffer.data.insert(buffer.data.end(), imgData.begin(), imgData.end());
+
+            tinygltf::Image imgObj;
+            imgObj.mimeType = mimeType;
+            imgObj.bufferView = (int)model.bufferViews.size();
+            model.images.push_back(imgObj);
+
+            tinygltf::BufferView bfv;
+            bfv.buffer = 0;
+            bfv.byteOffset = (int)bufStart;
+            alignment_buffer(buffer.data);
+            bfv.byteLength = (int)(buffer.data.size() - bufStart);
+            model.bufferViews.push_back(bfv);
+        }
+    }
+
+    // Phase 4: Build glTF scene objects
+    tinygltf::Node node; node.mesh = 0;
+    model.nodes.push_back(node);
+
+    tinygltf::Scene scene; scene.nodes.push_back(0);
+    model.scenes = { scene };
+    model.defaultScene = 0;
+
+    tinygltf::Sampler samp;
+    samp.magFilter = TINYGLTF_TEXTURE_FILTER_LINEAR;
+    samp.minFilter = TINYGLTF_TEXTURE_FILTER_NEAREST_MIPMAP_LINEAR;
+    samp.wrapS = TINYGLTF_TEXTURE_WRAP_REPEAT;
+    samp.wrapT = TINYGLTF_TEXTURE_WRAP_REPEAT;
+    model.samplers = { samp };
+
+    // Extensions
+    if (enable_unlit) {
+        model.extensionsRequired.push_back("KHR_materials_unlit");
+        model.extensionsUsed.push_back("KHR_materials_unlit");
+    }
+    if (enable_texture_compress) {
+        model.extensionsRequired.push_back("KHR_texture_basisu");
+        model.extensionsUsed.push_back("KHR_texture_basisu");
+    }
+    bool has_draco = enable_draco;
+    if (has_draco) {
+        model.extensionsRequired.push_back("KHR_draco_mesh_compression");
+        model.extensionsUsed.push_back("KHR_draco_mesh_compression");
+    }
+    if (enable_meshopt && !has_draco) {
+        model.extensionsRequired.push_back("EXT_meshopt_compression");
+        model.extensionsUsed.push_back("EXT_meshopt_compression");
+    }
+
+    // Materials
+    bool has_images = !model.images.empty();
+    if (all_textures.empty() || !has_images) {
+        auto mat = make_default_material(0.75, 0.75, 0.75);
+        if (enable_unlit)
+            mat.extensions["KHR_materials_unlit"] = tinygltf::Value(tinygltf::Value::Object());
+        model.materials.push_back(mat);
+    } else {
+        for (size_t i = 0; i < all_textures.size(); i++) {
+            auto mat = make_default_material(0.75, 0.75, 0.75);
+            if (enable_unlit)
+                mat.extensions["KHR_materials_unlit"] = tinygltf::Value(tinygltf::Value::Object());
+            if (has_images && i < model.images.size())
+                mat.pbrMetallicRoughness.baseColorTexture.index = (int)i;
+            model.materials.push_back(mat);
+        }
+    }
+
+    // Textures
+    if (!model.images.empty()) {
+        for (size_t i = 0; i < model.images.size(); i++) {
+            tinygltf::Texture tex;
+            tex.sampler = 0;
+            if (enable_texture_compress) {
+                tinygltf::Value::Object basisu;
+                basisu["source"] = tinygltf::Value((int)i);
+                tex.extensions["KHR_texture_basisu"] = tinygltf::Value(basisu);
+            } else {
+                tex.source = (int)i;
+            }
+            model.textures.push_back(tex);
+        }
+    }
+
+    model.asset.version = "2.0";
+    model.asset.generator = "osgb2b3dm-cpp-root-reconstruct";
+
+    // CRITICAL: buffer must be in model.buffers for BIN chunk to be written
+    model.buffers.push_back(buffer);
+
+    // Phase 5: Serialize to GLB
+    std::ostringstream ss;
+    if (!gltf.WriteGltfSceneToStream(&model, ss, false, true)) {
+        LOG_E("build_merged_root_glb: WriteGltfSceneToStream failed");
+        return false;
+    }
+
+    out_glb_buf = ss.str();
+
+    // Populate output bounding box
+    out_bbox.min = { (double)global_min.x(), (double)global_min.y(), (double)global_min.z() };
+    out_bbox.max = { (double)global_max.x(), (double)global_max.y(), (double)global_max.z() };
+
+    LOG_I("build_merged_root_glb: success, GLB size=%zu bytes, bbox=[%.2f..%.2f, %.2f..%.2f, %.2f..%.2f]",
+          out_glb_buf.size(),
+          global_min.x(), global_max.x(), global_min.y(), global_max.y(),
+          global_min.z(), global_max.z());
+
+    return true;
 }

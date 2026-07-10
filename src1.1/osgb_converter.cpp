@@ -375,8 +375,9 @@ int convert_osgb(const ConvertOptions& opts) {
     int max_lvl = (opts.max_lvl != 100) ? opts.max_lvl : cfg_max_lvl;
 
     LOG_I("Conversion parameters: center=(%.10f, %.10f), max_lvl=%d", center_x, center_y, max_lvl);
-    LOG_I("Features: texture_compress=%d, meshopt=%d, draco=%d, unlit=%d",
-          opts.enable_texture_compress, opts.enable_meshopt, opts.enable_draco, opts.enable_unlit);
+    LOG_I("Features: texture_compress=%d, meshopt=%d, draco=%d, unlit=%d, top_reconstruct=%d",
+          opts.enable_texture_compress, opts.enable_meshopt, opts.enable_draco, opts.enable_unlit,
+          opts.enable_top_reconstruct);
 
     // ============================================================
     // 4. Find and convert all tiles
@@ -390,6 +391,7 @@ int convert_osgb(const ConvertOptions& opts) {
     struct TileResult {
         json tree_json;                        // parsed tile tree (with URIs fixed)
         std::vector<double> box_v;
+        std::string coarsest_path;             // for root tile reconstruction
     };
 
     // ============================================================
@@ -496,7 +498,9 @@ int convert_osgb(const ConvertOptions& opts) {
             // Convert all tiles in this tree (3D Tiles 1.1: raw .glb output)
             do_tile_job_1_1(root, out_tile_dir.string(), max_lvl,
                         opts.enable_texture_compress, opts.enable_meshopt,
-                        opts.enable_draco, opts.enable_unlit);
+                        opts.enable_draco, opts.enable_unlit,
+                        opts.simplify_ratio,
+                        opts.draco_pos_bits, opts.draco_normal_bits, opts.draco_uv_bits);
 
             // Compute bounding box and geometric error
             extend_tile_box(root);
@@ -524,9 +528,12 @@ int convert_osgb(const ConvertOptions& opts) {
             box_full.insert(box_full.end(), root.bbox.max.begin(), root.bbox.max.end());
             box_full.insert(box_full.end(), root.bbox.min.begin(), root.bbox.min.end());
 
+            // Find coarsest LOD node for potential root reconstruction
+            std::string coarsest_path = find_coarsest_node(root);
+
             {
                 std::lock_guard<std::mutex> lock(tile_results_mutex);
-                tile_results.push_back({tile_tree, box_full});
+                tile_results.push_back({tile_tree, box_full, coarsest_path});
             }
 
             sem.release();
@@ -541,6 +548,54 @@ int convert_osgb(const ConvertOptions& opts) {
     if (tile_results.empty()) {
         LOG_E("No tiles were converted");
         return 1;
+    }
+
+    // ============================================================
+    // 4.5: Root tile reconstruction (merge coarsest LODs into root.glb)
+    // ============================================================
+    std::string root_glb_buf;
+    TileBox root_bbox_from_glb;
+    bool has_root_content = false;
+
+    if (opts.enable_top_reconstruct) {
+        std::vector<std::string> coarsest_paths;
+        for (const auto& tr : tile_results) {
+            if (!tr.coarsest_path.empty())
+                coarsest_paths.push_back(tr.coarsest_path);
+            else
+                LOG_W("TileResult missing coarsest_path (empty)");
+        }
+
+        if (!coarsest_paths.empty()) {
+            LOG_I("Building root GLB from %zu coarsest tiles...", coarsest_paths.size());
+            for (size_t ci = 0; ci < coarsest_paths.size(); ci++) {
+                LOG_I("  [%zu] %s", ci, coarsest_paths[ci].c_str());
+            }
+
+            has_root_content = build_merged_root_glb(
+                coarsest_paths, root_glb_buf, root_bbox_from_glb,
+                opts.enable_texture_compress, opts.enable_meshopt,
+                opts.enable_draco, opts.enable_unlit,
+                opts.top_texture_max_size,
+                opts.simplify_ratio,
+                opts.draco_pos_bits, opts.draco_normal_bits, opts.draco_uv_bits);
+
+            if (has_root_content) {
+                fs::path root_glb_path = out_dir / "Data" / "root.glb";
+                if (write_file(root_glb_path.string().c_str(),
+                               root_glb_buf.data(), (unsigned long)root_glb_buf.size())) {
+                    LOG_I("Root GLB written to: %s (%zu bytes)",
+                          root_glb_path.string().c_str(), root_glb_buf.size());
+                } else {
+                    LOG_E("Failed to write root GLB to: %s", root_glb_path.string().c_str());
+                    has_root_content = false;
+                }
+            } else {
+                LOG_W("Root GLB build failed, falling back to virtual root");
+            }
+        } else {
+            LOG_W("No coarsest paths found, skipping root reconstruction");
+        }
     }
 
     // ============================================================
@@ -599,13 +654,35 @@ int convert_osgb(const ConvertOptions& opts) {
     root_tileset["asset"]["gltfUpAxis"] = "Z";
     root_tileset["extensionsUsed"] = json::array({"3DTILES_content_gltf"});
     root_tileset["extensionsRequired"] = json::array({"3DTILES_content_gltf"});
-    root_tileset["geometricError"] = std::min(root_ge, 2000.0);
 
     json root_tile;
     root_tile["transform"] = trans_vec;
     root_tile["boundingVolume"]["box"] = box_to_tileset_box(root_box);
-    root_tile["geometricError"] = std::min(root_ge, 2000.0);
     root_tile["refine"] = "REPLACE";
+
+    if (has_root_content) {
+        // Root has actual geometry from merged coarsest LODs
+        json root_content;
+        root_content["uri"] = "./Data/root.glb";
+        root_content["extensions"]["3DTILES_content_gltf"] = json::object();
+
+        // boundingVolume for the root content (slightly padded)
+        TileBox rb = root_bbox_from_glb;
+        rb.extend(0.2);
+        root_content["boundingVolume"]["box"] = convert_bbox(rb);
+
+        root_tile["content"] = root_content;
+
+        // geometricError: use diagonal of merged bbox so root is visible from far away
+        double root_ge_diag = get_geometric_error(root_bbox_from_glb);
+        root_tile["geometricError"] = std::min(root_ge_diag, 5000.0);
+        root_tileset["geometricError"] = std::min(root_ge_diag, 5000.0);
+    } else {
+        // Virtual root (no geometry) — original behavior
+        root_tile["geometricError"] = std::min(root_ge, 2000.0);
+        root_tileset["geometricError"] = std::min(root_ge, 2000.0);
+    }
+
     root_tile["children"] = json::array();
 
     // Embed each top-level tile tree directly (instead of referencing sub-tileset.json)

@@ -44,6 +44,12 @@ struct HardcodedConfig {
     bool enable_meshopt;
     bool enable_draco;
     bool enable_unlit;
+    bool enable_top_reconstruct;
+    int  top_texture_max_size;
+    double simplify_ratio;
+    int  draco_pos_bits;
+    int  draco_normal_bits;
+    int  draco_uv_bits;
     double override_lon;
     double override_lat;
     double override_alt;
@@ -60,6 +66,12 @@ static const HardcodedConfig g_config = {
     /* meshopt      */ true,
     /* draco        */ true,
     /* unlit        */ true,
+    /* top_reconstruct */ false,
+    /* top_texture_max_size */ 512,
+    /* simplify_ratio */ 0.5,
+    /* draco_pos_bits */ 11,
+    /* draco_normal_bits */ 10,
+    /* draco_uv_bits */ 12,
     /* override_lon */ 0.0,
     /* override_lat */ 0.0,
     /* override_alt */ 0.0,
@@ -226,6 +238,12 @@ static void print_usage(const char* prog) {
         "  --enable-texture-compress  Enable KTX2 texture compression\n"
         "  --enable-lod            Enable Level of Detail\n"
         "  --enable-unlit          Enable KHR_materials_unlit (default: on for OSGB)\n"
+        "  --enable-top-reconstruct  Merge coarsest LOD tiles into a root overview GLB\n"
+        "  --top-texture-max-size N  Max texture dim for root GLB (default: 512, 0=no limit)\n"
+        "  --simplify-ratio R      Meshopt target_ratio (default: 0.5, 1.0=no simplify)\n"
+        "  --draco-pos-bits N      Draco position quant bits (default: 11)\n"
+        "  --draco-normal-bits N   Draco normal quant bits (default: 10)\n"
+        "  --draco-uv-bits N       Draco UV quant bits (default: 12)\n"
         "  --geoid <model>         Geoid model: none, egm84, egm96, egm2008\n"
         "  --geoid-path <path>     Path to geoid data files\n"
         "  --lon <degrees>         Override longitude\n"
@@ -261,6 +279,12 @@ int main(int argc, char* argv[]) {
     opts.enable_meshopt          = g_config.enable_meshopt;
     opts.enable_draco            = g_config.enable_draco;
     opts.enable_unlit            = g_config.enable_unlit;
+    opts.enable_top_reconstruct  = g_config.enable_top_reconstruct;
+    opts.top_texture_max_size    = g_config.top_texture_max_size;
+    opts.simplify_ratio          = g_config.simplify_ratio;
+    opts.draco_pos_bits          = g_config.draco_pos_bits;
+    opts.draco_normal_bits       = g_config.draco_normal_bits;
+    opts.draco_uv_bits           = g_config.draco_uv_bits;
 
     if (g_config.override_lon != 0.0) opts.center_x = g_config.override_lon;
     if (g_config.override_lat != 0.0) opts.center_y = g_config.override_lat;
@@ -297,6 +321,18 @@ int main(int argc, char* argv[]) {
             LOG_I("LOD enabled (not fully implemented)");
         } else if (arg == "--enable-unlit") {
             opts.enable_unlit = true;
+        } else if (arg == "--enable-top_reconstruct") {
+            opts.enable_top_reconstruct = true;
+        } else if (arg == "--top-texture-max-size" && i + 1 < argc) {
+            opts.top_texture_max_size = std::stoi(argv[++i]);
+        } else if (arg == "--simplify-ratio" && i + 1 < argc) {
+            opts.simplify_ratio = std::stod(argv[++i]);
+        } else if (arg == "--draco-pos-bits" && i + 1 < argc) {
+            opts.draco_pos_bits = std::stoi(argv[++i]);
+        } else if (arg == "--draco-normal-bits" && i + 1 < argc) {
+            opts.draco_normal_bits = std::stoi(argv[++i]);
+        } else if (arg == "--draco-uv-bits" && i + 1 < argc) {
+            opts.draco_uv_bits = std::stoi(argv[++i]);
         } else if (arg == "--geoid" && i + 1 < argc) {
             opts.geoid_model = argv[++i];
         } else if (arg == "--geoid-path" && i + 1 < argc) {
