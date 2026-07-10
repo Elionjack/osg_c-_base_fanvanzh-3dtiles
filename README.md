@@ -152,9 +152,11 @@ input_dir/
 # 1.1 版（输出 .glb + 3DTILES_content_gltf）
 ./osgb_converter_1_1 -i E:\learning\data\1 -o E:\learning\data\output\my_test_1_1
 
-# 启用压缩
+# 启用所有压缩 + Root 瓦片重建
 ./osgb_converter_1_1 -i E:\learning\data\1 -o E:\learning\data\output\all_on \
-    --enable-simplify --enable-draco --enable-texture-compress
+    --enable-simplify --enable-draco --enable-texture-compress \
+    --enable-top-reconstruct --simplify-ratio 0.5 \
+    --draco-pos-bits 11 --draco-normal-bits 10 --draco-uv-bits 12
 ```
 
 如需恢复硬编码配置，修改 `src/main.cpp` 或 `src1.1/main.cpp`：
@@ -163,17 +165,25 @@ input_dir/
 #define USE_HARDCODED_CONFIG  1   // 改回 1，然后修改下方的 g_config
 
 static const HardcodedConfig g_config = {
-    /* input_dir         */ R"(E:\learning\data\1)",
-    /* output_dir        */ R"(E:\learning\data\output\OSG_CJIAJIAbase3dtiles)",
-    /* config_json       */ "",
-    /* geoid_model       */ "none",
-    /* geoid_path        */ "",
-    /* texture_compress  */ false,
-    /* meshopt           */ false,
-    /* draco             */ false,
-    /* unlit             */ true,
-    /* override_lon/lat  */ 0.0,
-    /* has_override_alt  */ false,
+    /* input_dir           */ R"(E:\learning\data\1)",
+    /* output_dir          */ R"(E:\learning\data\output\OSG_CJIAJIAbase3dtiles)",
+    /* config_json         */ "",
+    /* geoid_model         */ "none",
+    /* geoid_path          */ "",
+    /* texture_compress    */ false,
+    /* meshopt             */ false,
+    /* draco               */ false,
+    /* unlit               */ true,
+    /* top_reconstruct     */ false,
+    /* top_texture_max_size */ 512,
+    /* simplify_ratio      */ 0.5,
+    /* draco_pos_bits      */ 11,
+    /* draco_normal_bits   */ 10,
+    /* draco_uv_bits       */ 12,
+    /* override_lon        */ 0.0,
+    /* override_lat        */ 0.0,
+    /* override_alt        */ 0.0,
+    /* has_override_alt    */ false,
 };
 ```
 
@@ -319,6 +329,12 @@ src/ 和 src1.1/ 现在共享完整的网格处理管线。核心差异仅在于
 | `--enable-draco` | 启用 Draco 网格压缩 | off |
 | `--enable-simplify` | 启用 meshoptimizer 网格简化 | off |
 | `--enable-unlit` | 启用 KHR_materials_unlit 扩展 | on |
+| `--enable-top-reconstruct` | 合并最粗 LOD 瓦片生成 root.glb 概览 | off |
+| `--top-texture-max-size` | Root GLB 纹理最大尺寸（0=不限制） | 512 |
+| `--simplify-ratio` | Meshopt 简化目标比例（1.0=不简化） | 0.5 |
+| `--draco-pos-bits` | Draco 位置量化位数 | 11 |
+| `--draco-normal-bits` | Draco 法向量化位数 | 10 |
+| `--draco-uv-bits` | Draco UV 量化位数 | 12 |
 | `--geoid` | 大地水准面模型：`none`/`egm84`/`egm96`/`egm2008` | none |
 | `--geoid-path` | 大地水准面数据文件路径 | 自动 |
 
@@ -336,19 +352,16 @@ src/ 和 src1.1/ 现在共享完整的网格处理管线。核心差异仅在于
 ### 转换器提交历史
 
 ```
-NEWEST  Sync src1.1 mesh pipeline to src/, fix GDAL/PROJ/OSG paths, enable CLI
-        ↓
-        - Fix: GDAL_DATA & PROJ_LIB use VCPKG_ROOT auto-detection (proj.db needed for WKT)
-        - Fix: OSG_LIBRARY_PATH force-injected into Registry search list (DLL init order)
-        - Feat: full mesh pipeline in both src/ and src1.1/ (simplify → meshopt/Draco → KTX2)
-        - Feat: CLI mode as default (USE_HARDCODED_CONFIG=0), all switches as CLI args
-        - Refactor: process_texture() unified in mesh_processor, remove HAS_STB conditional
-        
+53482f8 完成顶点重建，暴露控制参数
+        - Feat: --enable-top-reconstruct 合并最粗 LOD 瓦片生成 root.glb
+        - Feat: --top-texture-max-size 控制 root GLB 纹理最大尺寸
+        - Feat: 暴露 --simplify-ratio、--draco-pos/normal/uv-bits 等 CLI 控制参数
+        - Feat: build_merged_root_glb 支持纹理降采样、Draco、KTX2 全参数传递
+        - Feat: find_coarsest_node 查找最粗 LOD 节点
+
+eb788ff Add tile-level parallel processing for KTX2/OSGB conversion
+4b055b1 Fix GDAL/PROJ/OSG paths, sync mesh pipeline to src/, enable CLI mode
+8c338de Update README: add geometricError fix to commit history
 cffd8b2 Fix geometricError: leaf=0, parent=size*0.1, root capped at 2000
-7c420d4 Restore content-level boundingVolume in 1.1 tile JSON
-0d6aded Fix tile-edge gaps: remove tight content-level boundingVolume
-5565de1 Update README: document both 1.0/1.1 targets + display viewer
-84a8569 Add 3D Tiles 1.1 output support (src1.1/)
-582cad3 Add README with usage guide and architecture docs
-0aef0a0 Initial commit: osgb2b3dm - OSGB to 3D Tiles converter
+95fc162 Update README: add repo info and commit history
 ```
