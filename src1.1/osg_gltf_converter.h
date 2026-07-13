@@ -12,6 +12,20 @@ namespace tinygltf {
     class Buffer;
 }
 namespace coords { class CoordinateTransformer; }
+namespace osgb_converter { struct ConvertOptions; }
+
+// Forward declaration for FlatTile
+struct osg_tree;
+
+// ============================================================
+// FlatTile: flattened tile for parallel task pool
+// ============================================================
+struct FlatTile {
+    std::string file_name;   // OSGB 文件路径
+    std::string out_dir;     // 输出目录
+    int type = 1;            // 对应 osg_tree::type
+    osg_tree* tree = nullptr; // 指向 osg_tree 节点（用于回写 bbox）
+};
 
 struct MeshInfo {
     std::string name;
@@ -26,6 +40,8 @@ struct osg_tree {
     std::vector<osg_tree> sub_nodes;
     // type: 0=group, 1=PagedLOD nodes (default), 2=Other nodes
     int type = 1;
+    // Cached node from Phase 1 — avoids redundant readNodeFiles in Phase 2
+    osg::ref_ptr<osg::Node> cached_node;
 };
 
 // Get full OSGB tile tree starting from a root file
@@ -85,6 +101,16 @@ std::string encode_tile_json_1_1(osg_tree& tree, double x, double y);
 // Global transformer access
 coords::CoordinateTransformer* GetGlobalTransformer();
 void SetGlobalTransformer(coords::CoordinateTransformer* t);
+
+// Convert a single tile from OSGB to GLB and write to disk.
+// Designed to be called from parallel task pools.
+// Populates tile->bbox with the geometry bounds.
+bool convert_one_tile(const FlatTile& tile, const osgb_converter::ConvertOptions& opts);
+
+// Recursively collect all type>0 nodes from an osg_tree into a flat list.
+// Used by Phase 2 of the parallel pipeline.
+void collect_flat_tiles(osg_tree& tree, const std::string& out_dir,
+                        std::vector<FlatTile>& out);
 
 // ============================================================
 // Root tile reconstruction (top-level merge)

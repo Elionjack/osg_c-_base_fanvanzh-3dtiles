@@ -435,115 +435,133 @@ int convert_osgb(const ConvertOptions& opts) {
     };
 
     // ============================================================
-    // Collect top-level tile directories first (so we can process in parallel)
+    // Phase 1: Build tile trees in parallel (top-level only)
+    //           Each thread recursively builds a full osg_tree via get_all_tree().
     // ============================================================
-    struct TileJob {
-        fs::path tile_dir;
+    struct TreeResult {
+        osg_tree root;
         std::string stem;
-        fs::path osgb_file;
-        fs::path out_tile_dir;
+        std::string out_tile_dir;
     };
-    std::vector<TileJob> jobs;
 
-    for (auto& entry : fs::directory_iterator(data_dir)) {
-        if (!entry.is_directory()) continue;
+    std::mutex trees_mutex;
+    std::vector<TreeResult> all_trees;
+    {
+        Semaphore sem(std::thread::hardware_concurrency());
+        std::vector<std::future<void>> futures;
 
-        fs::path tile_dir = entry.path();
-        std::string stem = tile_dir.filename().string();
-        fs::path osgb_file = tile_dir / (stem + ".osgb");
+        for (auto& entry : fs::directory_iterator(data_dir)) {
+            if (!entry.is_directory()) continue;
 
-        if (!fs::exists(osgb_file) || fs::is_directory(osgb_file)) {
-            LOG_E("No OSGB file in tile dir: %s", tile_dir.string().c_str());
+            fs::path tile_dir = entry.path();
+            std::string stem = tile_dir.filename().string();
+            fs::path osgb_file = tile_dir / (stem + ".osgb");
+
+            if (!fs::exists(osgb_file) || fs::is_directory(osgb_file)) {
+                LOG_E("No OSGB file in tile dir: %s", tile_dir.string().c_str());
+                continue;
+            }
+
+            fs::path out_tile_dir = out_dir / "Data" / stem;
+            fs::create_directories(out_tile_dir);
+
+            sem.acquire();
+            auto task = [&trees_mutex, &all_trees, &sem,
+                         osgb_path = osgb_file.string(),
+                         stem,
+                         out_path = out_tile_dir.string()]() {
+                LOG_I("Phase 1 - Building tree: %s", osgb_path.c_str());
+                std::string path_copy = osgb_path;
+                osg_tree root = get_all_tree(path_copy);
+                if (root.file_name.empty()) {
+                    LOG_E("Failed to read: %s", osgb_path.c_str());
+                    sem.release();
+                    return;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(trees_mutex);
+                    all_trees.push_back({std::move(root), stem, out_path});
+                }
+                sem.release();
+            };
+            futures.push_back(std::async(std::launch::async, std::move(task)));
+        }
+        for (auto& f : futures) f.get();
+    }
+
+    LOG_I("Phase 1 complete: %zu tile trees built", all_trees.size());
+
+    if (all_trees.empty()) {
+        LOG_E("No tile trees were built");
+        return 1;
+    }
+
+    // ============================================================
+    // Phase 2: Flatten all trees → tile conversion (parallel or serial)
+    //           Every tile (including sub-LODs) competes for CPU cores
+    //           when parallel mode is on.
+    // ============================================================
+    std::vector<FlatTile> all_tiles;
+    for (auto& tr : all_trees) {
+        collect_flat_tiles(tr.root, tr.out_tile_dir, all_tiles);
+    }
+    LOG_I("Phase 2: Flattened %zu tiles (%s)", all_tiles.size(),
+          opts.enable_parallel ? "parallel" : "serial");
+
+    if (opts.enable_parallel) {
+        Semaphore sem(std::thread::hardware_concurrency());
+        std::vector<std::future<void>> futures;
+
+        for (const auto& tile : all_tiles) {
+            sem.acquire();
+            auto task = [&sem, &opts, tile]() {
+                convert_one_tile(tile, opts);
+                sem.release();
+            };
+            futures.push_back(std::async(std::launch::async, std::move(task)));
+        }
+        for (auto& f : futures) f.get();
+    } else {
+        for (const auto& tile : all_tiles) {
+            convert_one_tile(tile, opts);
+        }
+    }
+
+    LOG_I("Phase 2 complete: %zu tiles converted", all_tiles.size());
+
+    // ============================================================
+    // Phase 3: Serial aggregation — bbox, geometricError, tile JSON
+    //           Must be serial because extend_tile_box()/calc_geometric_error()
+    //           are bottom-up on each tree.
+    // ============================================================
+    std::vector<TileResult> tile_results;
+
+    for (auto& tr : all_trees) {
+        extend_tile_box(tr.root);
+        if (tr.root.bbox.max.empty() || tr.root.bbox.min.empty()) {
+            LOG_E("Empty bounding box for: %s", tr.stem.c_str());
             continue;
         }
 
-        fs::path out_tile_dir = out_dir / "Data" / stem;
-        fs::create_directories(out_tile_dir);
-        jobs.push_back({tile_dir, stem, osgb_file, out_tile_dir});
+        calc_geometric_error(tr.root);
+
+        std::string json_str = encode_tile_json_1_1(tr.root, degree2rad(center_x), degree2rad(center_y));
+        json tile_tree = json::parse(json_str.empty() ? "{}" : json_str);
+
+        std::string uri_prefix = "/Data/" + tr.stem;
+        fix_tile_uris(tile_tree, uri_prefix);
+
+        tr.root.bbox.extend(0.2);
+        std::vector<double> box_full;
+        box_full.insert(box_full.end(), tr.root.bbox.max.begin(), tr.root.bbox.max.end());
+        box_full.insert(box_full.end(), tr.root.bbox.min.begin(), tr.root.bbox.min.end());
+
+        std::string coarsest_path = find_coarsest_node(tr.root);
+
+        tile_results.push_back({tile_tree, box_full, coarsest_path});
     }
 
-    LOG_I("Found %zu top-level tiles, processing in parallel...", jobs.size());
-
-    // ============================================================
-    // Process tiles in parallel with concurrency limit
-    // ============================================================
-    std::mutex tile_results_mutex;
-    std::vector<TileResult> tile_results;
-    Semaphore sem(std::thread::hardware_concurrency());
-    std::vector<std::future<void>> futures;
-
-    for (const auto& job : jobs) {
-        sem.acquire();
-
-        // Capture everything by value for thread safety
-        auto task = [&tile_results_mutex, &tile_results, &sem,
-                     fix_tile_uris,
-                     osgb_path = job.osgb_file.string(),
-                     stem = job.stem,
-                     out_tile_dir = job.out_tile_dir,
-                     max_lvl,
-                     &opts,
-                     center_x, center_y]() {
-            LOG_I("Processing: %s", osgb_path.c_str());
-
-            // Build OSGB tree
-            std::string path_copy = osgb_path;
-            osg_tree root = get_all_tree(path_copy);
-            if (root.file_name.empty()) {
-                LOG_E("Failed to read: %s", osgb_path.c_str());
-                sem.release();
-                return;
-            }
-
-            // Convert all tiles in this tree (3D Tiles 1.1: raw .glb output)
-            do_tile_job_1_1(root, out_tile_dir.string(), max_lvl,
-                        opts.enable_texture_compress, opts.enable_meshopt,
-                        opts.enable_draco, opts.enable_unlit,
-                        opts.simplify_ratio,
-                        opts.draco_pos_bits, opts.draco_normal_bits, opts.draco_uv_bits);
-
-            // Compute bounding box and geometric error
-            extend_tile_box(root);
-            if (root.bbox.max.empty() || root.bbox.min.empty()) {
-                LOG_E("Empty bounding box for: %s", osgb_path.c_str());
-                sem.release();
-                return;
-            }
-
-            calc_geometric_error(root);
-
-            // Generate tile JSON
-            std::string json_str = encode_tile_json_1_1(root, degree2rad(center_x), degree2rad(center_y));
-            json tile_tree = json::parse(json_str.empty() ? "{}" : json_str);
-
-            std::string uri_prefix = "/Data/" + stem;
-            fix_tile_uris(tile_tree, uri_prefix);
-
-            std::vector<double> box_v;
-            box_v.insert(box_v.end(), root.bbox.max.begin(), root.bbox.max.end());
-            box_v.insert(box_v.end(), root.bbox.min.begin(), root.bbox.min.end());
-
-            root.bbox.extend(0.2);
-            std::vector<double> box_full;
-            box_full.insert(box_full.end(), root.bbox.max.begin(), root.bbox.max.end());
-            box_full.insert(box_full.end(), root.bbox.min.begin(), root.bbox.min.end());
-
-            // Find coarsest LOD node for potential root reconstruction
-            std::string coarsest_path = find_coarsest_node(root);
-
-            {
-                std::lock_guard<std::mutex> lock(tile_results_mutex);
-                tile_results.push_back({tile_tree, box_full, coarsest_path});
-            }
-
-            sem.release();
-        };
-
-        futures.push_back(std::async(std::launch::async, std::move(task)));
-    }
-
-    // Wait for all tasks to complete
-    for (auto& f : futures) f.get();
+    LOG_I("Phase 3 complete: %zu tile trees aggregated", tile_results.size());
 
     if (tile_results.empty()) {
         LOG_E("No tiles were converted");

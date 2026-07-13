@@ -50,6 +50,7 @@ struct HardcodedConfig {
     int  draco_pos_bits;
     int  draco_normal_bits;
     int  draco_uv_bits;
+    bool enable_parallel;
     double override_lon;
     double override_lat;
     double override_alt;
@@ -72,6 +73,7 @@ static const HardcodedConfig g_config = {
     /* draco_pos_bits */ 11,
     /* draco_normal_bits */ 10,
     /* draco_uv_bits */ 12,
+    /* enable_parallel */ true,
     /* override_lon */ 0.0,
     /* override_lat */ 0.0,
     /* override_alt */ 0.0,
@@ -244,6 +246,7 @@ static void print_usage(const char* prog) {
         "  --draco-pos-bits N      Draco position quant bits (default: 11)\n"
         "  --draco-normal-bits N   Draco normal quant bits (default: 10)\n"
         "  --draco-uv-bits N       Draco UV quant bits (default: 12)\n"
+        "  --no-parallel           Disable multi-threaded tile conversion\n"
         "  --geoid <model>         Geoid model: none, egm84, egm96, egm2008\n"
         "  --geoid-path <path>     Path to geoid data files\n"
         "  --lon <degrees>         Override longitude\n"
@@ -285,6 +288,7 @@ int main(int argc, char* argv[]) {
     opts.draco_pos_bits          = g_config.draco_pos_bits;
     opts.draco_normal_bits       = g_config.draco_normal_bits;
     opts.draco_uv_bits           = g_config.draco_uv_bits;
+    opts.enable_parallel         = g_config.enable_parallel;
 
     if (g_config.override_lon != 0.0) opts.center_x = g_config.override_lon;
     if (g_config.override_lat != 0.0) opts.center_y = g_config.override_lat;
@@ -321,6 +325,8 @@ int main(int argc, char* argv[]) {
             LOG_I("LOD enabled (not fully implemented)");
         } else if (arg == "--enable-unlit") {
             opts.enable_unlit = true;
+        } else if (arg == "--no-parallel") {
+            opts.enable_parallel = false;
         } else if (arg == "--enable-top_reconstruct") {
             opts.enable_top_reconstruct = true;
         } else if (arg == "--top-texture-max-size" && i + 1 < argc) {
