@@ -17,6 +17,7 @@ struct ConvertOptions {
     bool enable_meshopt = false;
     bool enable_draco = false;
     bool enable_unlit = true;
+    bool enable_parallel = true;     // multi-threaded tile conversion
 
     // Geoid
     std::string geoid_model = "none";

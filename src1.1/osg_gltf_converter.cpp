@@ -1,4 +1,5 @@
 #include "osg_gltf_converter.h"
+#include "osgb_converter.h"
 #include "coordinate_transformer.h"
 #include "mesh_processor.h"
 
@@ -141,10 +142,12 @@ static void log_osg_plugin_info() {
 // ============================================================
 class InfoVisitor : public osg::NodeVisitor {
     std::string path;
+    bool skip_correction;  // true for get_all_tree (only need sub_node_names)
 public:
-    InfoVisitor(std::string _path, bool loadAllType = false)
+    InfoVisitor(std::string _path, bool loadAllType = false, bool _skip_correction = false)
         : osg::NodeVisitor(TRAVERSE_ALL_CHILDREN)
-        , path(_path), is_loadAllType(loadAllType), is_pagedlod(loadAllType) {}
+        , path(_path), is_loadAllType(loadAllType), is_pagedlod(loadAllType)
+        , skip_correction(_skip_correction) {}
 
     ~InfoVisitor() {}
 
@@ -160,8 +163,9 @@ public:
             other_geometry_array.push_back(&geometry);
 
         // Coordinate correction using global transformer
+        // Skip in get_all_tree() — only need sub_node_names, geometry is discarded.
         coords::CoordinateTransformer* transformer = GetGlobalTransformer();
-        bool needs_transform = transformer && transformer->HasGeoReference();
+        bool needs_transform = !skip_correction && transformer && transformer->HasGeoReference();
 
         if (needs_transform) {
             osg::Vec3Array* vertexArr = (osg::Vec3Array*)geometry.getVertexArray();
@@ -261,7 +265,7 @@ osg_tree get_all_tree(std::string& file_name) {
     static bool logged = false;
     if (!logged) { log_osg_plugin_info(); logged = true; }
 
-    InfoVisitor infoVisitor(get_parent(file_name));
+    InfoVisitor infoVisitor(get_parent(file_name), false, /*skip_correction=*/true);
     {
         osg::ref_ptr<osg::Node> root = osgDB::readNodeFiles(fileNames);
         if (!root) {
@@ -272,6 +276,7 @@ osg_tree get_all_tree(std::string& file_name) {
         root_tile.file_name = file_name;
         root_tile.type = 1;
         root->accept(infoVisitor);
+        root_tile.cached_node = root;  // Save for Phase 2 to avoid re-reading
     }
 
     for (auto& i : infoVisitor.sub_node_names) {
@@ -1024,20 +1029,16 @@ static void write_osgGeometry(osg::Geometry* g, OsgBuildState* osgState,
     }
 }
 
-bool osgb2glb_buf(std::string path, std::string& glb_buff, MeshInfo& mesh_info,
-                  int node_type, bool enable_texture_compress,
-                  bool enable_meshopt, bool enable_draco, bool enable_unlit,
-                  double simplify_ratio,
-                  int draco_pos_bits, int draco_normal_bits, int draco_uv_bits) {
-    vector<string> fileNames = { path };
-    std::string parent_path = get_parent(path);
-
-    static bool logged = false;
-    if (!logged) { log_osg_plugin_info(); logged = true; }
-
-    osg::ref_ptr<osg::Node> root = osgDB::readNodeFiles(fileNames);
-    if (!root.valid()) return false;
-
+// ============================================================
+// Core: OSG Node → GLB buffer (shared by osgb2glb_buf and convert_one_tile)
+// Takes a pre-loaded node and its parent path.
+// ============================================================
+static bool osgb2glb_buf_from_node(osg::Node* root, std::string parent_path,
+                                    std::string& glb_buff, MeshInfo& mesh_info,
+                                    int node_type, bool enable_texture_compress,
+                                    bool enable_meshopt, bool enable_draco, bool enable_unlit,
+                                    double simplify_ratio,
+                                    int draco_pos_bits, int draco_normal_bits, int draco_uv_bits) {
     InfoVisitor infoVisitor(parent_path, node_type == -1);
     root->accept(infoVisitor);
     if (node_type == 2 || infoVisitor.geometry_array.empty()) {
@@ -1084,8 +1085,6 @@ bool osgb2glb_buf(std::string path, std::string& glb_buff, MeshInfo& mesh_info,
 
     if (model.meshes[0].primitives.empty()) return false;
 
-    // Fix: ensure all primitives have a valid material index (not -1)
-    // otherwise Cesium may fail to render them
     for (auto& prim : model.meshes[0].primitives) {
         if (prim.material < 0) prim.material = 0;
     }
@@ -1151,11 +1150,10 @@ bool osgb2glb_buf(std::string path, std::string& glb_buff, MeshInfo& mesh_info,
         model.extensionsUsed.push_back("EXT_meshopt_compression");
     }
 
-    // Materials — always set a visible baseColorFactor so model is visible even without textures
+    // Materials
     {
         bool has_images = !model.images.empty();
         if (infoVisitor.texture_array.empty()) {
-            // No textures at all — create one default material with visible gray color
             auto mat = make_default_material(0.75, 0.75, 0.75);
             if (enable_unlit)
                 mat.extensions["KHR_materials_unlit"] = tinygltf::Value(tinygltf::Value::Object());
@@ -1165,7 +1163,6 @@ bool osgb2glb_buf(std::string path, std::string& glb_buff, MeshInfo& mesh_info,
                 auto mat = make_default_material(0.75, 0.75, 0.75);
                 if (enable_unlit)
                     mat.extensions["KHR_materials_unlit"] = tinygltf::Value(tinygltf::Value::Object());
-                // Only set texture if we successfully encoded it
                 if (has_images && i < model.images.size())
                     mat.pbrMetallicRoughness.baseColorTexture.index = (int)i;
                 model.materials.push_back(mat);
@@ -1173,7 +1170,7 @@ bool osgb2glb_buf(std::string path, std::string& glb_buff, MeshInfo& mesh_info,
         }
     }
 
-    // Textures — only create if we have valid images
+    // Textures
     if (!model.images.empty()) {
         for (size_t i = 0; i < model.images.size(); i++) {
             tinygltf::Texture tex;
@@ -1192,11 +1189,6 @@ bool osgb2glb_buf(std::string path, std::string& glb_buff, MeshInfo& mesh_info,
     model.asset.version = "2.0";
     model.asset.generator = "osgb2b3dm-cpp";
 
-    // CRITICAL: The buffer must be added to model.buffers so that
-    // WriteGltfSceneToStream writes the BIN chunk containing all
-    // vertex data, indices, textures, etc.
-    // Without this, only the JSON chunk is written and Cesium has
-    // nothing to render (the b3dm loads but is invisible).
     model.buffers.push_back(buffer);
 
     std::ostringstream ss;
@@ -1205,6 +1197,28 @@ bool osgb2glb_buf(std::string path, std::string& glb_buff, MeshInfo& mesh_info,
         return true;
     }
     return false;
+}
+
+bool osgb2glb_buf(std::string path, std::string& glb_buff, MeshInfo& mesh_info,
+                  int node_type, bool enable_texture_compress,
+                  bool enable_meshopt, bool enable_draco, bool enable_unlit,
+                  double simplify_ratio,
+                  int draco_pos_bits, int draco_normal_bits, int draco_uv_bits) {
+    vector<string> fileNames = { path };
+    std::string parent_path = get_parent(path);
+
+    static bool logged = false;
+    if (!logged) { log_osg_plugin_info(); logged = true; }
+
+    osg::ref_ptr<osg::Node> root = osgDB::readNodeFiles(fileNames);
+    if (!root.valid()) return false;
+
+    return osgb2glb_buf_from_node(root.get(), parent_path,
+                                   glb_buff, mesh_info, node_type,
+                                   enable_texture_compress, enable_meshopt,
+                                   enable_draco, enable_unlit,
+                                   simplify_ratio,
+                                   draco_pos_bits, draco_normal_bits, draco_uv_bits);
 }
 
 // ============================================================
@@ -1393,6 +1407,52 @@ void do_tile_job_1_1(osg_tree& tree, std::string out_path, int max_lvl,
 }
 
 // ============================================================
+// Single tile conversion (for parallel task pool)
+// Always loads from disk — cached_node from Phase 1 contains
+// pre-loaded child geometry which would break tile-level bbox.
+// ============================================================
+bool convert_one_tile(const FlatTile& tile, const osgb_converter::ConvertOptions& opts) {
+    std::string glb_buf;
+    MeshInfo minfo;
+
+    bool ok = osgb2glb_buf(tile.file_name, glb_buf, minfo, tile.type,
+                          opts.enable_texture_compress, opts.enable_meshopt,
+                          opts.enable_draco, opts.enable_unlit,
+                          opts.simplify_ratio,
+                          opts.draco_pos_bits, opts.draco_normal_bits, opts.draco_uv_bits);
+
+    if (!ok) return false;
+
+    if (tile.tree) {
+        tile.tree->bbox.max = minfo.max;
+        tile.tree->bbox.min = minfo.min;
+    }
+
+    std::string out_file = tile.out_dir + "/" +
+        replace(get_file_name(tile.file_name), ".osgb",
+                tile.type != 2 ? ".glb" : "o.glb");
+
+    if (!glb_buf.empty())
+        write_file(out_file.c_str(), glb_buf.data(), (unsigned long)glb_buf.size());
+
+    return true;
+}
+
+// ============================================================
+// Recursively collect all tiles into a flat list for parallel processing
+// ============================================================
+void collect_flat_tiles(osg_tree& tree, const std::string& out_dir,
+                        std::vector<FlatTile>& out) {
+    if (tree.file_name.empty()) return;
+    if (tree.type > 0) {
+        out.push_back({tree.file_name, out_dir, tree.type, &tree});
+    }
+    for (auto& sub : tree.sub_nodes) {
+        collect_flat_tiles(sub, out_dir, out);
+    }
+}
+
+// ============================================================
 // 3D Tiles 1.1: JSON generation with 3DTILES_content_gltf
 // ============================================================
 std::string encode_tile_json_1_1(osg_tree& tree, double x, double y) {
@@ -1512,6 +1572,12 @@ bool build_merged_root_glb(
         return h;
     };
 
+    // Keep loaded nodes alive until the end of this function.
+    // Geometry/texture pointers stored in all_geometry/all_textures are
+    // raw pointers into these node graphs — destroying the ref_ptr would
+    // free the entire OSG node tree, making all pointers dangling.
+    std::vector<osg::ref_ptr<osg::Node>> loaded_nodes;
+
     // Phase 1: Load all coarsest files and collect geometry/textures
     for (const auto& fpath : coarsest_paths) {
         std::string parent_path = get_parent(fpath);
@@ -1558,6 +1624,9 @@ bool build_merged_root_glb(
                 }
             }
         }
+
+        // Keep root alive — geometry/texture raw pointers point into it
+        loaded_nodes.push_back(root);
     }
 
     if (all_geometry.empty()) {
