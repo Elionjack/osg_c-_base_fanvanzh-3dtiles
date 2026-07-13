@@ -180,6 +180,7 @@ static const HardcodedConfig g_config = {
     /* draco_pos_bits      */ 11,
     /* draco_normal_bits   */ 10,
     /* draco_uv_bits       */ 12,
+    /* enable_parallel     */ true,
     /* override_lon        */ 0.0,
     /* override_lat        */ 0.0,
     /* override_alt        */ 0.0,
@@ -330,6 +331,7 @@ src/ 和 src1.1/ 现在共享完整的网格处理管线。核心差异仅在于
 | `--enable-simplify` | 启用 meshoptimizer 网格简化 | off |
 | `--enable-unlit` | 启用 KHR_materials_unlit 扩展 | on |
 | `--enable-top-reconstruct` | 合并最粗 LOD 瓦片生成 root.glb 概览 | off |
+| `--no-parallel` | 禁用多线程 tile 转换（默认开启并行） | off（即默认并行） |
 | `--top-texture-max-size` | Root GLB 纹理最大尺寸（0=不限制） | 512 |
 | `--simplify-ratio` | Meshopt 简化目标比例（1.0=不简化） | 0.5 |
 | `--draco-pos-bits` | Draco 位置量化位数 | 11 |
@@ -352,6 +354,12 @@ src/ 和 src1.1/ 现在共享完整的网格处理管线。核心差异仅在于
 ### 转换器提交历史
 
 ```
+04a12af Refactor pipeline to 3-phase: parallel tree build → tile-level parallel conversion → serial aggregation
+        - 三阶段管线：Phase 1 并行建树 → Phase 2 全 tile 并行转换 → Phase 3 串行聚合(bbox/ge/JSON)
+        - convert_one_tile() 始终从磁盘加载，避免 cached_node 几何体污染
+        - build_merged_root_glb 修复：loaded_nodes 防悬空指针、encoded_hashes 分离纹理去重
+        - 新增 --no-parallel CLI 参数、FlatTile 结构体、collect_flat_tiles()
+
 53482f8 完成顶点重建，暴露控制参数
         - Feat: --enable-top-reconstruct 合并最粗 LOD 瓦片生成 root.glb
         - Feat: --top-texture-max-size 控制 root GLB 纹理最大尺寸
