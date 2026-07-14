@@ -16,6 +16,7 @@
 #include <condition_variable>
 #include <future>
 #include <functional>
+#include <memory>
 #include <glm/gtc/type_ptr.hpp>
 
 namespace fs = std::filesystem;
@@ -446,50 +447,68 @@ int convert_osgb(const ConvertOptions& opts) {
 
     std::mutex trees_mutex;
     std::vector<TreeResult> all_trees;
-    {
-        Semaphore sem(std::thread::hardware_concurrency());
-        std::vector<std::future<void>> futures;
 
-        for (auto& entry : fs::directory_iterator(data_dir)) {
-            if (!entry.is_directory()) continue;
+    // Collect tasks first, then dispatch (parallel or serial).
+    // Phase 1 is I/O-bound: osgDB::readNodeFiles() has a global mutex,
+    // so we cap I/O concurrency to 4 threads even in parallel mode.
+    std::vector<std::function<void()>> phase1_tasks;
 
-            fs::path tile_dir = entry.path();
-            std::string stem = tile_dir.filename().string();
-            fs::path osgb_file = tile_dir / (stem + ".osgb");
+    for (auto& entry : fs::directory_iterator(data_dir)) {
+        if (!entry.is_directory()) continue;
 
-            if (!fs::exists(osgb_file) || fs::is_directory(osgb_file)) {
-                LOG_E("No OSGB file in tile dir: %s", tile_dir.string().c_str());
-                continue;
-            }
+        fs::path tile_dir = entry.path();
+        std::string stem = tile_dir.filename().string();
+        fs::path osgb_file = tile_dir / (stem + ".osgb");
 
-            fs::path out_tile_dir = out_dir / "Data" / stem;
-            fs::create_directories(out_tile_dir);
-
-            sem.acquire();
-            auto task = [&trees_mutex, &all_trees, &sem,
-                         osgb_path = osgb_file.string(),
-                         stem,
-                         out_path = out_tile_dir.string()]() {
-                LOG_I("Phase 1 - Building tree: %s", osgb_path.c_str());
-                std::string path_copy = osgb_path;
-                osg_tree root = get_all_tree(path_copy);
-                if (root.file_name.empty()) {
-                    LOG_E("Failed to read: %s", osgb_path.c_str());
-                    sem.release();
-                    return;
-                }
-                {
-                    std::lock_guard<std::mutex> lock(trees_mutex);
-                    all_trees.push_back({std::move(root), stem, out_path});
-                }
-                sem.release();
-            };
-            futures.push_back(std::async(std::launch::async, std::move(task)));
+        if (!fs::exists(osgb_file) || fs::is_directory(osgb_file)) {
+            LOG_E("No OSGB file in tile dir: %s", tile_dir.string().c_str());
+            continue;
         }
-        for (auto& f : futures) f.get();
+
+        fs::path out_tile_dir = out_dir / "Data" / stem;
+        fs::create_directories(out_tile_dir);
+
+        phase1_tasks.push_back([&trees_mutex, &all_trees,
+                                osgb_path = osgb_file.string(),
+                                stem,
+                                out_path = out_tile_dir.string()]() {
+            LOG_I("Phase 1 - Building tree: %s", osgb_path.c_str());
+            std::string path_copy = osgb_path;
+            osg_tree root = get_all_tree(path_copy);
+            if (root.file_name.empty()) {
+                LOG_E("Failed to read: %s", osgb_path.c_str());
+                return;
+            }
+            {
+                std::lock_guard<std::mutex> lock(trees_mutex);
+                all_trees.push_back({std::move(root), stem, out_path});
+            }
+        });
     }
 
-    LOG_I("Phase 1 complete: %zu tile trees built", all_trees.size());
+    if (opts.enable_parallel) {
+        // Cap I/O threads: osgDB::readNodeFiles serializes on a global mutex
+        unsigned int p1_threads = std::min(std::thread::hardware_concurrency(), 4u);
+        Semaphore sem(p1_threads);
+        std::vector<std::future<void>> futures;
+        futures.reserve(phase1_tasks.size());
+
+        for (auto& task : phase1_tasks) {
+            // sem.acquire() INSIDE the lambda — non-blocking submission (Fix #4)
+            auto wrapper = [&sem, task = std::move(task)]() {
+                sem.acquire();
+                task();
+                sem.release();
+            };
+            futures.push_back(std::async(std::launch::async, std::move(wrapper)));
+        }
+        for (auto& f : futures) f.get();
+        LOG_I("Phase 1 complete: %zu tile trees built (parallel, %u I/O threads)",
+              all_trees.size(), p1_threads);
+    } else {
+        for (auto& task : phase1_tasks) task();
+        LOG_I("Phase 1 complete: %zu tile trees built (serial)", all_trees.size());
+    }
 
     if (all_trees.empty()) {
         LOG_E("No tile trees were built");
@@ -498,32 +517,121 @@ int convert_osgb(const ConvertOptions& opts) {
 
     // ============================================================
     // Phase 2: Flatten all trees → tile conversion (parallel or serial)
-    //           Every tile (including sub-LODs) competes for CPU cores
-    //           when parallel mode is on.
+    //           Uses cached_node from Phase 1 to avoid redundant
+    //           osgDB::readNodeFiles() calls and OSG global mutex.
+    //           Tiles are chunked; compute and I/O are separated:
+    //           parallel CPU work first, then serialized file writes.
     // ============================================================
     std::vector<FlatTile> all_tiles;
-    for (auto& tr : all_trees) {
-        collect_flat_tiles(tr.root, tr.out_tile_dir, all_tiles);
+    {
+        auto t0 = std::chrono::steady_clock::now();
+        for (auto& tr : all_trees) {
+            collect_flat_tiles(tr.root, tr.out_tile_dir, all_tiles);
+        }
+        auto t1 = std::chrono::steady_clock::now();
+        LOG_I("Phase 2: Flattened %zu tiles in %.0fms (%s)", all_tiles.size(),
+              std::chrono::duration<double, std::milli>(t1 - t0).count(),
+              opts.enable_parallel ? "parallel (chunked, serial write)" : "serial");
     }
-    LOG_I("Phase 2: Flattened %zu tiles (%s)", all_tiles.size(),
-          opts.enable_parallel ? "parallel" : "serial");
 
     if (opts.enable_parallel) {
-        Semaphore sem(std::thread::hardware_concurrency());
-        std::vector<std::future<void>> futures;
+        const size_t CHUNK_SIZE = 16;
+        size_t num_chunks = (all_tiles.size() + CHUNK_SIZE - 1) / CHUNK_SIZE;
 
-        for (const auto& tile : all_tiles) {
-            sem.acquire();
-            auto task = [&sem, &opts, tile]() {
-                convert_one_tile(tile, opts);
+        Semaphore sem(6u);  // P-core count for i9-12900H
+        std::mutex write_mutex;
+        std::atomic<size_t> tiles_done{0};
+        std::atomic<size_t> active_chunks{0};
+        std::vector<std::future<void>> futures;
+        futures.reserve(num_chunks);
+
+        auto t_launch_start = std::chrono::steady_clock::now();
+        for (size_t ci = 0; ci < num_chunks; ci++) {
+            size_t start = ci * CHUNK_SIZE;
+            size_t end = std::min(start + CHUNK_SIZE, all_tiles.size());
+            size_t chunk_idx = ci;
+
+            auto chunk_tiles = std::make_shared<std::vector<FlatTile>>(
+                all_tiles.begin() + start, all_tiles.begin() + end);
+
+            auto task = [&sem, &opts, chunk_tiles, chunk_idx, num_chunks,
+                         total_tiles = all_tiles.size(),
+                         &write_mutex, &tiles_done,
+                         &active_chunks,
+                         first_flag = std::make_shared<std::atomic<bool>>(false)]() {
+                sem.acquire();
+
+                // Log the very first chunk to start
+                bool expect = false;
+                if (first_flag->compare_exchange_strong(expect, true))
+                    LOG_I("Phase 2: First chunk started computing (thread is alive)");
+
+                size_t cur_active = active_chunks.fetch_add(1) + 1;
+                LOG_I("  Chunk %zu/%zu [%zu tiles] computing... (active=%zu)",
+                      chunk_idx + 1, num_chunks, chunk_tiles->size(), cur_active);
+
+                // === Phase 2a: Parallel computation ===
+                size_t chunk_size = chunk_tiles->size();
+                auto t0 = std::chrono::steady_clock::now();
+
+                struct ChunkResult {
+                    std::string glb_buf;
+                    std::string out_file;
+                    MeshInfo minfo;
+                    osg_tree* tree;
+                    bool ok;
+                };
+                std::vector<ChunkResult> results;
+                results.reserve(chunk_size);
+
+                for (const auto& tile : *chunk_tiles) {
+                    ChunkResult r;
+                    r.tree = tile.tree;
+                    r.ok = compute_tile_output(tile, opts, r.glb_buf, r.minfo, r.out_file);
+                    if (r.ok && r.tree) {
+                        r.tree->bbox.max = r.minfo.max;
+                        r.tree->bbox.min = r.minfo.min;
+                    }
+                    results.push_back(std::move(r));
+                }
+
+                auto t1 = std::chrono::steady_clock::now();
+                double compute_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
                 sem.release();
+
+                // === Phase 2b: Serialized file writes ===
+                auto t2 = std::chrono::steady_clock::now();
+                double wait_ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
+                {
+                    std::lock_guard<std::mutex> lock(write_mutex);
+                    for (auto& r : results) {
+                        if (r.ok && !r.glb_buf.empty())
+                            write_file(r.out_file.c_str(), r.glb_buf.data(),
+                                       (unsigned long)r.glb_buf.size());
+                    }
+                }
+
+                auto t3 = std::chrono::steady_clock::now();
+                double write_ms = std::chrono::duration<double, std::milli>(t3 - t2).count();
+
+                LOG_I("  Chunk %zu/%zu: compute=%.0fms, write_wait=%.0fms, write=%.0fms",
+                      chunk_idx + 1, num_chunks, compute_ms, wait_ms, write_ms);
+
+                size_t done = tiles_done.fetch_add(chunk_size) + chunk_size;
+                if (done % 200 < chunk_size || done >= total_tiles)
+                    LOG_I("  Progress: %zu/%zu tiles done", done, total_tiles);
             };
             futures.push_back(std::async(std::launch::async, std::move(task)));
         }
+        auto t_launch_end = std::chrono::steady_clock::now();
+        LOG_I("Phase 2: %zu futures launched in %.0fms, waiting for completion...",
+              futures.size(),
+              std::chrono::duration<double, std::milli>(t_launch_end - t_launch_start).count());
         for (auto& f : futures) f.get();
     } else {
         for (const auto& tile : all_tiles) {
-            convert_one_tile(tile, opts);
+            convert_one_tile_from_cached(tile, opts);
         }
     }
 

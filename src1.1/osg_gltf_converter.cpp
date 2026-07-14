@@ -32,6 +32,8 @@
 
 // OSG plugin registration (needed for static linking on Linux/macOS)
 #if defined(__unix__) || defined(__APPLE__)
+#include <atomic>
+#include <chrono>
 #include <osgDB/Registry>
 USE_OSGPLUGIN(osg)
 USE_OSGPLUGIN(osg2)
@@ -1033,12 +1035,20 @@ static void write_osgGeometry(osg::Geometry* g, OsgBuildState* osgState,
 // Core: OSG Node → GLB buffer (shared by osgb2glb_buf and convert_one_tile)
 // Takes a pre-loaded node and its parent path.
 // ============================================================
-static bool osgb2glb_buf_from_node(osg::Node* root, std::string parent_path,
+bool osgb2glb_buf_from_node(osg::Node* root, std::string parent_path,
                                     std::string& glb_buff, MeshInfo& mesh_info,
                                     int node_type, bool enable_texture_compress,
                                     bool enable_meshopt, bool enable_draco, bool enable_unlit,
                                     double simplify_ratio,
                                     int draco_pos_bits, int draco_normal_bits, int draco_uv_bits) {
+    static std::atomic<int64_t> total_info_us{0};
+    static std::atomic<int64_t> total_geom_us{0};
+    static std::atomic<int64_t> total_tex_us{0};
+    static std::atomic<int64_t> total_glb_us{0};
+    static std::atomic<size_t> call_n{0};
+
+    auto t0 = std::chrono::steady_clock::now();
+
     InfoVisitor infoVisitor(parent_path, node_type == -1);
     root->accept(infoVisitor);
     if (node_type == 2 || infoVisitor.geometry_array.empty()) {
@@ -1049,6 +1059,8 @@ static bool osgb2glb_buf_from_node(osg::Node* root, std::string parent_path,
 
     osgUtil::SmoothingVisitor sv;
     root->accept(sv);
+
+    auto t1 = std::chrono::steady_clock::now();
 
     tinygltf::TinyGLTF gltf;
     tinygltf::Model model;
@@ -1089,6 +1101,8 @@ static bool osgb2glb_buf_from_node(osg::Node* root, std::string parent_path,
         if (prim.material < 0) prim.material = 0;
     }
 
+    auto t2 = std::chrono::steady_clock::now();  // geometry done
+
     mesh_info.min = { (double)osgState.point_min.x(), (double)osgState.point_min.y(), (double)osgState.point_min.z() };
     mesh_info.max = { (double)osgState.point_max.x(), (double)osgState.point_max.y(), (double)osgState.point_max.z() };
 
@@ -1114,6 +1128,8 @@ static bool osgb2glb_buf_from_node(osg::Node* root, std::string parent_path,
             model.bufferViews.push_back(bfv);
         }
     }
+
+    auto t3 = std::chrono::steady_clock::now();  // textures done
 
     // Node
     tinygltf::Node node; node.mesh = 0;
@@ -1192,7 +1208,25 @@ static bool osgb2glb_buf_from_node(osg::Node* root, std::string parent_path,
     model.buffers.push_back(buffer);
 
     std::ostringstream ss;
-    if (gltf.WriteGltfSceneToStream(&model, ss, false, true)) {
+    bool ok = gltf.WriteGltfSceneToStream(&model, ss, false, true);
+
+    auto t4 = std::chrono::steady_clock::now();  // GLB done
+
+    // Accumulate per-phase timing for diagnostics
+    using namespace std::chrono;
+    total_info_us += duration_cast<microseconds>(t1 - t0).count();
+    total_geom_us += duration_cast<microseconds>(t2 - t1).count();
+    total_tex_us  += duration_cast<microseconds>(t3 - t2).count();
+    total_glb_us  += duration_cast<microseconds>(t4 - t3).count();
+    size_t n = call_n.fetch_add(1) + 1;
+    if (n % 200 == 0 || n == 1) {
+        auto to_ms = [](int64_t us) { return us / 1000; };
+        LOG_I("  Per-tile phase timing (%zu tiles): info=%lldms geom=%lldms tex=%lldms glb=%lldms",
+              n, to_ms(total_info_us.load()), to_ms(total_geom_us.load()),
+              to_ms(total_tex_us.load()), to_ms(total_glb_us.load()));
+    }
+
+    if (ok) {
         glb_buff = ss.str();
         return true;
     }
@@ -1431,6 +1465,80 @@ bool convert_one_tile(const FlatTile& tile, const osgb_converter::ConvertOptions
     std::string out_file = tile.out_dir + "/" +
         replace(get_file_name(tile.file_name), ".osgb",
                 tile.type != 2 ? ".glb" : "o.glb");
+
+    if (!glb_buf.empty())
+        write_file(out_file.c_str(), glb_buf.data(), (unsigned long)glb_buf.size());
+
+    return true;
+}
+
+// ============================================================
+// Compute GLB buffer and output path for a single tile.
+// Pure CPU work — no file I/O. Caller handles bbox write-back
+// and file writing. Safe for parallel execution.
+// ============================================================
+bool compute_tile_output(const FlatTile& tile,
+                         const osgb_converter::ConvertOptions& opts,
+                         std::string& glb_buf, MeshInfo& minfo,
+                         std::string& out_file) {
+    static std::atomic<size_t> cache_hits{0};
+    static std::atomic<size_t> cache_misses{0};
+    bool ok = false;
+    bool used_cache = false;
+
+    if (tile.tree && tile.tree->cached_node.valid()) {
+        ok = osgb2glb_buf_from_node(
+            tile.tree->cached_node.get(),
+            get_parent(tile.file_name),
+            glb_buf, minfo, tile.type,
+            opts.enable_texture_compress, opts.enable_meshopt,
+            opts.enable_draco, opts.enable_unlit,
+            opts.simplify_ratio,
+            opts.draco_pos_bits, opts.draco_normal_bits, opts.draco_uv_bits);
+        used_cache = true;
+    } else {
+        ok = osgb2glb_buf(tile.file_name, glb_buf, minfo, tile.type,
+                         opts.enable_texture_compress, opts.enable_meshopt,
+                         opts.enable_draco, opts.enable_unlit,
+                         opts.simplify_ratio,
+                         opts.draco_pos_bits, opts.draco_normal_bits, opts.draco_uv_bits);
+    }
+
+    size_t h = cache_hits.fetch_add(used_cache ? 1 : 0) + (used_cache ? 1 : 0);
+    size_t m = cache_misses.fetch_add(used_cache ? 0 : 1) + (used_cache ? 0 : 1);
+    // Log first few misses and every 200 tiles
+    if (!used_cache || (h + m) % 200 == 0 || h + m <= 20) {
+        LOG_I("  compute_tile: %s (hits=%zu misses=%zu type=%d)",
+              used_cache ? "cached" : "DISK", h, m, tile.type);
+    }
+
+    if (!ok) return false;
+
+    out_file = tile.out_dir + "/" +
+        replace(get_file_name(tile.file_name), ".osgb",
+                tile.type != 2 ? ".glb" : "o.glb");
+
+    return true;
+}
+
+// ============================================================
+// Single tile conversion that uses pre-loaded cached_node from Phase 1.
+// Computes GLB buffer, writes bbox, and writes file to disk.
+// Used by the serial path and as a convenience wrapper.
+// ============================================================
+bool convert_one_tile_from_cached(const FlatTile& tile,
+                                   const osgb_converter::ConvertOptions& opts) {
+    std::string glb_buf;
+    MeshInfo minfo;
+    std::string out_file;
+
+    if (!compute_tile_output(tile, opts, glb_buf, minfo, out_file))
+        return false;
+
+    if (tile.tree) {
+        tile.tree->bbox.max = minfo.max;
+        tile.tree->bbox.min = minfo.min;
+    }
 
     if (!glb_buf.empty())
         write_file(out_file.c_str(), glb_buf.data(), (unsigned long)glb_buf.size());
