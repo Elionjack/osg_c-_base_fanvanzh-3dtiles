@@ -354,22 +354,44 @@ src/ 和 src1.1/ 现在共享完整的网格处理管线。核心差异仅在于
 ### 转换器提交历史
 
 ```
+61df8e7 更新 src1.1: osg_gltf_converter 增强、osgb_converter 重构、mesh_processor 优化
+        - osg_gltf_converter 新增 osgb2glb_buf_from_node()（预加载节点转换，避免 OSG 全局锁）
+        - osg_gltf_converter 新增 compute_tile_output()（计算/IO 分离，提升并行吞吐）
+        - osg_gltf_converter 新增 build_merged_root_glb()（合并最粗 LOD 生成 root.glb）
+        - osgb_converter 重构为 3 阶段管线（并行建树 → 块级并行转换 → 串行聚合）
+        - mesh_processor 移除 basisu cFlagThreaded（外层并行时内部单线程，避免线程爆炸）
+2ff7b33 Update README: document 3-phase pipeline, --no-parallel, and recent fixes
 04a12af Refactor pipeline to 3-phase: parallel tree build → tile-level parallel conversion → serial aggregation
         - 三阶段管线：Phase 1 并行建树 → Phase 2 全 tile 并行转换 → Phase 3 串行聚合(bbox/ge/JSON)
         - convert_one_tile() 始终从磁盘加载，避免 cached_node 几何体污染
         - build_merged_root_glb 修复：loaded_nodes 防悬空指针、encoded_hashes 分离纹理去重
         - 新增 --no-parallel CLI 参数、FlatTile 结构体、collect_flat_tiles()
 
-53482f8 完成顶点重建，暴露控制参数
-        - Feat: --enable-top-reconstruct 合并最粗 LOD 瓦片生成 root.glb
-        - Feat: --top-texture-max-size 控制 root GLB 纹理最大尺寸
-        - Feat: 暴露 --simplify-ratio、--draco-pos/normal/uv-bits 等 CLI 控制参数
-        - Feat: build_merged_root_glb 支持纹理降采样、Draco、KTX2 全参数传递
-        - Feat: find_coarsest_node 查找最粗 LOD 节点
-
-eb788ff Add tile-level parallel processing for KTX2/OSGB conversion
-4b055b1 Fix GDAL/PROJ/OSG paths, sync mesh pipeline to src/, enable CLI mode
-8c338de Update README: add geometricError fix to commit history
-cffd8b2 Fix geometricError: leaf=0, parent=size*0.1, root capped at 2000
-95fc162 Update README: add repo info and commit history
 ```
+
+### 并行处理性能优化 (最新)
+
+基于实测性能分析，针对并行处理进行了多项优化：
+
+**已修复的瓶颈：**
+
+| 问题 | 修复 | 文件 |
+|------|------|------|
+| Phase 2 重复调 `osgDB::readNodeFiles()`，OSG 全局锁串行化 | `convert_one_tile_from_cached()` 使用 Phase 1 的 `cached_node` 加载节点 | `osg_gltf_converter.cpp` |
+| `basisu::cFlagThreaded` 导致 N×M 线程爆炸 | 移除 `cFlagThreaded`，外层并行时内部单线程 | `mesh_processor.cpp` |
+| 一个 tile 一个 `std::async`，线程调度开销过大 | 按 16 个 tile 分 chunk，一个 chunk 一个 `std::async` | `osgb_converter.cpp` |
+| `sem.acquire()` 在主线程阻塞任务提交 | 移到 async lambda 内部 | `osgb_converter.cpp` |
+| `--no-parallel` 只关闭 Phase 2，Phase 1 仍并行 | Phase 1 也遵循 `--no-parallel` | `osgb_converter.cpp` |
+| 并行计算和文件写入纠缠导致写 I/O 串行化 | 计算(C)和写入(I/O)分离：并行计算 → sem.release → `write_mutex` 保护串行写入 | `osgb_converter.cpp` |
+
+**性能结论（i9-12900H, 1925 tiles）：**
+
+| 场景 | 推荐方式 | 耗时 |
+|------|----------|------|
+| 不开 KTX2 纹理压缩 | **`--no-parallel` 串行** | ~240s（并行 727s 更慢） |
+| 开 KTX2 纹理压缩 | **默认并行** | 并行远快于串行 |
+
+- **小 tile 不开 KTX2**：每个 tile 计算轻（~0.1s），6 线程 CPU 并行开销（L3 缓存/内存带宽竞争）> 计算收益，串行更快
+- **开 KTX2**：纹理压缩极重（数秒/tile），计算开销 >> 线程开销，并行大幅加速
+
+`--no-parallel` 现在完全禁用 Phase 1 + Phase 2 的并行，Phase 3 始终串行。
