@@ -47,7 +47,19 @@ struct osg_tree {
 // Get full OSGB tile tree starting from a root file
 osg_tree get_all_tree(std::string& file_name);
 
-// Convert OSGB file to GLB buffer
+// Core: convert a pre-loaded OSG Node to GLB buffer.
+// Unlike osgb2glb_buf(), this does NOT call osgDB::readNodeFiles() —
+// the caller provides the already-loaded node. Thread-safe for parallel use.
+bool osgb2glb_buf_from_node(osg::Node* root, std::string parent_path,
+                            std::string& glb_buff, MeshInfo& mesh_info,
+                            int node_type, bool enable_texture_compress = false,
+                            bool enable_meshopt = false, bool enable_draco = false,
+                            bool enable_unlit = true,
+                            double simplify_ratio = 0.5,
+                            int draco_pos_bits = 11, int draco_normal_bits = 10,
+                            int draco_uv_bits = 12);
+
+// Convert OSGB file to GLB buffer (reads from disk via osgDB::readNodeFiles)
 bool osgb2glb_buf(std::string path, std::string& glb_buff, MeshInfo& mesh_info,
                   int node_type, bool enable_texture_compress = false,
                   bool enable_meshopt = false, bool enable_draco = false,
@@ -106,6 +118,21 @@ void SetGlobalTransformer(coords::CoordinateTransformer* t);
 // Designed to be called from parallel task pools.
 // Populates tile->bbox with the geometry bounds.
 bool convert_one_tile(const FlatTile& tile, const osgb_converter::ConvertOptions& opts);
+
+// Convert a single tile using pre-loaded cached_node from Phase 1.
+// Avoids redundant osgDB::readNodeFiles() and its global mutex.
+// Falls back to disk read if cached_node is invalid.
+bool convert_one_tile_from_cached(const FlatTile& tile,
+                                   const osgb_converter::ConvertOptions& opts);
+
+// Compute GLB buffer for a single tile without writing to disk.
+// Does all the CPU work (InfoVisitor, GLB serialization, compression)
+// but returns the buffer and output path instead of writing.
+// Caller is responsible for bbox write-back and file I/O.
+bool compute_tile_output(const FlatTile& tile,
+                         const osgb_converter::ConvertOptions& opts,
+                         std::string& glb_buf, MeshInfo& minfo,
+                         std::string& out_file);
 
 // Recursively collect all type>0 nodes from an osg_tree into a flat list.
 // Used by Phase 2 of the parallel pipeline.

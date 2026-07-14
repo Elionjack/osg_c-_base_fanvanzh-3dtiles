@@ -49,7 +49,10 @@ bool compress_to_ktx2(const std::vector<unsigned char>& rgba_data, int width, in
         int quality_level = 128;
         std::size_t file_size = 0;
 
-        unsigned int flags = quality_level | basisu::cFlagKTX2 | basisu::cFlagGenMipsWrap | basisu::cFlagThreaded;
+        // NOTE: cFlagThreaded is intentionally NOT set here.
+        // When tiles are already processed in parallel (Phase 2), enabling
+        // basisu's internal threads would cause N×M thread oversubscription.
+        unsigned int flags = quality_level | basisu::cFlagKTX2 | basisu::cFlagGenMipsWrap;
         void* pKTX2_data = basisu::basis_compress(
             basist::basis_tex_format::cETC1S, source_images, flags, 1.0f, &file_size, nullptr);
 

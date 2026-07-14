@@ -246,7 +246,7 @@ static void print_usage(const char* prog) {
         "  --draco-pos-bits N      Draco position quant bits (default: 11)\n"
         "  --draco-normal-bits N   Draco normal quant bits (default: 10)\n"
         "  --draco-uv-bits N       Draco UV quant bits (default: 12)\n"
-        "  --no-parallel           Disable multi-threaded tile conversion\n"
+        "  --no-parallel           Disable all multi-threading (Phase 1 + Phase 2)\n"
         "  --geoid <model>         Geoid model: none, egm84, egm96, egm2008\n"
         "  --geoid-path <path>     Path to geoid data files\n"
         "  --lon <degrees>         Override longitude\n"
