@@ -50,7 +50,9 @@ struct HardcodedConfig {
     int  draco_pos_bits;
     int  draco_normal_bits;
     int  draco_uv_bits;
+    int  ktx2_quality;
     bool enable_parallel;
+    int  num_threads;
     double override_lon;
     double override_lat;
     double override_alt;
@@ -73,7 +75,9 @@ static const HardcodedConfig g_config = {
     /* draco_pos_bits */ 11,
     /* draco_normal_bits */ 10,
     /* draco_uv_bits */ 12,
+    /* ktx2_quality */ 128,
     /* enable_parallel */ true,
+    /* num_threads     */ 0,
     /* override_lon */ 0.0,
     /* override_lat */ 0.0,
     /* override_alt */ 0.0,
@@ -97,7 +101,7 @@ static void setup_environment(const char* exe_path) {
     {
         std::string osg_plugins;
 
-        // 1) Try vcpkg debug plugins directory first
+        // 1) Try vcpkg release plugins directory first
         const char* vcpkg_root = getenv("VCPKG_ROOT");
         if (vcpkg_root) {
             std::string vcpkg_debug_plugins = std::string(vcpkg_root)
@@ -105,14 +109,14 @@ static void setup_environment(const char* exe_path) {
             std::string vcpkg_rel_plugins  = std::string(vcpkg_root)
                 + "/installed/x64-windows/plugins/osgPlugins-3.6.5";
 #ifdef _WIN32
-            if (GetFileAttributesA(vcpkg_debug_plugins.c_str()) != INVALID_FILE_ATTRIBUTES) {
-                osg_plugins = vcpkg_debug_plugins;
-            } else if (GetFileAttributesA(vcpkg_rel_plugins.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            if (GetFileAttributesA(vcpkg_rel_plugins.c_str()) != INVALID_FILE_ATTRIBUTES) {
                 osg_plugins = vcpkg_rel_plugins;
+            } else if (GetFileAttributesA(vcpkg_debug_plugins.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                osg_plugins = vcpkg_debug_plugins;
             }
 #else
-            if (fs::exists(vcpkg_debug_plugins)) osg_plugins = vcpkg_debug_plugins;
-            else if (fs::exists(vcpkg_rel_plugins)) osg_plugins = vcpkg_rel_plugins;
+            if (fs::exists(vcpkg_rel_plugins)) osg_plugins = vcpkg_rel_plugins;
+            else if (fs::exists(vcpkg_debug_plugins)) osg_plugins = vcpkg_debug_plugins;
 #endif
         }
 
@@ -246,7 +250,9 @@ static void print_usage(const char* prog) {
         "  --draco-pos-bits N      Draco position quant bits (default: 11)\n"
         "  --draco-normal-bits N   Draco normal quant bits (default: 10)\n"
         "  --draco-uv-bits N       Draco UV quant bits (default: 12)\n"
+        "  --ktx2-quality N      KTX2 encode quality (1-255, lower=faster, default: 128)\n"
         "  --no-parallel           Disable all multi-threading (Phase 1 + Phase 2)\n"
+        "  --threads N             Number of worker threads (default: auto=CPU cores)\n"
         "  --geoid <model>         Geoid model: none, egm84, egm96, egm2008\n"
         "  --geoid-path <path>     Path to geoid data files\n"
         "  --lon <degrees>         Override longitude\n"
@@ -288,7 +294,9 @@ int main(int argc, char* argv[]) {
     opts.draco_pos_bits          = g_config.draco_pos_bits;
     opts.draco_normal_bits       = g_config.draco_normal_bits;
     opts.draco_uv_bits           = g_config.draco_uv_bits;
+    opts.ktx2_quality            = g_config.ktx2_quality;
     opts.enable_parallel         = g_config.enable_parallel;
+    opts.num_threads             = g_config.num_threads;
 
     if (g_config.override_lon != 0.0) opts.center_x = g_config.override_lon;
     if (g_config.override_lat != 0.0) opts.center_y = g_config.override_lat;
@@ -327,7 +335,9 @@ int main(int argc, char* argv[]) {
             opts.enable_unlit = true;
         } else if (arg == "--no-parallel") {
             opts.enable_parallel = false;
-        } else if (arg == "--enable-top_reconstruct") {
+        } else if (arg == "--threads" && i + 1 < argc) {
+            opts.num_threads = std::stoi(argv[++i]);
+        } else if (arg == "--enable-top-reconstruct" || arg == "--enable-top_reconstruct") {
             opts.enable_top_reconstruct = true;
         } else if (arg == "--top-texture-max-size" && i + 1 < argc) {
             opts.top_texture_max_size = std::stoi(argv[++i]);
@@ -339,6 +349,8 @@ int main(int argc, char* argv[]) {
             opts.draco_normal_bits = std::stoi(argv[++i]);
         } else if (arg == "--draco-uv-bits" && i + 1 < argc) {
             opts.draco_uv_bits = std::stoi(argv[++i]);
+        } else if (arg == "--ktx2-quality" && i + 1 < argc) {
+            opts.ktx2_quality = std::stoi(argv[++i]);
         } else if (arg == "--geoid" && i + 1 < argc) {
             opts.geoid_model = argv[++i];
         } else if (arg == "--geoid-path" && i + 1 < argc) {

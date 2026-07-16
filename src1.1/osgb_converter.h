@@ -18,6 +18,8 @@ struct ConvertOptions {
     bool enable_draco = false;
     bool enable_unlit = true;
     bool enable_parallel = true;     // multi-threaded tile conversion
+    int  num_threads = 0;            // thread count (0=auto: hardware_concurrency)
+    int  ktx2_quality = 128;         // basisu encoding quality (lower=faster, 1-255)
 
     // Geoid
     std::string geoid_model = "none";

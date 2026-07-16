@@ -59,7 +59,7 @@ struct MeshoptCompressionResult {
 
 // Function to compress image data to KTX2 using Basis Universal
 bool compress_to_ktx2(const std::vector<unsigned char>& rgba_data, int width, int height,
-                      std::vector<unsigned char>& ktx2_data);
+                      std::vector<unsigned char>& ktx2_data, int quality = 128);
 
 // Optimize and simplify mesh using meshoptimizer
 bool optimize_and_simplify_mesh(
@@ -88,4 +88,5 @@ bool compress_mesh_geometry_meshopt(osg::Geometry* geometry,
 
 // Process textures (KTX2 compression)
 bool process_texture(osg::Texture* tex, std::vector<unsigned char>& image_data,
-                     std::string& mime_type, bool enable_texture_compress = false);
+                     std::string& mime_type, bool enable_texture_compress = false,
+                     int ktx2_quality = 128);
