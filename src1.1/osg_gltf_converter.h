@@ -2,8 +2,10 @@
 
 #include <string>
 #include <vector>
+#include <map>
 #include <osg/Node>
 #include <osg/Geometry>
+#include <nlohmann/json.hpp>
 #include "utils.h"
 
 // Forward declarations
@@ -57,7 +59,7 @@ bool osgb2glb_buf_from_node(osg::Node* root, std::string parent_path,
                             bool enable_unlit = true,
                             double simplify_ratio = 0.5,
                             int draco_pos_bits = 11, int draco_normal_bits = 10,
-                            int draco_uv_bits = 12);
+                            int draco_uv_bits = 12, int ktx2_quality = 128);
 
 // Convert OSGB file to GLB buffer (reads from disk via osgDB::readNodeFiles)
 bool osgb2glb_buf(std::string path, std::string& glb_buff, MeshInfo& mesh_info,
@@ -66,7 +68,7 @@ bool osgb2glb_buf(std::string path, std::string& glb_buff, MeshInfo& mesh_info,
                   bool enable_unlit = true,
                   double simplify_ratio = 0.5,
                   int draco_pos_bits = 11, int draco_normal_bits = 10,
-                  int draco_uv_bits = 12);
+                  int draco_uv_bits = 12, int ktx2_quality = 128);
 
 // Convert OSGB file to B3DM buffer (includes GLB inside)
 bool osgb2b3dm_buf(std::string path, std::string& b3dm_buf, TileBox& tile_box,
@@ -75,7 +77,7 @@ bool osgb2b3dm_buf(std::string path, std::string& b3dm_buf, TileBox& tile_box,
                    bool enable_unlit = true,
                    double simplify_ratio = 0.5,
                    int draco_pos_bits = 11, int draco_normal_bits = 10,
-                   int draco_uv_bits = 12);
+                   int draco_uv_bits = 12, int ktx2_quality = 128);
 
 // Process all tiles recursively
 void do_tile_job(osg_tree& tree, std::string out_path, int max_lvl,
@@ -83,7 +85,7 @@ void do_tile_job(osg_tree& tree, std::string out_path, int max_lvl,
                  bool enable_draco = false, bool enable_unlit = true,
                  double simplify_ratio = 0.5,
                  int draco_pos_bits = 11, int draco_normal_bits = 10,
-                 int draco_uv_bits = 12);
+                 int draco_uv_bits = 12, int ktx2_quality = 128);
 
 // Bounding box operations
 void expend_box(TileBox& box, TileBox& box_new);
@@ -104,7 +106,7 @@ void do_tile_job_1_1(osg_tree& tree, std::string out_path, int max_lvl,
                      bool enable_draco = false, bool enable_unlit = true,
                      double simplify_ratio = 0.5,
                      int draco_pos_bits = 11, int draco_normal_bits = 10,
-                     int draco_uv_bits = 12);
+                     int draco_uv_bits = 12, int ktx2_quality = 128);
 
 // JSON generation for tile trees (3D Tiles 1.1 compatible)
 // Uses 3DTILES_content_gltf extension and .glb URIs
@@ -140,13 +142,91 @@ void collect_flat_tiles(osg_tree& tree, const std::string& out_dir,
                         std::vector<FlatTile>& out);
 
 // ============================================================
+// Quadtree HLOD structures
+// ============================================================
+
+// Grid cell in spatial grid (one per top-level tile directory)
+struct GridCell {
+    std::string stem;            // e.g. "Tile_-001_+050"
+    int grid_x = 0;              // parsed grid X coordinate
+    int grid_y = 0;              // parsed grid Y coordinate
+    std::string coarsest_path;   // coarsest OSGB path in this cell
+    TileBox bbox;                // bounding box
+    double geometricError = 0.0; // geometric error
+    std::string glb_uri;         // URI to existing GLB (e.g. "./Tile_-001_+050.glb")
+};
+
+// Spatial grid: grid_x → grid_y → GridCell
+using SpatialGrid = std::map<int, std::map<int, GridCell>>;
+
+// Quadtree node for HLOD hierarchy
+struct QuadNode {
+    int grid_x = 0;              // top-left grid coordinate
+    int grid_y = 0;
+    int grid_size = 0;           // size in grid cells (1, 2, 4, 8, ...)
+    int level = 0;               // 0 = finest (leaf), higher = coarser
+    std::string stem;            // tile stem (only for leaf nodes, e.g. "Tile_-001_+050")
+    TileBox bbox;                // bounding box (union of children or from merge)
+    double geometricError = 0.0;
+    std::string glb_uri;         // output GLB URI (relative path)
+    bool has_content = false;    // true = has geometry (content in tileset)
+    std::vector<QuadNode> children; // 0-4 sub-quadtree nodes
+    std::vector<std::string> leaf_stems;           // level=0: tile stems under this node
+    std::vector<std::string> leaf_coarsest_paths;  // level=0: coarsest OSGB paths under this node
+};
+
+// ============================================================
 // Root tile reconstruction (top-level merge)
 // ============================================================
 
-// Find the file path of the coarsest-LOD node in a tile tree.
-// Returns the file_name of the node with the highest _Lxx level number.
-// Falls back to the tree's own file_name if no coarser children found.
-std::string find_coarsest_node(const osg_tree& tree);
+// Parse tile grid coordinates from tile name stem
+// e.g. "Tile_-001_+050" → (-1, 50)
+bool parse_tile_grid_coords(const std::string& stem, int& out_x, int& out_y);
+
+// Build spatial grid from tile results (Phase 3 output)
+SpatialGrid build_spatial_grid(
+    const std::vector<std::string>& tile_stems,
+    const std::vector<std::string>& coarsest_paths,
+    const std::vector<TileBox>& bboxes,
+    const std::vector<double>& coarsest_ges);
+
+// Calculate simplification ratio for a given quadtree level
+double calc_level_ratio(int level, double base_ratio);
+
+// Build quadtree bottom-up from spatial grid.
+// Returns the root node (highest level).
+QuadNode build_quadtree(const SpatialGrid& grid);
+
+// Collect all leaf OSGB paths under a quadtree node (recursive).
+void collect_leaf_paths(const QuadNode& node, const SpatialGrid& grid,
+                        std::vector<std::string>& paths);
+
+// General merge function: merge multiple OSGB files into one GLB.
+// Uses level to determine simplification ratio.
+bool build_merged_glb(
+    const std::vector<std::string>& osgb_paths,
+    int quadtree_level,
+    std::string& out_glb_buf,
+    TileBox& out_bbox,
+    bool enable_texture_compress,
+    bool enable_meshopt,
+    bool enable_draco,
+    bool enable_unlit,
+    int top_texture_max_size = 512,
+    double simplify_ratio = 0.5,
+    int draco_pos_bits = 11, int draco_normal_bits = 10,
+    int draco_uv_bits = 12, int ktx2_quality = 128);
+
+// Generate tileset JSON for a quadtree node hierarchy.
+// Returns a nlohmann::json object representing the tile subtree.
+// tile_jsons maps stem→json for embedding PagedLOD subtrees at leaves.
+nlohmann::json encode_quadtree_json(
+    const QuadNode& node,
+    const std::map<std::string, nlohmann::json>& tile_jsons);
+
+// Returns the coarsest-LOD file for a tile tree: the tree root
+// (file without _Lxx suffix). Optionally outputs its geometricError.
+std::string find_coarsest_node(const osg_tree& tree, double* out_ge = nullptr);
 
 // Build a merged root-level GLB from multiple OSGB files.
 // Loads each file, applies SVD coordinate correction, merges all
@@ -163,4 +243,4 @@ bool build_merged_root_glb(
     int top_texture_max_size = 512,
     double simplify_ratio = 0.5,
     int draco_pos_bits = 11, int draco_normal_bits = 10,
-    int draco_uv_bits = 12);
+    int draco_uv_bits = 12, int ktx2_quality = 128);

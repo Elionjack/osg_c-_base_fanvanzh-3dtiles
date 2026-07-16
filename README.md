@@ -20,7 +20,8 @@
 │   ├── mesh_processor.cpp/.h   # 可选压缩 (Draco/KTX2/meshopt)
 │   └── utils.h                 # 日志、文件 I/O、二进制序列化、包围盒
 ├── src1.1/                     # 3D Tiles 1.1（输出 .glb + 3DTILES_content_gltf）
-│   └── （文件与 src/ 对应，差异见下方说明）
+│   ├── （文件与 src/ 对应，差异见下方说明）
+│   └── split_tileset.py         # tileset.json 层级分割工具（流式 2-pass）
 ├── out/                        # CMake 构建输出
 └── display/                    # CesiumJS 网页查看器（独立 git 仓库）
     ├── server.js               # Node.js 静态文件服务器
@@ -152,11 +153,12 @@ input_dir/
 # 1.1 版（输出 .glb + 3DTILES_content_gltf）
 ./osgb_converter_1_1 -i E:\learning\data\1 -o E:\learning\data\output\my_test_1_1
 
-# 启用所有压缩 + Root 瓦片重建
+# 启用所有压缩 + Root 瓦片重建 + KTX2 质量控制
 ./osgb_converter_1_1 -i E:\learning\data\1 -o E:\learning\data\output\all_on \
     --enable-simplify --enable-draco --enable-texture-compress \
     --enable-top-reconstruct --simplify-ratio 0.5 \
-    --draco-pos-bits 11 --draco-normal-bits 10 --draco-uv-bits 12
+    --draco-pos-bits 11 --draco-normal-bits 10 --draco-uv-bits 12 \
+    --ktx2-quality 128 --threads 8
 ```
 
 如需恢复硬编码配置，修改 `src/main.cpp` 或 `src1.1/main.cpp`：
@@ -330,13 +332,15 @@ src/ 和 src1.1/ 现在共享完整的网格处理管线。核心差异仅在于
 | `--enable-draco` | 启用 Draco 网格压缩 | off |
 | `--enable-simplify` | 启用 meshoptimizer 网格简化 | off |
 | `--enable-unlit` | 启用 KHR_materials_unlit 扩展 | on |
-| `--enable-top-reconstruct` | 合并最粗 LOD 瓦片生成 root.glb 概览 | off |
+| `--enable-top-reconstruct` | 构建四叉树 HLOD（逐级合并生成简化 GLB） | off |
 | `--no-parallel` | 禁用多线程 tile 转换（默认开启并行） | off（即默认并行） |
 | `--top-texture-max-size` | Root GLB 纹理最大尺寸（0=不限制） | 512 |
 | `--simplify-ratio` | Meshopt 简化目标比例（1.0=不简化） | 0.5 |
 | `--draco-pos-bits` | Draco 位置量化位数 | 11 |
 | `--draco-normal-bits` | Draco 法向量化位数 | 10 |
 | `--draco-uv-bits` | Draco UV 量化位数 | 12 |
+| `--ktx2-quality` | KTX2 编码质量 (1-255，越低越快) | 128 |
+| `--threads` | 工作线程数（0=自动=CPU 核心数） | 0 |
 | `--geoid` | 大地水准面模型：`none`/`egm84`/`egm96`/`egm2008` | none |
 | `--geoid-path` | 大地水准面数据文件路径 | 自动 |
 
@@ -354,6 +358,15 @@ src/ 和 src1.1/ 现在共享完整的网格处理管线。核心差异仅在于
 ### 转换器提交历史
 
 ```
+93bbec7 feat(src1.1): 四叉树HLOD、KTX2质量控制、线程数可配、tileset分割工具
+        - 四叉树HLOD: build_quadtree() 从空间网格自底向上构建，每层自动合并生成简化GLB
+        - build_merged_glb() 通用多文件合并（逐级简化比率 calc_level_ratio）
+        - encode_quadtree_json() 生成嵌套 tileset JSON，leaf 嵌 PagedLOD 子树
+        - --ktx2-quality N (1-255) 控制 basisu 编码质量/速度
+        - --threads N 覆盖 CPU 核心数，Phase 1/2 统一使用
+        - split_tileset.py: 流式 2-pass 解析，按深度拆分为外部 tileset 引用
+        - OSG 插件路径优先 Release，get_all_tree 不再缓存 cached_node
+        - find_coarsest_node 简化为直接返回树根
 61df8e7 更新 src1.1: osg_gltf_converter 增强、osgb_converter 重构、mesh_processor 优化
         - osg_gltf_converter 新增 osgb2glb_buf_from_node()（预加载节点转换，避免 OSG 全局锁）
         - osg_gltf_converter 新增 compute_tile_output()（计算/IO 分离，提升并行吞吐）
@@ -395,3 +408,70 @@ src/ 和 src1.1/ 现在共享完整的网格处理管线。核心差异仅在于
 - **开 KTX2**：纹理压缩极重（数秒/tile），计算开销 >> 线程开销，并行大幅加速
 
 `--no-parallel` 现在完全禁用 Phase 1 + Phase 2 的并行，Phase 3 始终串行。
+
+### 四叉树 HLOD（--enable-top-reconstruct）
+
+当启用 `--enable-top-reconstruct` 时，Phase 4 会构建一个四叉树 HLOD（Hierarchical Level of Detail）层级结构：
+
+**处理流程：**
+
+```
+Phase 3 聚合结果（tile_results）
+       │
+       ▼
+Step 4.1: build_spatial_grid()
+  ├── 解析每个 tile stem → 网格坐标 (grid_x, grid_y)
+  │   例: "Tile_-001_+050" → (-1, 50)
+  └── 输出: SpatialGrid = map<grid_x, map<grid_y, GridCell>>
+       │
+       ▼
+Step 4.2: build_quadtree()
+  ├── 计算网格边界，padding 到 2 的幂
+  ├── 从 size=2 开始自底向上递归构建 QuadNode
+  │   - Level 0 (size=2): 合并 4 个 GridCell → 1 个 quadtree 节点
+  │   - Level N (size=2^(N+2)): 合并 4 个 Level N-1 节点
+  └── geometricError 逐级翻倍（每个父级 = max(子级) × 2）
+       │
+       ▼
+Step 4.3: 逐级合并生成 GLB
+  ├── build_merged_glb(leaf_paths, level, ...)
+  │   - 加载所有子节点 OSGB 文件
+  │   - 纹理去重（hash 采样）
+  │   - calc_level_ratio(level, base_ratio) = base_ratio × 0.25^level
+  │   - 逐级简化：level 越高（越粗），简化越多
+  └── 输出: Data/HLOD/root.glb, L0_X+0000_Y+0000.glb, ...
+       │
+       ▼
+Step 5: encode_quadtree_json()
+  ├── Level 0 节点: content = HLOD GLB + children = PagedLOD 子树
+  └── 内部节点: content = HLOD GLB + children = 子 quadtree 节点
+```
+
+**关键设计点：**
+- 叶子节点保留 PagedLOD 原始 GLB（不修改），作为 HLOD level-0 的 children
+- 合并后的 GLB 写入 `Data/HLOD/` 目录
+- tileset.json root 直接使用 quadtree 结构（替代 flat children 列表）
+- 单 tile 数据集的 2×2 区域不合并（保持原始质量）
+
+### tileset.json 分割工具（split_tileset.py）
+
+当 tileset.json 过大导致 Cesium 加载缓慢时，可使用 `split_tileset.py` 按深度拆分为外部 tileset 引用：
+
+```bash
+# 自动选择最优深度
+python src1.1/split_tileset.py output/tileset.json output_split/
+
+# 指定分割深度
+python src1.1/split_tileset.py output/tileset.json output_split/ --depth 2
+
+# 自定义 tile 数量范围
+python src1.1/split_tileset.py output/tileset.json output_split/ --min-tiles 100 --max-tiles 500
+```
+
+**设计特点：**
+- **2-pass 流式处理**：Pass 1 扫描深度分布 → Pass 2 提取子树写入外部文件
+- 基于 `BufferedCharReader` 的字符级流式解析器，内存占用恒定，不依赖完整 JSON 解析
+- 每个子树写入 `subtilesets/` 目录，主 tileset 中替换为轻量引用（boundingVolume + content.uri）
+- `auto_select_depth()` 自动选择 tile 数在 [100, 2000] 范围内的最浅深度
+- 自动复制 Data 目录（可用 `--no-copy-data` 跳过）
+

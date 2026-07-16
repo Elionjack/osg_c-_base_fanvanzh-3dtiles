@@ -487,8 +487,10 @@ int convert_osgb(const ConvertOptions& opts) {
     }
 
     if (opts.enable_parallel) {
-        // Cap I/O threads: osgDB::readNodeFiles serializes on a global mutex
-        unsigned int p1_threads = std::min(std::thread::hardware_concurrency(), 4u);
+        unsigned int n_threads = opts.num_threads > 0
+            ? (unsigned int)opts.num_threads
+            : std::thread::hardware_concurrency();
+        unsigned int p1_threads = std::min(n_threads, 4u);  // I/O bound
         Semaphore sem(p1_threads);
         std::vector<std::future<void>> futures;
         futures.reserve(phase1_tasks.size());
@@ -538,7 +540,10 @@ int convert_osgb(const ConvertOptions& opts) {
         const size_t CHUNK_SIZE = 16;
         size_t num_chunks = (all_tiles.size() + CHUNK_SIZE - 1) / CHUNK_SIZE;
 
-        Semaphore sem(6u);  // P-core count for i9-12900H
+        unsigned int p2_threads = opts.num_threads > 0
+            ? (unsigned int)opts.num_threads
+            : std::thread::hardware_concurrency();
+        Semaphore sem(p2_threads);
         std::mutex write_mutex;
         std::atomic<size_t> tiles_done{0};
         std::atomic<size_t> active_chunks{0};
@@ -643,6 +648,7 @@ int convert_osgb(const ConvertOptions& opts) {
     //           are bottom-up on each tree.
     // ============================================================
     std::vector<TileResult> tile_results;
+    std::map<std::string, json> tile_jsons_map;  // stem → tree_json (for HLOD leaves)
 
     for (auto& tr : all_trees) {
         extend_tile_box(tr.root);
@@ -667,6 +673,7 @@ int convert_osgb(const ConvertOptions& opts) {
         std::string coarsest_path = find_coarsest_node(tr.root);
 
         tile_results.push_back({tile_tree, box_full, coarsest_path});
+        tile_jsons_map[tr.stem] = tile_tree;  // For HLOD leaf lookup
     }
 
     LOG_I("Phase 3 complete: %zu tile trees aggregated", tile_results.size());
@@ -677,68 +684,152 @@ int convert_osgb(const ConvertOptions& opts) {
     }
 
     // ============================================================
-    // 4.5: Root tile reconstruction (merge coarsest LODs into root.glb)
+    // Phase 4: Quadtree HLOD construction (if enabled)
+    //           Builds spatial grid → quadtree → merged GLB per level
     // ============================================================
-    std::string root_glb_buf;
-    TileBox root_bbox_from_glb;
-    bool has_root_content = false;
+    QuadNode quadtree_root;
+    bool has_hlod = false;
 
     if (opts.enable_top_reconstruct) {
+        // Collect data for spatial grid from all_trees
+        std::vector<std::string> tile_stems;
         std::vector<std::string> coarsest_paths;
-        for (const auto& tr : tile_results) {
-            if (!tr.coarsest_path.empty())
-                coarsest_paths.push_back(tr.coarsest_path);
-            else
-                LOG_W("TileResult missing coarsest_path (empty)");
+        std::vector<TileBox> tile_bboxes;
+        std::vector<double> coarsest_ges;
+
+        for (auto& tr : all_trees) {
+            if (tr.root.bbox.max.empty() || tr.root.bbox.min.empty()) continue;
+            tile_stems.push_back(tr.stem);
+
+            double coarsest_ge = 0.0;
+            std::string coarsest = find_coarsest_node(tr.root, &coarsest_ge);
+            coarsest_paths.push_back(coarsest);
+            coarsest_ges.push_back(coarsest_ge);
+
+            TileBox bbox;
+            bbox.max = tr.root.bbox.max;
+            bbox.min = tr.root.bbox.min;
+            tile_bboxes.push_back(bbox);
         }
 
-        if (!coarsest_paths.empty()) {
-            LOG_I("Building root GLB from %zu coarsest tiles...", coarsest_paths.size());
-            for (size_t ci = 0; ci < coarsest_paths.size(); ci++) {
-                LOG_I("  [%zu] %s", ci, coarsest_paths[ci].c_str());
-            }
+        if (!tile_stems.empty()) {
+            // Step 4.1: Build spatial grid
+            SpatialGrid grid = build_spatial_grid(tile_stems, coarsest_paths, tile_bboxes, coarsest_ges);
 
-            has_root_content = build_merged_root_glb(
-                coarsest_paths, root_glb_buf, root_bbox_from_glb,
-                opts.enable_texture_compress, opts.enable_meshopt,
-                opts.enable_draco, opts.enable_unlit,
-                opts.top_texture_max_size,
-                opts.simplify_ratio,
-                opts.draco_pos_bits, opts.draco_normal_bits, opts.draco_uv_bits);
+            // Step 4.2: Build quadtree bottom-up
+            quadtree_root = build_quadtree(grid);
+            has_hlod = quadtree_root.has_content || !quadtree_root.children.empty();
 
-            if (has_root_content) {
-                fs::path root_glb_path = out_dir / "Data" / "root.glb";
-                if (write_file(root_glb_path.string().c_str(),
-                               root_glb_buf.data(), (unsigned long)root_glb_buf.size())) {
-                    LOG_I("Root GLB written to: %s (%zu bytes)",
-                          root_glb_path.string().c_str(), root_glb_buf.size());
-                } else {
-                    LOG_E("Failed to write root GLB to: %s", root_glb_path.string().c_str());
-                    has_root_content = false;
-                }
+            if (has_hlod) {
+                // Create HLOD output directory
+                fs::path hlod_dir = out_dir / "Data" / "HLOD";
+                std::error_code ec;
+                fs::create_directories(hlod_dir, ec);
+
+                // Step 4.3: Bottom-up merge at each quadtree level.
+                // Use a recursive lambda to process children first.
+                std::function<void(QuadNode&)> merge_node;
+                int root_level = quadtree_root.level;
+                merge_node = [&](QuadNode& node) {
+                    // Process children first (bottom-up)
+                    for (auto& child : node.children) {
+                        merge_node(child);
+                    }
+
+                    // Collect all leaf OSGB paths under this node
+                    std::vector<std::string> leaf_paths;
+                    collect_leaf_paths(node, grid, leaf_paths);
+
+                    if (leaf_paths.empty()) {
+                        LOG_W("HLOD merge: level %d node at (%d,%d) has no leaf paths, skipping",
+                              node.level, node.grid_x, node.grid_y);
+                        node.has_content = false;
+                        return;
+                    }
+
+                    // Determine output file name
+                    std::string glb_name;
+                    if (node.level == root_level) {
+                        glb_name = "root.glb";
+                    } else {
+                        char buf[128];
+                        int display_level = root_level - 1 - node.level;
+                        snprintf(buf, sizeof(buf), "L%d_X%+04d_Y%+04d.glb",
+                                 display_level, node.grid_x, node.grid_y);
+                        glb_name = buf;
+                    }
+
+                    // Pass node.level + 1 to preserve calc_level_ratio semantics:
+                    // level 0 (first merge) → ratio = 0.25, level 1 → 0.0625, etc.
+                    LOG_I("HLOD merge: %s (level=%d, %zu leaf paths, grid=(%d,%d) size=%d)",
+                          glb_name.c_str(), node.level, leaf_paths.size(),
+                          node.grid_x, node.grid_y, node.grid_size);
+
+                    std::string glb_buf;
+                    TileBox merged_bbox;
+                    bool ok = build_merged_glb(
+                        leaf_paths, node.level + 1, glb_buf, merged_bbox,
+                        opts.enable_texture_compress, opts.enable_meshopt,
+                        opts.enable_draco, opts.enable_unlit,
+                        opts.top_texture_max_size, opts.simplify_ratio,
+                        opts.draco_pos_bits, opts.draco_normal_bits, opts.draco_uv_bits,
+                        opts.ktx2_quality);
+
+                    if (ok && !glb_buf.empty()) {
+                        fs::path glb_path = hlod_dir / glb_name;
+                        if (write_file(glb_path.string().c_str(),
+                                       glb_buf.data(), (unsigned long)glb_buf.size())) {
+                            node.bbox = merged_bbox;
+                            node.glb_uri = "./Data/HLOD/" + glb_name;
+                            node.has_content = true;
+                            LOG_I("  written: %s (%zu bytes)", glb_path.string().c_str(), glb_buf.size());
+                        } else {
+                            LOG_E("  failed to write: %s", glb_path.string().c_str());
+                            node.has_content = false;
+                        }
+                    } else {
+                        LOG_W("  merge failed for level %d node at (%d,%d)",
+                              node.level, node.grid_x, node.grid_y);
+                        node.has_content = false;
+                    }
+                };
+
+                merge_node(quadtree_root);
+
+                LOG_I("Phase 4 complete: HLOD quadtree built (%d levels)", root_level);
             } else {
-                LOG_W("Root GLB build failed, falling back to virtual root");
+                LOG_W("Quadtree build returned empty root, falling back to flat tileset");
             }
         } else {
-            LOG_W("No coarsest paths found, skipping root reconstruction");
+            LOG_W("No tile stems collected, skipping HLOD build");
         }
     }
 
     // ============================================================
-    // 5. Build single tileset.json (flat structure, no sub-tileset.json)
+    // 5. Build tileset.json
     // ============================================================
+    // Compute root bounding box (from tile_results for flat mode, from quadtree for HLOD)
     std::vector<double> root_box = {-1e38, -1e38, -1e38, 1e38, 1e38, 1e38};
     double root_ge = 0.0;
 
-    for (auto& tr : tile_results) {
+    if (has_hlod) {
+        // Use quadtree root bbox
         for (int i = 0; i < 3; i++) {
-            if (tr.box_v[i] > root_box[i]) root_box[i] = tr.box_v[i];
+            root_box[i] = quadtree_root.bbox.max[i];
+            root_box[i+3] = quadtree_root.bbox.min[i];
         }
-        for (int i = 3; i < 6; i++) {
-            if (tr.box_v[i] < root_box[i]) root_box[i] = tr.box_v[i];
+        root_ge = quadtree_root.geometricError;
+    } else {
+        for (auto& tr : tile_results) {
+            for (int i = 0; i < 3; i++) {
+                if (tr.box_v[i] > root_box[i]) root_box[i] = tr.box_v[i];
+            }
+            for (int i = 3; i < 6; i++) {
+                if (tr.box_v[i] < root_box[i]) root_box[i] = tr.box_v[i];
+            }
+            if (tr.tree_json.contains("geometricError"))
+                root_ge = std::max(root_ge, tr.tree_json["geometricError"].get<double>());
         }
-        if (tr.tree_json.contains("geometricError"))
-            root_ge = std::max(root_ge, tr.tree_json["geometricError"].get<double>());
     }
 
     // Compute transform matrix
@@ -773,7 +864,7 @@ int convert_osgb(const ConvertOptions& opts) {
             center_x, center_y, trans_height, trans_vec[12], trans_vec[13], trans_vec[14]);
 
     // ============================================================
-    // Build single tileset.json (3D Tiles 1.1) — all tile trees embedded directly
+    // Build tileset.json
     // ============================================================
     json root_tileset;
     root_tileset["asset"]["version"] = "1.1";
@@ -781,42 +872,35 @@ int convert_osgb(const ConvertOptions& opts) {
     root_tileset["extensionsUsed"] = json::array({"3DTILES_content_gltf"});
     root_tileset["extensionsRequired"] = json::array({"3DTILES_content_gltf"});
 
-    json root_tile;
-    root_tile["transform"] = trans_vec;
-    root_tile["boundingVolume"]["box"] = box_to_tileset_box(root_box);
-    root_tile["refine"] = "REPLACE";
+    if (has_hlod) {
+        // HLOD mode: root tile is the quadtree root
+        json quadtree_json = encode_quadtree_json(quadtree_root, tile_jsons_map);
 
-    if (has_root_content) {
-        // Root has actual geometry from merged coarsest LODs
-        json root_content;
-        root_content["uri"] = "./Data/root.glb";
-        root_content["extensions"]["3DTILES_content_gltf"] = json::object();
+        // Add ECEF transform to root
+        quadtree_json["transform"] = trans_vec;
+        quadtree_json["boundingVolume"]["box"] = box_to_tileset_box(root_box);
 
-        // boundingVolume for the root content (slightly padded)
-        TileBox rb = root_bbox_from_glb;
-        rb.extend(0.2);
-        root_content["boundingVolume"]["box"] = convert_bbox(rb);
+        // Root GE computed from quadtree hierarchy (no cap)
+        quadtree_json["geometricError"] = root_ge;
+        root_tileset["geometricError"] = root_ge;
 
-        root_tile["content"] = root_content;
-
-        // geometricError: use diagonal of merged bbox so root is visible from far away
-        double root_ge_diag = get_geometric_error(root_bbox_from_glb);
-        root_tile["geometricError"] = std::min(root_ge_diag, 5000.0);
-        root_tileset["geometricError"] = std::min(root_ge_diag, 5000.0);
+        root_tileset["root"] = quadtree_json;
     } else {
-        // Virtual root (no geometry) — original behavior
+        // Flat mode (no HLOD): original behavior
+        json root_tile;
+        root_tile["transform"] = trans_vec;
+        root_tile["boundingVolume"]["box"] = box_to_tileset_box(root_box);
+        root_tile["refine"] = "REPLACE";
         root_tile["geometricError"] = std::min(root_ge, 2000.0);
         root_tileset["geometricError"] = std::min(root_ge, 2000.0);
+        root_tile["children"] = json::array();
+
+        for (auto& tr : tile_results) {
+            root_tile["children"].push_back(tr.tree_json);
+        }
+
+        root_tileset["root"] = root_tile;
     }
-
-    root_tile["children"] = json::array();
-
-    // Embed each top-level tile tree directly (instead of referencing sub-tileset.json)
-    for (auto& tr : tile_results) {
-        root_tile["children"].push_back(tr.tree_json);
-    }
-
-    root_tileset["root"] = root_tile;
 
     fs::path root_json_path = out_dir / "tileset.json";
     std::ofstream root_ofs(root_json_path);

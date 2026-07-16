@@ -18,6 +18,8 @@
 #include <cstdint>
 #include <limits>
 #include <cstdlib>
+#include <cmath>
+#include <climits>
 
 #define TINYGLTF_IMPLEMENTATION
 #include <tiny_gltf.h>
@@ -278,8 +280,10 @@ osg_tree get_all_tree(std::string& file_name) {
         root_tile.file_name = file_name;
         root_tile.type = 1;
         root->accept(infoVisitor);
-        root_tile.cached_node = root;  // Save for Phase 2 to avoid re-reading
     }
+    // NOTE: cached_node is NOT set here. Phase 1 only builds the file tree
+    // structure (sub_node_names).  Phase 2 loads each tile from disk on demand
+    // and frees it after conversion, keeping memory bounded.
 
     for (auto& i : infoVisitor.sub_node_names) {
         osg_tree tree = get_all_tree(i);
@@ -1040,7 +1044,8 @@ bool osgb2glb_buf_from_node(osg::Node* root, std::string parent_path,
                                     int node_type, bool enable_texture_compress,
                                     bool enable_meshopt, bool enable_draco, bool enable_unlit,
                                     double simplify_ratio,
-                                    int draco_pos_bits, int draco_normal_bits, int draco_uv_bits) {
+                                    int draco_pos_bits, int draco_normal_bits, int draco_uv_bits,
+                                    int ktx2_quality) {
     static std::atomic<int64_t> total_info_us{0};
     static std::atomic<int64_t> total_geom_us{0};
     static std::atomic<int64_t> total_tex_us{0};
@@ -1112,7 +1117,7 @@ bool osgb2glb_buf_from_node(osg::Node* root, std::string parent_path,
         std::vector<unsigned char> imgData;
         std::string mimeType;
 
-        if (::process_texture(tex, imgData, mimeType, enable_texture_compress)) {
+        if (::process_texture(tex, imgData, mimeType, enable_texture_compress, ktx2_quality)) {
             buffer.data.insert(buffer.data.end(), imgData.begin(), imgData.end());
 
             tinygltf::Image imgObj;
@@ -1237,7 +1242,8 @@ bool osgb2glb_buf(std::string path, std::string& glb_buff, MeshInfo& mesh_info,
                   int node_type, bool enable_texture_compress,
                   bool enable_meshopt, bool enable_draco, bool enable_unlit,
                   double simplify_ratio,
-                  int draco_pos_bits, int draco_normal_bits, int draco_uv_bits) {
+                  int draco_pos_bits, int draco_normal_bits, int draco_uv_bits,
+                  int ktx2_quality) {
     vector<string> fileNames = { path };
     std::string parent_path = get_parent(path);
 
@@ -1252,7 +1258,8 @@ bool osgb2glb_buf(std::string path, std::string& glb_buff, MeshInfo& mesh_info,
                                    enable_texture_compress, enable_meshopt,
                                    enable_draco, enable_unlit,
                                    simplify_ratio,
-                                   draco_pos_bits, draco_normal_bits, draco_uv_bits);
+                                   draco_pos_bits, draco_normal_bits, draco_uv_bits,
+                                   ktx2_quality);
 }
 
 // ============================================================
@@ -1262,14 +1269,16 @@ bool osgb2b3dm_buf(std::string path, std::string& b3dm_buf, TileBox& tile_box,
                    int node_type, bool enable_texture_compress,
                    bool enable_meshopt, bool enable_draco, bool enable_unlit,
                    double simplify_ratio,
-                   int draco_pos_bits, int draco_normal_bits, int draco_uv_bits) {
+                   int draco_pos_bits, int draco_normal_bits, int draco_uv_bits,
+                   int ktx2_quality) {
     using nlohmann::json;
 
     std::string glb_buf;
     MeshInfo minfo;
     if (!osgb2glb_buf(path, glb_buf, minfo, node_type,
                       enable_texture_compress, enable_meshopt, enable_draco, enable_unlit,
-                      simplify_ratio, draco_pos_bits, draco_normal_bits, draco_uv_bits))
+                      simplify_ratio, draco_pos_bits, draco_normal_bits, draco_uv_bits,
+                      ktx2_quality))
         return false;
 
     tile_box.max = minfo.max;
@@ -1325,7 +1334,8 @@ void do_tile_job(osg_tree& tree, std::string out_path, int max_lvl,
                  bool enable_texture_compress, bool enable_meshopt,
                  bool enable_draco, bool enable_unlit,
                  double simplify_ratio,
-                 int draco_pos_bits, int draco_normal_bits, int draco_uv_bits) {
+                 int draco_pos_bits, int draco_normal_bits, int draco_uv_bits,
+                 int ktx2_quality) {
     if (tree.file_name.empty()) return;
     int lvl = get_lvl_num(tree.file_name);
     if (lvl > max_lvl) return;
@@ -1334,7 +1344,8 @@ void do_tile_job(osg_tree& tree, std::string out_path, int max_lvl,
         std::string b3dm_buf;
         osgb2b3dm_buf(tree.file_name, b3dm_buf, tree.bbox, tree.type,
                       enable_texture_compress, enable_meshopt, enable_draco, enable_unlit,
-                      simplify_ratio, draco_pos_bits, draco_normal_bits, draco_uv_bits);
+                      simplify_ratio, draco_pos_bits, draco_normal_bits, draco_uv_bits,
+                      ktx2_quality);
 
         std::string out_file = out_path + "/" +
             replace(get_file_name(tree.file_name), ".osgb", tree.type != 2 ? ".b3dm" : "o.b3dm");
@@ -1347,7 +1358,8 @@ void do_tile_job(osg_tree& tree, std::string out_path, int max_lvl,
     for (auto& i : tree.sub_nodes) {
         do_tile_job(i, out_path, max_lvl,
                     enable_texture_compress, enable_meshopt, enable_draco, enable_unlit,
-                    simplify_ratio, draco_pos_bits, draco_normal_bits, draco_uv_bits);
+                    simplify_ratio, draco_pos_bits, draco_normal_bits, draco_uv_bits,
+                    ktx2_quality);
     }
 }
 
@@ -1409,7 +1421,8 @@ void do_tile_job_1_1(osg_tree& tree, std::string out_path, int max_lvl,
                      bool enable_texture_compress, bool enable_meshopt,
                      bool enable_draco, bool enable_unlit,
                      double simplify_ratio,
-                     int draco_pos_bits, int draco_normal_bits, int draco_uv_bits) {
+                     int draco_pos_bits, int draco_normal_bits, int draco_uv_bits,
+                     int ktx2_quality) {
     if (tree.file_name.empty()) return;
     int lvl = get_lvl_num(tree.file_name);
     if (lvl > max_lvl) return;
@@ -1420,7 +1433,8 @@ void do_tile_job_1_1(osg_tree& tree, std::string out_path, int max_lvl,
         MeshInfo minfo;
         if (osgb2glb_buf(tree.file_name, glb_buf, minfo, tree.type,
                          enable_texture_compress, enable_meshopt, enable_draco, enable_unlit,
-                         simplify_ratio, draco_pos_bits, draco_normal_bits, draco_uv_bits)) {
+                         simplify_ratio, draco_pos_bits, draco_normal_bits, draco_uv_bits,
+                         ktx2_quality)) {
             tree.bbox.max = minfo.max;
             tree.bbox.min = minfo.min;
 
@@ -1436,7 +1450,8 @@ void do_tile_job_1_1(osg_tree& tree, std::string out_path, int max_lvl,
     for (auto& i : tree.sub_nodes) {
         do_tile_job_1_1(i, out_path, max_lvl,
                         enable_texture_compress, enable_meshopt, enable_draco, enable_unlit,
-                        simplify_ratio, draco_pos_bits, draco_normal_bits, draco_uv_bits);
+                        simplify_ratio, draco_pos_bits, draco_normal_bits, draco_uv_bits,
+                        ktx2_quality);
     }
 }
 
@@ -1453,7 +1468,8 @@ bool convert_one_tile(const FlatTile& tile, const osgb_converter::ConvertOptions
                           opts.enable_texture_compress, opts.enable_meshopt,
                           opts.enable_draco, opts.enable_unlit,
                           opts.simplify_ratio,
-                          opts.draco_pos_bits, opts.draco_normal_bits, opts.draco_uv_bits);
+                          opts.draco_pos_bits, opts.draco_normal_bits, opts.draco_uv_bits,
+                          opts.ktx2_quality);
 
     if (!ok) return false;
 
@@ -1494,14 +1510,16 @@ bool compute_tile_output(const FlatTile& tile,
             opts.enable_texture_compress, opts.enable_meshopt,
             opts.enable_draco, opts.enable_unlit,
             opts.simplify_ratio,
-            opts.draco_pos_bits, opts.draco_normal_bits, opts.draco_uv_bits);
+            opts.draco_pos_bits, opts.draco_normal_bits, opts.draco_uv_bits,
+            opts.ktx2_quality);
         used_cache = true;
     } else {
         ok = osgb2glb_buf(tile.file_name, glb_buf, minfo, tile.type,
                          opts.enable_texture_compress, opts.enable_meshopt,
                          opts.enable_draco, opts.enable_unlit,
                          opts.simplify_ratio,
-                         opts.draco_pos_bits, opts.draco_normal_bits, opts.draco_uv_bits);
+                         opts.draco_pos_bits, opts.draco_normal_bits, opts.draco_uv_bits,
+                         opts.ktx2_quality);
     }
 
     size_t h = cache_hits.fetch_add(used_cache ? 1 : 0) + (used_cache ? 1 : 0);
@@ -1608,30 +1626,15 @@ std::string encode_tile_json_1_1(osg_tree& tree, double x, double y) {
 // Root tile reconstruction helpers
 // ============================================================
 
-// Recursively find the coarsest (highest _Lxx) node in a tile tree.
-// Higher L numbers = coarser LOD. Files without _Lxx return level -1 (finest).
-// Falls back to the tree's own file if no coarser child is found.
-std::string find_coarsest_node(const osg_tree& tree) {
-    int current_lvl = get_lvl_num(tree.file_name);
-
-    if (tree.sub_nodes.empty()) {
-        return tree.file_name;  // leaf node
-    }
-
-    std::string best_path = tree.file_name;
-    int best_lvl = current_lvl;
-
-    for (const auto& child : tree.sub_nodes) {
-        std::string candidate = find_coarsest_node(child);
-        if (candidate.empty()) continue;
-        int child_lvl = get_lvl_num(candidate);
-        if (child_lvl > best_lvl) {
-            best_lvl = child_lvl;
-            best_path = candidate;
-        }
-    }
-
-    return best_path;
+// Returns the coarsest-LOD file for a tile tree: the tree root
+// (file without _Lxx suffix, e.g. Tile_-051_+050.osgb).
+// Optionally outputs its geometricError (already computed by calc_geometric_error).
+std::string find_coarsest_node(const osg_tree& tree, double* out_ge) {
+    // The root node (tree.file_name, no L suffix, get_lvl_num → -1) is the
+    // coarsest LOD. calc_geometric_error() has already computed its GE.
+    // No need to recurse — the tree root IS the coarsest node.
+    if (out_ge) *out_ge = tree.geometricError;
+    return tree.file_name;
 }
 
 // Merge multiple coarsest-LOD OSGB files into a single root GLB.
@@ -1647,7 +1650,8 @@ bool build_merged_root_glb(
     bool enable_unlit,
     int top_texture_max_size,
     double simplify_ratio,
-    int draco_pos_bits, int draco_normal_bits, int draco_uv_bits)
+    int draco_pos_bits, int draco_normal_bits, int draco_uv_bits,
+    int ktx2_quality)
 {
     if (coarsest_paths.empty()) return false;
 
@@ -1842,7 +1846,7 @@ bool build_merged_root_glb(
         std::vector<unsigned char> imgData;
         std::string mimeType;
 
-        if (::process_texture(tex, imgData, mimeType, enable_texture_compress)) {
+        if (::process_texture(tex, imgData, mimeType, enable_texture_compress, ktx2_quality)) {
             buffer.data.insert(buffer.data.end(), imgData.begin(), imgData.end());
 
             tinygltf::Image imgObj;
@@ -1952,4 +1956,612 @@ bool build_merged_root_glb(
           global_min.z(), global_max.z());
 
     return true;
+}
+
+// ============================================================
+// Quadtree HLOD implementation
+// ============================================================
+
+bool parse_tile_grid_coords(const std::string& stem, int& out_x, int& out_y) {
+    // Expected format: "Tile_-XXX_+YYY" or "Tile_+XXX_-YYY"
+    // Find the two underscore-separated number parts after "Tile_"
+    if (stem.size() < 7 || stem.substr(0, 5) != "Tile_") return false;
+
+    std::string rest = stem.substr(5); // e.g. "-001_+050"
+    auto us_pos = rest.find('_');
+    if (us_pos == std::string::npos) return false;
+
+    std::string xs = rest.substr(0, us_pos);  // e.g. "-001"
+    std::string ys = rest.substr(us_pos + 1); // e.g. "+050"
+
+    try {
+        out_x = std::stoi(xs);
+        out_y = std::stoi(ys);
+    } catch (...) {
+        return false;
+    }
+    return true;
+}
+
+SpatialGrid build_spatial_grid(
+    const std::vector<std::string>& tile_stems,
+    const std::vector<std::string>& coarsest_paths,
+    const std::vector<TileBox>& bboxes,
+    const std::vector<double>& coarsest_ges)
+{
+    SpatialGrid grid;
+    size_t n = std::min({tile_stems.size(), coarsest_paths.size(), bboxes.size(), coarsest_ges.size()});
+
+    for (size_t i = 0; i < n; i++) {
+        GridCell cell;
+        cell.stem = tile_stems[i];
+        if (!parse_tile_grid_coords(cell.stem, cell.grid_x, cell.grid_y)) {
+            LOG_W("build_spatial_grid: failed to parse coords from '%s', skipping",
+                  cell.stem.c_str());
+            continue;
+        }
+        cell.coarsest_path = coarsest_paths[i];
+        cell.bbox = bboxes[i];
+        cell.geometricError = coarsest_ges[i];  // Inherit from coarsest PagedLOD tile
+
+        // GLB URI for the coarsest tile: "./Tile_-001_+050.glb"
+        // This is the relative path within the tile's output directory
+        std::string glb_name = replace(get_file_name(cell.coarsest_path), ".osgb", ".glb");
+        cell.glb_uri = "./" + glb_name;
+
+        grid[cell.grid_x][cell.grid_y] = std::move(cell);
+    }
+
+    LOG_I("build_spatial_grid: %zu tiles placed in grid", n);
+    return grid;
+}
+
+double calc_level_ratio(int level, double base_ratio) {
+    // Each level covers 4x the area → keep 1/4 the detail
+    double r = base_ratio * std::pow(0.25, level);
+    return std::max(0.01, r);
+}
+
+// ============================================================
+// General merge: multiple OSGB files → one GLB with level-based simplification
+// ============================================================
+bool build_merged_glb(
+    const std::vector<std::string>& osgb_paths,
+    int quadtree_level,
+    std::string& out_glb_buf,
+    TileBox& out_bbox,
+    bool enable_texture_compress,
+    bool enable_meshopt,
+    bool enable_draco,
+    bool enable_unlit,
+    int top_texture_max_size,
+    double simplify_ratio,
+    int draco_pos_bits, int draco_normal_bits, int draco_uv_bits,
+    int ktx2_quality)
+{
+    if (osgb_paths.empty()) return false;
+
+    // Compute level-specific simplify ratio
+    double level_ratio = calc_level_ratio(quadtree_level, simplify_ratio);
+    LOG_I("build_merged_glb: level=%d, ratio=%.4f (%zu tiles)",
+          quadtree_level, level_ratio, osgb_paths.size());
+
+    tinygltf::TinyGLTF gltf;
+    tinygltf::Model model;
+    tinygltf::Buffer buffer;
+
+    std::vector<osg::Geometry*> all_geometry;
+    std::vector<osg::Texture*> all_textures;
+    std::map<size_t, size_t> tex_hash_to_idx;
+    std::map<osg::Geometry*, osg::Texture*> geom_to_tex;
+
+    osg::Vec3f global_min(1e38f, 1e38f, 1e38f);
+    osg::Vec3f global_max(-1e38f, -1e38f, -1e38f);
+
+    // Texture dedup helper
+    auto hash_texture_image = [](osg::Texture* tex) -> size_t {
+        if (!tex || tex->getNumImages() == 0) return 0;
+        osg::Image* img = tex->getImage(0);
+        if (!img || !img->data()) return 0;
+        size_t h = std::hash<int>{}(img->s());
+        h ^= std::hash<int>{}(img->t()) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<int>{}((int)img->getPixelFormat()) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        int total = img->getImageSizeInBytes();
+        int step = std::max(1, total / 4096);
+        const unsigned char* data = img->data();
+        for (int j = 0; j < total; j += step)
+            h ^= std::hash<unsigned char>{}(data[j]) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        return h;
+    };
+
+    std::vector<osg::ref_ptr<osg::Node>> loaded_nodes;
+
+    // Phase 1: Load all OSGB files and collect geometry/textures
+    for (const auto& fpath : osgb_paths) {
+        std::string parent_path = get_parent(fpath);
+        std::vector<std::string> fileNames = { fpath };
+
+        osg::ref_ptr<osg::Node> root = osgDB::readNodeFiles(fileNames);
+        if (!root.valid()) {
+            LOG_W("build_merged_glb: failed to load %s, skipping", fpath.c_str());
+            continue;
+        }
+
+        InfoVisitor infoVisitor(parent_path, false);
+        root->accept(infoVisitor);
+
+        auto& geoms = infoVisitor.geometry_array;
+        auto& textures = infoVisitor.texture_array;
+        if (geoms.empty() && !infoVisitor.other_geometry_array.empty()) {
+            geoms = infoVisitor.other_geometry_array;
+            textures = infoVisitor.other_texture_array;
+        }
+
+        if (geoms.empty()) {
+            LOG_W("build_merged_glb: no geometry in %s, skipping", fpath.c_str());
+            continue;
+        }
+
+        for (auto* g : geoms) {
+            all_geometry.push_back(g);
+            auto it = infoVisitor.texture_map.find(g);
+            if (it != infoVisitor.texture_map.end()) {
+                osg::Texture* raw_tex = it->second;
+                size_t h = hash_texture_image(raw_tex);
+                auto dedup_it = tex_hash_to_idx.find(h);
+                if (dedup_it != tex_hash_to_idx.end()) {
+                    geom_to_tex[g] = all_textures[dedup_it->second];
+                } else {
+                    tex_hash_to_idx[h] = all_textures.size();
+                    all_textures.push_back(raw_tex);
+                    geom_to_tex[g] = raw_tex;
+                }
+            }
+        }
+
+        loaded_nodes.push_back(root);
+    }
+
+    if (all_geometry.empty()) {
+        LOG_E("build_merged_glb: no geometry from any source file");
+        return false;
+    }
+
+    LOG_I("build_merged_glb: merging %zu geometries, %zu textures (level=%d, ratio=%.4f)",
+          all_geometry.size(), all_textures.size(), quadtree_level, level_ratio);
+
+    // Phase 2: Build glTF model
+    OsgBuildState osgState = { &buffer, &model,
+        osg::Vec3f(-1e38f,-1e38f,-1e38f), osg::Vec3f(1e38f,1e38f,1e38f), -1, -1 };
+
+    model.meshes.resize(1);
+
+    std::map<osg::Texture*, int> tex_to_mat;
+    {
+        int idx = 0;
+        for (auto* t : all_textures) tex_to_mat[t] = idx++;
+    }
+
+    int primIdx = 0;
+    for (auto* g : all_geometry) {
+        if (!g->getVertexArray() || g->getVertexArray()->getDataSize() == 0)
+            continue;
+
+        write_osgGeometry(g, &osgState, enable_meshopt, enable_draco,
+                          level_ratio, draco_pos_bits, draco_normal_bits, draco_uv_bits);
+
+        auto* tex = geom_to_tex[g];
+        int matIdx = tex ? tex_to_mat[tex] : 0;
+        for (unsigned k = 0; k < g->getNumPrimitiveSets(); k++) {
+            if (primIdx < (int)model.meshes[0].primitives.size()) {
+                model.meshes[0].primitives[primIdx].material = matIdx;
+            }
+            primIdx++;
+        }
+
+        global_min.x() = std::min(global_min.x(), osgState.point_min.x());
+        global_min.y() = std::min(global_min.y(), osgState.point_min.y());
+        global_min.z() = std::min(global_min.z(), osgState.point_min.z());
+        global_max.x() = std::max(global_max.x(), osgState.point_max.x());
+        global_max.y() = std::max(global_max.y(), osgState.point_max.y());
+        global_max.z() = std::max(global_max.z(), osgState.point_max.z());
+    }
+
+    if (model.meshes[0].primitives.empty()) {
+        LOG_E("build_merged_glb: no primitives generated");
+        return false;
+    }
+
+    for (auto& prim : model.meshes[0].primitives) {
+        if (prim.material < 0) prim.material = 0;
+    }
+
+    // Phase 3: Process textures (with optional downsampling)
+    for (auto* tex : all_textures) {
+        if (top_texture_max_size > 0 && tex && tex->getNumImages() > 0) {
+            osg::Image* img = tex->getImage(0);
+            if (img && img->data()) {
+                int w = img->s(), h = img->t();
+                int max_dim = std::max(w, h);
+                if (max_dim > top_texture_max_size) {
+                    double scale = (double)top_texture_max_size / max_dim;
+                    int new_w = std::max(1, (int)(w * scale));
+                    int new_h = std::max(1, (int)(h * scale));
+                    int channels = img->getPixelFormat() == GL_RGB ? 3 : 4;
+                    std::vector<unsigned char> resized(new_w * new_h * channels);
+
+                    unsigned char* result = stbir_resize_uint8_linear(
+                        img->data(), w, h, img->getRowStepInBytes(),
+                        resized.data(), new_w, new_h, new_w * channels,
+                        (stbir_pixel_layout)channels);
+
+                    if (result) {
+                        unsigned char* stolen = (unsigned char*)malloc(resized.size());
+                        memcpy(stolen, resized.data(), resized.size());
+                        img->setImage(new_w, new_h, 1,
+                            img->getInternalTextureFormat(),
+                            img->getPixelFormat(), img->getDataType(),
+                            stolen, osg::Image::USE_MALLOC_FREE);
+                    }
+                }
+            }
+        }
+
+        unsigned bufStart = (unsigned)buffer.data.size();
+        std::vector<unsigned char> imgData;
+        std::string mimeType;
+
+        if (::process_texture(tex, imgData, mimeType, enable_texture_compress, ktx2_quality)) {
+            buffer.data.insert(buffer.data.end(), imgData.begin(), imgData.end());
+
+            tinygltf::Image imgObj;
+            imgObj.mimeType = mimeType;
+            imgObj.bufferView = (int)model.bufferViews.size();
+            model.images.push_back(imgObj);
+
+            tinygltf::BufferView bfv;
+            bfv.buffer = 0;
+            bfv.byteOffset = (int)bufStart;
+            alignment_buffer(buffer.data);
+            bfv.byteLength = (int)(buffer.data.size() - bufStart);
+            model.bufferViews.push_back(bfv);
+        }
+    }
+
+    // Phase 4: Build glTF scene objects
+    tinygltf::Node node; node.mesh = 0;
+    model.nodes.push_back(node);
+
+    tinygltf::Scene scene; scene.nodes.push_back(0);
+    model.scenes = { scene };
+    model.defaultScene = 0;
+
+    tinygltf::Sampler samp;
+    samp.magFilter = TINYGLTF_TEXTURE_FILTER_LINEAR;
+    samp.minFilter = TINYGLTF_TEXTURE_FILTER_NEAREST_MIPMAP_LINEAR;
+    samp.wrapS = TINYGLTF_TEXTURE_WRAP_REPEAT;
+    samp.wrapT = TINYGLTF_TEXTURE_WRAP_REPEAT;
+    model.samplers = { samp };
+
+    if (enable_unlit) {
+        model.extensionsRequired.push_back("KHR_materials_unlit");
+        model.extensionsUsed.push_back("KHR_materials_unlit");
+    }
+    if (enable_texture_compress) {
+        model.extensionsRequired.push_back("KHR_texture_basisu");
+        model.extensionsUsed.push_back("KHR_texture_basisu");
+    }
+    bool has_draco = enable_draco;
+    if (has_draco) {
+        model.extensionsRequired.push_back("KHR_draco_mesh_compression");
+        model.extensionsUsed.push_back("KHR_draco_mesh_compression");
+    }
+    if (enable_meshopt && !has_draco) {
+        model.extensionsRequired.push_back("EXT_meshopt_compression");
+        model.extensionsUsed.push_back("EXT_meshopt_compression");
+    }
+
+    // Materials
+    bool has_images = !model.images.empty();
+    if (all_textures.empty() || !has_images) {
+        auto mat = make_default_material(0.75, 0.75, 0.75);
+        if (enable_unlit)
+            mat.extensions["KHR_materials_unlit"] = tinygltf::Value(tinygltf::Value::Object());
+        model.materials.push_back(mat);
+    } else {
+        for (size_t i = 0; i < all_textures.size(); i++) {
+            auto mat = make_default_material(0.75, 0.75, 0.75);
+            if (enable_unlit)
+                mat.extensions["KHR_materials_unlit"] = tinygltf::Value(tinygltf::Value::Object());
+            if (has_images && i < model.images.size())
+                mat.pbrMetallicRoughness.baseColorTexture.index = (int)i;
+            model.materials.push_back(mat);
+        }
+    }
+
+    // Textures
+    if (!model.images.empty()) {
+        for (size_t i = 0; i < model.images.size(); i++) {
+            tinygltf::Texture tex;
+            tex.sampler = 0;
+            if (enable_texture_compress) {
+                tinygltf::Value::Object basisu;
+                basisu["source"] = tinygltf::Value((int)i);
+                tex.extensions["KHR_texture_basisu"] = tinygltf::Value(basisu);
+            } else {
+                tex.source = (int)i;
+            }
+            model.textures.push_back(tex);
+        }
+    }
+
+    model.asset.version = "2.0";
+    model.asset.generator = "osgb2b3dm-cpp-hlod-merge";
+
+    model.buffers.push_back(buffer);
+
+    // Phase 5: Serialize to GLB
+    std::ostringstream ss;
+    if (!gltf.WriteGltfSceneToStream(&model, ss, false, true)) {
+        LOG_E("build_merged_glb: WriteGltfSceneToStream failed");
+        return false;
+    }
+
+    out_glb_buf = ss.str();
+
+    out_bbox.min = { (double)global_min.x(), (double)global_min.y(), (double)global_min.z() };
+    out_bbox.max = { (double)global_max.x(), (double)global_max.y(), (double)global_max.z() };
+
+    LOG_I("build_merged_glb: success, GLB size=%zu bytes, level=%d",
+          out_glb_buf.size(), quadtree_level);
+
+    return true;
+}
+
+// ============================================================
+// Collect all leaf OSGB paths under a quadtree node
+// ============================================================
+void collect_leaf_paths(const QuadNode& node, const SpatialGrid& grid,
+                               std::vector<std::string>& paths) {
+    if (node.level == 0) {
+        // Level 0 node: leaf_coarsest_paths are the coarsest OSGB paths
+        // of the grid cells directly under this node.
+        paths.insert(paths.end(),
+                     node.leaf_coarsest_paths.begin(),
+                     node.leaf_coarsest_paths.end());
+    } else {
+        for (const auto& child : node.children) {
+            collect_leaf_paths(child, grid, paths);
+        }
+    }
+}
+
+// ============================================================
+// Recursive quadtree builder
+// ============================================================
+static QuadNode build_quadtree_impl(const SpatialGrid& grid,
+                                     int x, int y, int size, int level) {
+    // size=1 cells are NOT wrapped — instead, size=2 is the new base case
+    // that directly merges 4 grid cells into a level-0 quadtree node.
+    if (size == 1) {
+        return QuadNode{};  // Empty — grid cell content handled by size=2 parent
+    }
+
+    if (size == 2) {
+        // New base case: directly collect 4 grid cells (size=1 each) and build
+        // a level-0 quadtree node with PagedLOD roots as children.
+        QuadNode node;
+        node.grid_x = x;
+        node.grid_y = y;
+        node.grid_size = size;
+        node.level = 0;
+        node.has_content = false;
+
+        std::pair<int,int> cells[4] = {
+            {x,     y    },
+            {x+1,   y    },
+            {x,     y+1  },
+            {x+1,   y+1  }
+        };
+
+        double max_cell_ge = 0.0;
+        for (auto& [cx, cy] : cells) {
+            auto it_x = grid.find(cx);
+            if (it_x == grid.end()) continue;
+            auto it_y = it_x->second.find(cy);
+            if (it_y == it_x->second.end()) continue;
+
+            const auto& cell = it_y->second;
+            TileBox cell_bbox = cell.bbox;  // copy for non-const expend_box
+            expend_box(node.bbox, cell_bbox);
+            max_cell_ge = std::max(max_cell_ge, cell.geometricError);
+            node.leaf_stems.push_back(cell.stem);
+            node.leaf_coarsest_paths.push_back(cell.coarsest_path);
+        }
+
+        if (node.leaf_stems.empty()) {
+            return QuadNode{};  // No cells in this 2×2 area
+        }
+
+        // Single cell in a 2×2 area: don't merge, just store as-is
+        // (multiple cells will be merged, GE doubles)
+        if (node.leaf_stems.size() == 1) {
+            node.geometricError = max_cell_ge;
+        } else {
+            node.geometricError = max_cell_ge * 2.0;
+        }
+
+        node.has_content = true;  // Will be generated by merge phase
+        return node;
+    }
+
+    // size >= 4: recursive case, same as before
+    int half = size / 2;
+
+    QuadNode node;
+    node.grid_x = x;
+    node.grid_y = y;
+    node.grid_size = size;
+    node.level = level;
+    node.has_content = false;
+
+    std::pair<int,int> origins[4] = {
+        {x,       y},
+        {x+half,  y},
+        {x,       y+half},
+        {x+half,  y+half}
+    };
+
+    int child_level = level - 1;
+    for (auto& [cx, cy] : origins) {
+        QuadNode child = build_quadtree_impl(grid, cx, cy, half, child_level);
+        if (child.has_content || !child.children.empty()) {
+            expend_box(node.bbox, child.bbox);
+            node.children.push_back(std::move(child));
+        }
+    }
+
+    if (node.children.empty()) {
+        return QuadNode{};  // No content in this region
+    }
+
+    // Compute geometric error bottom-up.
+    // Internal nodes double the max child GE at each level up.
+    for (auto& child : node.children) {
+        node.geometricError = std::max(node.geometricError, child.geometricError);
+    }
+    node.geometricError *= 2.0;
+
+    node.has_content = true;  // Will be generated by merge phase
+
+    return node;
+}
+
+QuadNode build_quadtree(const SpatialGrid& grid) {
+    if (grid.empty()) {
+        LOG_E("build_quadtree: empty grid");
+        return QuadNode{};
+    }
+
+    // Find grid bounds
+    int min_x = INT_MAX, max_x = INT_MIN;
+    int min_y = INT_MAX, max_y = INT_MIN;
+    int cell_count = 0;
+
+    for (const auto& [x, row] : grid) {
+        min_x = std::min(min_x, x);
+        max_x = std::max(max_x, x);
+        for (const auto& [y, cell] : row) {
+            min_y = std::min(min_y, y);
+            max_y = std::max(max_y, y);
+            cell_count++;
+        }
+    }
+
+    int w = max_x - min_x + 1;
+    int h = max_y - min_y + 1;
+    int max_dim = std::max(w, h);
+
+    // Compute padded power-of-2 size
+    int padded_size = 1;
+    while (padded_size < max_dim) padded_size <<= 1;
+
+    // Align origin to the padded grid
+    int origin_x = min_x;
+    int origin_y = min_y;
+
+    int max_level = (int)std::log2(padded_size) - 1;  // size=2 → level=0
+
+    // Single cell or all cells in one 2×2 block — no HLOD tree needed
+    if (max_level < 0) {
+        LOG_I("build_quadtree: padded_size=%d, no HLOD levels to build", padded_size);
+        return QuadNode{};
+    }
+
+    LOG_I("build_quadtree: grid [%d..%d]x[%d..%d] (%dx%d), padded=%d, max_level=%d, cells=%d",
+          min_x, max_x, min_y, max_y, w, h, padded_size, max_level, cell_count);
+
+    QuadNode root = build_quadtree_impl(grid, origin_x, origin_y, padded_size, max_level);
+
+    if (root.children.empty() && !root.has_content) {
+        LOG_E("build_quadtree: failed to build tree");
+        return root;
+    }
+
+    // Count nodes at each level
+    std::function<void(const QuadNode&, int)> count_nodes = [&](const QuadNode& n, int depth) {
+        if (n.children.empty()) return;
+        for (const auto& c : n.children) count_nodes(c, depth + 1);
+    };
+
+    LOG_I("build_quadtree: root at (%d,%d) size=%d level=%d, children=%zu",
+          root.grid_x, root.grid_y, root.grid_size, root.level, root.children.size());
+
+    return root;
+}
+
+// ============================================================
+// Generate tileset JSON for quadtree hierarchy
+// ============================================================
+nlohmann::json encode_quadtree_json(
+    const QuadNode& node,
+    const std::map<std::string, nlohmann::json>& tile_jsons)
+{
+    // Level 0: first merge level — generate JSON with HLOD content and
+    // PagedLOD root tiles as children (looked up from tile_jsons_map).
+    if (node.level == 0) {
+        nlohmann::json tile;
+        tile["geometricError"] = node.geometricError;
+        tile["refine"] = "REPLACE";
+        tile["boundingVolume"]["box"] = convert_bbox(node.bbox);
+
+        if (node.has_content && !node.glb_uri.empty()) {
+            nlohmann::json content;
+            content["uri"] = node.glb_uri;
+            content["extensions"]["3DTILES_content_gltf"] = nlohmann::json::object();
+            TileBox cb = node.bbox;
+            cb.extend(0.2);
+            content["boundingVolume"]["box"] = convert_bbox(cb);
+            tile["content"] = content;
+        }
+
+        tile["children"] = nlohmann::json::array();
+        for (const auto& stem : node.leaf_stems) {
+            auto it = tile_jsons.find(stem);
+            if (it != tile_jsons.end()) {
+                tile["children"].push_back(it->second);
+            }
+        }
+        return tile;
+    }
+
+    // Internal node: generate JSON with HLOD content and quadtree children
+    nlohmann::json tile;
+    tile["geometricError"] = node.geometricError;
+    tile["refine"] = "REPLACE";
+    tile["boundingVolume"]["box"] = convert_bbox(node.bbox);
+
+    if (node.has_content && !node.glb_uri.empty()) {
+        nlohmann::json content;
+        content["uri"] = node.glb_uri;
+        content["extensions"]["3DTILES_content_gltf"] = nlohmann::json::object();
+        TileBox cb = node.bbox;
+        cb.extend(0.2);
+        content["boundingVolume"]["box"] = convert_bbox(cb);
+        tile["content"] = content;
+    }
+
+    if (!node.children.empty()) {
+        tile["children"] = nlohmann::json::array();
+        for (const auto& child : node.children) {
+            nlohmann::json child_json = encode_quadtree_json(child, tile_jsons);
+            if (!child_json.empty()) {
+                tile["children"].push_back(child_json);
+            }
+        }
+    } else {
+        tile["children"] = nlohmann::json::array();
+    }
+
+    return tile;
 }

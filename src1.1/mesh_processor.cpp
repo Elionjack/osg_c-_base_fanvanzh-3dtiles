@@ -37,7 +37,7 @@ static void write_buf_callback(void* context, void* data, int len) {
 // KTX2 Compression (requires basisu)
 // ============================================================
 bool compress_to_ktx2(const std::vector<unsigned char>& rgba_data, int width, int height,
-                      std::vector<unsigned char>& ktx2_data) {
+                      std::vector<unsigned char>& ktx2_data, int quality) {
     try {
         if (rgba_data.empty() || width <= 0 || height <= 0) return false;
 
@@ -46,7 +46,7 @@ bool compress_to_ktx2(const std::vector<unsigned char>& rgba_data, int width, in
 
         basisu::vector<basisu::image> source_images;
         source_images.push_back(basisu::image(rgba_data.data(), width, height, 4));
-        int quality_level = 128;
+        int quality_level = quality;
         std::size_t file_size = 0;
 
         // NOTE: cFlagThreaded is intentionally NOT set here.
@@ -437,7 +437,8 @@ bool compress_mesh_geometry_meshopt(osg::Geometry* geometry,
 // Texture Processing
 // ============================================================
 bool process_texture(osg::Texture* tex, std::vector<unsigned char>& image_data,
-                     std::string& mime_type, bool enable_texture_compress) {
+                     std::string& mime_type, bool enable_texture_compress,
+                     int ktx2_quality) {
     // KTX2 path (Basis Universal)
     if (enable_texture_compress && tex && tex->getNumImages() > 0) {
         osg::Image* img = tex->getImage(0);
@@ -488,7 +489,7 @@ bool process_texture(osg::Texture* tex, std::vector<unsigned char>& image_data,
             }
             if (!rgba.empty()) {
                 std::vector<unsigned char> ktx2;
-                if (compress_to_ktx2(rgba, w, h, ktx2)) {
+                if (compress_to_ktx2(rgba, w, h, ktx2, ktx2_quality)) {
                     image_data = ktx2;
                     mime_type = "image/ktx2";
                     return true;
