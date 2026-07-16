@@ -25,6 +25,10 @@ struct ConvertOptions {
     std::string geoid_model = "none";
     std::string geoid_path;
 
+    // Tileset JSON splitting (external tilesets)
+    bool enable_split_json = false;    // split monolithic tileset.json into index + sub-tilesets
+    int  split_depth = 1;              // split depth (1 = one sub-tileset per top-level tree)
+
     // Root tile reconstruction (merge coarsest LODs into overview GLB)
     bool enable_top_reconstruct = false;
     int  top_texture_max_size = 512;  // max texture dimension for root GLB (0=no limit)

@@ -53,6 +53,8 @@ struct HardcodedConfig {
     int  ktx2_quality;
     bool enable_parallel;
     int  num_threads;
+    bool enable_split_json;
+    int  split_depth;
     double override_lon;
     double override_lat;
     double override_alt;
@@ -78,6 +80,8 @@ static const HardcodedConfig g_config = {
     /* ktx2_quality */ 128,
     /* enable_parallel */ true,
     /* num_threads     */ 0,
+    /* enable_split_json */ false,
+    /* split_depth     */ 1,
     /* override_lon */ 0.0,
     /* override_lat */ 0.0,
     /* override_alt */ 0.0,
@@ -253,6 +257,8 @@ static void print_usage(const char* prog) {
         "  --ktx2-quality N      KTX2 encode quality (1-255, lower=faster, default: 128)\n"
         "  --no-parallel           Disable all multi-threading (Phase 1 + Phase 2)\n"
         "  --threads N             Number of worker threads (default: auto=CPU cores)\n"
+        "  --split-json            Split tileset.json into root index + sub-tilesets\n"
+        "  --split-depth N         Split depth (default: 1, 1=per top-level tile)\n"
         "  --geoid <model>         Geoid model: none, egm84, egm96, egm2008\n"
         "  --geoid-path <path>     Path to geoid data files\n"
         "  --lon <degrees>         Override longitude\n"
@@ -297,6 +303,8 @@ int main(int argc, char* argv[]) {
     opts.ktx2_quality            = g_config.ktx2_quality;
     opts.enable_parallel         = g_config.enable_parallel;
     opts.num_threads             = g_config.num_threads;
+    opts.enable_split_json       = g_config.enable_split_json;
+    opts.split_depth             = g_config.split_depth;
 
     if (g_config.override_lon != 0.0) opts.center_x = g_config.override_lon;
     if (g_config.override_lat != 0.0) opts.center_y = g_config.override_lat;
@@ -337,6 +345,10 @@ int main(int argc, char* argv[]) {
             opts.enable_parallel = false;
         } else if (arg == "--threads" && i + 1 < argc) {
             opts.num_threads = std::stoi(argv[++i]);
+        } else if (arg == "--split-json") {
+            opts.enable_split_json = true;
+        } else if (arg == "--split-depth" && i + 1 < argc) {
+            opts.split_depth = std::stoi(argv[++i]);
         } else if (arg == "--enable-top-reconstruct" || arg == "--enable-top_reconstruct") {
             opts.enable_top_reconstruct = true;
         } else if (arg == "--top-texture-max-size" && i + 1 < argc) {

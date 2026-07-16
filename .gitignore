@@ -1,5 +1,6 @@
 # Build output
 out/
+build/
 
 # Visual Studio
 .vs/
@@ -15,3 +16,6 @@ cmake_install.cmake
 *.sln
 *.vcxproj
 *.vcxproj.filters
+
+# Temp files
+_tmp_*.txt

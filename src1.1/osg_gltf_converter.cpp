@@ -14,6 +14,8 @@
 #include <map>
 #include <algorithm>
 #include <sstream>
+#include <fstream>
+#include <filesystem>
 #include <functional>
 #include <cstdint>
 #include <limits>
@@ -27,6 +29,8 @@
 // stb_image_write used by tinygltf's TINYGLTF_IMPLEMENTATION and by mesh_processor
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include <stb_image_write.h>
+
+namespace fs = std::filesystem;
 
 // stb_image_resize for root tile texture downsampling
 #define STB_IMAGE_RESIZE_IMPLEMENTATION
@@ -2505,8 +2509,77 @@ QuadNode build_quadtree(const SpatialGrid& grid) {
 // ============================================================
 nlohmann::json encode_quadtree_json(
     const QuadNode& node,
-    const std::map<std::string, nlohmann::json>& tile_jsons)
+    const std::map<std::string, nlohmann::json>& tile_jsons,
+    int current_display_level,
+    int root_level,
+    int split_depth,
+    const std::string& output_dir,
+    bool externalize_pagedlod)
 {
+    // --- Split check: if this node is at the split display level,
+    //     write the full subtree as an external tileset and return a reference ---
+    if (split_depth > 0 && current_display_level == split_depth && !output_dir.empty()) {
+        // Build the full subtree JSON.
+        // Pass split_depth=0 to prevent this node from splitting itself again,
+        // but keep externalize_pagedlod so level-0 PagedLOD subtrees are
+        // still externalized inside the sub-tileset.
+        nlohmann::json full_subtree = encode_quadtree_json(
+            node, tile_jsons, current_display_level, root_level,
+            0, output_dir, externalize_pagedlod);
+
+        // Rewrite URIs for sub-tileset location (subtilesets/ is one level deep)
+        std::function<void(nlohmann::json&)> rewrite_uris;
+        rewrite_uris = [&rewrite_uris](nlohmann::json& tile) {
+            if (tile.contains("content") && tile["content"].is_object()
+                && tile["content"].contains("uri")) {
+                std::string uri = tile["content"]["uri"].get<std::string>();
+                if (uri.size() >= 2 && uri[0] == '.' && uri[1] == '/') {
+                    tile["content"]["uri"] = ".." + uri.substr(1);
+                }
+            }
+            if (tile.contains("children") && tile["children"].is_array()) {
+                for (auto& child : tile["children"])
+                    rewrite_uris(child);
+            }
+        };
+        rewrite_uris(full_subtree);
+
+        // Build sub-tileset file name from grid coordinates and display level
+        char fname_buf[128];
+        int display_level = current_display_level;
+        snprintf(fname_buf, sizeof(fname_buf),
+                 "HLOD_L%d_X%+04d_Y%+04d.json",
+                 display_level, node.grid_x, node.grid_y);
+        std::string sub_name = fname_buf;
+
+        // Build sub-tileset envelope
+        nlohmann::json sub_tileset;
+        sub_tileset["asset"]["version"] = "1.1";
+        sub_tileset["extensionsUsed"] = nlohmann::json::array({"3DTILES_content_gltf"});
+        sub_tileset["extensionsRequired"] = nlohmann::json::array({"3DTILES_content_gltf"});
+        sub_tileset["geometricError"] = full_subtree.value("geometricError", 0.0);
+        sub_tileset["root"] = full_subtree;
+
+        // Write to disk
+        fs::path sub_path = fs::path(output_dir) / "subtilesets" / sub_name;
+        fs::create_directories(sub_path.parent_path());
+        std::ofstream ofs(sub_path);
+        ofs << sub_tileset.dump(2);
+        ofs.close();
+
+        LOG_I("  Wrote HLOD sub-tileset: subtilesets/%s", sub_name.c_str());
+
+        // Build reference tile
+        nlohmann::json ref_tile;
+        ref_tile["boundingVolume"]["box"] = convert_bbox(node.bbox);
+        ref_tile["content"]["uri"] = "./subtilesets/" + sub_name;
+        ref_tile["geometricError"] = node.geometricError;
+        ref_tile["refine"] = "REPLACE";
+        return ref_tile;
+    }
+
+    // --- Normal encoding (no split at this level) ---
+
     // Level 0: first merge level — generate JSON with HLOD content and
     // PagedLOD root tiles as children (looked up from tile_jsons_map).
     if (node.level == 0) {
@@ -2526,9 +2599,59 @@ nlohmann::json encode_quadtree_json(
         }
 
         tile["children"] = nlohmann::json::array();
+        // When split is enabled, externalize each PagedLOD subtree as a
+        // separate sub-tileset instead of embedding it inline.  This is
+        // the primary JSON size problem in HLOD mode — each PagedLOD tree
+        // can contain hundreds of LOD levels.
         for (const auto& stem : node.leaf_stems) {
             auto it = tile_jsons.find(stem);
-            if (it != tile_jsons.end()) {
+            if (it == tile_jsons.end()) continue;
+
+            if (externalize_pagedlod && !output_dir.empty()) {
+                // --- Externalize: write subtilesets/<stem>.json ---
+                nlohmann::json tree_copy = it->second;
+
+                // Rewrite content URIs so they resolve from subtilesets/
+                std::function<void(nlohmann::json&)> rewrite;
+                rewrite = [&rewrite](nlohmann::json& t) {
+                    if (t.contains("content") && t["content"].is_object()
+                        && t["content"].contains("uri")) {
+                        std::string uri = t["content"]["uri"].get<std::string>();
+                        if (uri.size() >= 2 && uri[0] == '.' && uri[1] == '/')
+                            t["content"]["uri"] = ".." + uri.substr(1);
+                    }
+                    if (t.contains("children") && t["children"].is_array()) {
+                        for (auto& c : t["children"]) rewrite(c);
+                    }
+                };
+                rewrite(tree_copy);
+
+                nlohmann::json sub_tileset;
+                sub_tileset["asset"]["version"] = "1.1";
+                sub_tileset["extensionsUsed"] = nlohmann::json::array({"3DTILES_content_gltf"});
+                sub_tileset["extensionsRequired"] = nlohmann::json::array({"3DTILES_content_gltf"});
+                sub_tileset["geometricError"] = tree_copy.value("geometricError", 0.0);
+                sub_tileset["root"] = tree_copy;
+
+                fs::path sub_path = fs::path(output_dir) / "subtilesets" / (stem + ".json");
+                fs::create_directories(sub_path.parent_path());
+                std::ofstream ofs(sub_path);
+                ofs << sub_tileset.dump(2);
+                ofs.close();
+
+                // Build a lightweight reference tile for the quadtree
+                nlohmann::json ref_tile;
+                // Use the tile's own boundingVolume if present, else fall back
+                if (tree_copy.contains("boundingVolume"))
+                    ref_tile["boundingVolume"] = tree_copy["boundingVolume"];
+                else
+                    ref_tile["boundingVolume"]["box"] = convert_bbox(node.bbox);
+                ref_tile["content"]["uri"] = "./subtilesets/" + stem + ".json";
+                ref_tile["geometricError"] = tree_copy.value("geometricError", 0.0);
+                ref_tile["refine"] = "REPLACE";
+                tile["children"].push_back(ref_tile);
+            } else {
+                // Original inline behavior
                 tile["children"].push_back(it->second);
             }
         }
@@ -2553,8 +2676,11 @@ nlohmann::json encode_quadtree_json(
 
     if (!node.children.empty()) {
         tile["children"] = nlohmann::json::array();
+        int child_display_level = split_depth > 0 ? current_display_level + 1 : 0;
         for (const auto& child : node.children) {
-            nlohmann::json child_json = encode_quadtree_json(child, tile_jsons);
+            nlohmann::json child_json = encode_quadtree_json(
+                child, tile_jsons, child_display_level, root_level,
+                split_depth, output_dir, externalize_pagedlod);
             if (!child_json.empty()) {
                 tile["children"].push_back(child_json);
             }
