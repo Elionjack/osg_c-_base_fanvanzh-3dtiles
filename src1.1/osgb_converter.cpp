@@ -390,6 +390,7 @@ int convert_osgb(const ConvertOptions& opts) {
     }
 
     struct TileResult {
+        std::string stem;                      // tile directory name (e.g. "Tile_-001_+050")
         json tree_json;                        // parsed tile tree (with URIs fixed)
         std::vector<double> box_v;
         std::string coarsest_path;             // for root tile reconstruction
@@ -672,7 +673,7 @@ int convert_osgb(const ConvertOptions& opts) {
 
         std::string coarsest_path = find_coarsest_node(tr.root);
 
-        tile_results.push_back({tile_tree, box_full, coarsest_path});
+        tile_results.push_back({tr.stem, tile_tree, box_full, coarsest_path});
         tile_jsons_map[tr.stem] = tile_tree;  // For HLOD leaf lookup
     }
 
@@ -806,6 +807,28 @@ int convert_osgb(const ConvertOptions& opts) {
     }
 
     // ============================================================
+    // Helper: recursively rewrite content URIs in a tile JSON tree
+    // for external sub-tilesets. Since sub-tilesets live in
+    // ./subtilesets/ (one level below root), all "./Data/..." URIs
+    // need to become "../Data/..." so they resolve correctly.
+    // ============================================================
+    std::function<void(json&)> rewrite_uris_for_sub_tileset;
+    rewrite_uris_for_sub_tileset = [&rewrite_uris_for_sub_tileset](json& tile) {
+        if (tile.contains("content") && tile["content"].is_object()
+            && tile["content"].contains("uri")) {
+            std::string uri = tile["content"]["uri"].get<std::string>();
+            // Replace "./Data/" → "../Data/" so URIs resolve from subtilesets/
+            if (uri.size() >= 2 && uri[0] == '.' && uri[1] == '/') {
+                tile["content"]["uri"] = ".." + uri.substr(1);
+            }
+        }
+        if (tile.contains("children") && tile["children"].is_array()) {
+            for (auto& child : tile["children"])
+                rewrite_uris_for_sub_tileset(child);
+        }
+    };
+
+    // ============================================================
     // 5. Build tileset.json
     // ============================================================
     // Compute root bounding box (from tile_results for flat mode, from quadtree for HLOD)
@@ -873,8 +896,19 @@ int convert_osgb(const ConvertOptions& opts) {
     root_tileset["extensionsRequired"] = json::array({"3DTILES_content_gltf"});
 
     if (has_hlod) {
-        // HLOD mode: root tile is the quadtree root
-        json quadtree_json = encode_quadtree_json(quadtree_root, tile_jsons_map);
+        // HLOD mode: root tile is the quadtree root.
+        // When split_json is enabled, writes sub-tilesets at the specified
+        // display level and returns reference tiles instead of full subtrees.
+        int split_d = opts.enable_split_json ? opts.split_depth : 0;
+        bool do_split = (split_d > 0);
+        std::string out_dir_str = do_split ? out_dir.string() : "";
+        json quadtree_json = encode_quadtree_json(
+            quadtree_root, tile_jsons_map,
+            0,                       // current_display_level (root = 0)
+            quadtree_root.level,     // root_level of quadtree
+            split_d,
+            out_dir_str,
+            do_split);               // externalize_pagedlod = true when split enabled
 
         // Add ECEF transform to root
         quadtree_json["transform"] = trans_vec;
@@ -886,20 +920,68 @@ int convert_osgb(const ConvertOptions& opts) {
 
         root_tileset["root"] = quadtree_json;
     } else {
-        // Flat mode (no HLOD): original behavior
-        json root_tile;
-        root_tile["transform"] = trans_vec;
-        root_tile["boundingVolume"]["box"] = box_to_tileset_box(root_box);
-        root_tile["refine"] = "REPLACE";
-        root_tile["geometricError"] = std::min(root_ge, 2000.0);
-        root_tileset["geometricError"] = std::min(root_ge, 2000.0);
-        root_tile["children"] = json::array();
+        // Flat mode (no HLOD)
+        if (opts.enable_split_json) {
+            // --- Split mode: one external sub-tileset per top-level tree ---
+            fs::path sub_dir = out_dir / "subtilesets";
+            fs::create_directories(sub_dir);
 
-        for (auto& tr : tile_results) {
-            root_tile["children"].push_back(tr.tree_json);
+            json root_tile;
+            root_tile["transform"] = trans_vec;
+            root_tile["boundingVolume"]["box"] = box_to_tileset_box(root_box);
+            root_tile["refine"] = "REPLACE";
+            root_tile["geometricError"] = std::min(root_ge, 2000.0);
+            root_tileset["geometricError"] = std::min(root_ge, 2000.0);
+            root_tile["children"] = json::array();
+
+            for (auto& tr : tile_results) {
+                // Deep-copy the tree JSON so we can rewrite URIs without
+                // affecting the HLOD leaf lookup (tile_jsons_map).
+                json tree_copy = tr.tree_json;
+                rewrite_uris_for_sub_tileset(tree_copy);
+
+                // Build sub-tileset envelope
+                json sub_tileset;
+                sub_tileset["asset"]["version"] = "1.1";
+                sub_tileset["extensionsUsed"] = json::array({"3DTILES_content_gltf"});
+                sub_tileset["extensionsRequired"] = json::array({"3DTILES_content_gltf"});
+                sub_tileset["geometricError"] = tree_copy.value("geometricError", 0.0);
+                sub_tileset["root"] = tree_copy;
+
+                // Write subtilesets/<stem>.json
+                std::string stem = tr.stem;
+                fs::path sub_path = sub_dir / (stem + ".json");
+                std::ofstream sub_ofs(sub_path);
+                sub_ofs << sub_tileset.dump(2);
+                sub_ofs.close();
+                LOG_I("  Wrote sub-tileset: subtilesets/%s.json", stem.c_str());
+
+                // Build lightweight reference tile for root tileset.json
+                json ref_tile;
+                ref_tile["boundingVolume"]["box"] = box_to_tileset_box(tr.box_v);
+                ref_tile["content"]["uri"] = "./subtilesets/" + stem + ".json";
+                ref_tile["geometricError"] = tr.tree_json.value("geometricError", 0.0);
+                ref_tile["refine"] = "REPLACE";
+                root_tile["children"].push_back(ref_tile);
+            }
+
+            root_tileset["root"] = root_tile;
+        } else {
+            // --- Original monolithic mode ---
+            json root_tile;
+            root_tile["transform"] = trans_vec;
+            root_tile["boundingVolume"]["box"] = box_to_tileset_box(root_box);
+            root_tile["refine"] = "REPLACE";
+            root_tile["geometricError"] = std::min(root_ge, 2000.0);
+            root_tileset["geometricError"] = std::min(root_ge, 2000.0);
+            root_tile["children"] = json::array();
+
+            for (auto& tr : tile_results) {
+                root_tile["children"].push_back(tr.tree_json);
+            }
+
+            root_tileset["root"] = root_tile;
         }
-
-        root_tileset["root"] = root_tile;
     }
 
     fs::path root_json_path = out_dir / "tileset.json";

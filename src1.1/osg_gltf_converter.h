@@ -220,9 +220,18 @@ bool build_merged_glb(
 // Generate tileset JSON for a quadtree node hierarchy.
 // Returns a nlohmann::json object representing the tile subtree.
 // tile_jsons maps stem→json for embedding PagedLOD subtrees at leaves.
+// When split_depth > 0, nodes at display_level == split_depth are
+// written as external sub-tilesets and replaced by reference tiles.
+// When externalize_pagedlod is true, level-0 PagedLOD subtrees are
+// always externalized (regardless of display_level/split_depth).
 nlohmann::json encode_quadtree_json(
     const QuadNode& node,
-    const std::map<std::string, nlohmann::json>& tile_jsons);
+    const std::map<std::string, nlohmann::json>& tile_jsons,
+    int current_display_level = 0,
+    int root_level = 0,
+    int split_depth = 0,
+    const std::string& output_dir = "",
+    bool externalize_pagedlod = false);
 
 // Returns the coarsest-LOD file for a tile tree: the tree root
 // (file without _Lxx suffix). Optionally outputs its geometricError.

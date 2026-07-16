@@ -93,6 +93,8 @@ cmake --build out/build/x64-Debug
 cmake --build out/build/x64-Debug --target osgb_converter_1_1
 ```
 
+> Visual Studio「打开文件夹」方式：`CMakeSettings.json` 已包含 `x64-Debug` 和 `x64-Release`（Ninja）两个配置，Release 配置用于生产转换（性能远高于 Debug）。
+
 ### Linux 构建
 
 ```bash
@@ -334,6 +336,8 @@ src/ 和 src1.1/ 现在共享完整的网格处理管线。核心差异仅在于
 | `--enable-unlit` | 启用 KHR_materials_unlit 扩展 | on |
 | `--enable-top-reconstruct` | 构建四叉树 HLOD（逐级合并生成简化 GLB） | off |
 | `--no-parallel` | 禁用多线程 tile 转换（默认开启并行） | off（即默认并行） |
+| `--split-json` | 将 tileset.json 分割为根索引 + `subtilesets/` 外部子瓦片集 | off |
+| `--split-depth` | HLOD 四叉树分割显示层级（1=顶层每节点一个子瓦片集） | 1 |
 | `--top-texture-max-size` | Root GLB 纹理最大尺寸（0=不限制） | 512 |
 | `--simplify-ratio` | Meshopt 简化目标比例（1.0=不简化） | 0.5 |
 | `--draco-pos-bits` | Draco 位置量化位数 | 11 |
@@ -358,6 +362,13 @@ src/ 和 src1.1/ 现在共享完整的网格处理管线。核心差异仅在于
 ### 转换器提交历史
 
 ```
+(最新)  feat(src1.1): 内置 tileset.json 分割 (--split-json/--split-depth)，新增 x64-Release 配置
+        - --split-json: 转换时直接生成「根索引 + subtilesets/ 外部子瓦片集」结构
+        - Flat 模式: 每个顶层 Tile 树写为 subtilesets/<stem>.json，根 tileset 仅保留轻量引用
+        - HLOD 模式: encode_quadtree_json() 按 --split-depth 显示层级切割四叉树为外部子瓦片集
+        - HLOD 模式: level-0 PagedLOD 子树外置（JSON 体积过大的主要来源）
+        - URI 重写: ./Data/... → ../Data/...（子瓦片集位于 subtilesets/ 下一级）
+        - CMakeSettings.json 新增 x64-Release (Ninja) 配置
 93bbec7 feat(src1.1): 四叉树HLOD、KTX2质量控制、线程数可配、tileset分割工具
         - 四叉树HLOD: build_quadtree() 从空间网格自底向上构建，每层自动合并生成简化GLB
         - build_merged_glb() 通用多文件合并（逐级简化比率 calc_level_ratio）
@@ -452,6 +463,39 @@ Step 5: encode_quadtree_json()
 - 合并后的 GLB 写入 `Data/HLOD/` 目录
 - tileset.json root 直接使用 quadtree 结构（替代 flat children 列表）
 - 单 tile 数据集的 2×2 区域不合并（保持原始质量）
+
+### 内置 tileset.json 分割（--split-json / --split-depth）
+
+当数据集很大时，单体 tileset.json 可达数十 MB，Cesium 首次加载需要完整解析整个 JSON，明显卡顿。1.1 版新增**转换时内置分割**，一步到位生成「根索引 + 外部子瓦片集」结构，无需后处理：
+
+```bash
+# Flat 模式：每个顶层 Tile 树一个子瓦片集
+./osgb_converter_1_1 -i input -o output --split-json
+
+# HLOD 模式：在四叉树显示层级 2 处切割
+./osgb_converter_1_1 -i input -o output --enable-top-reconstruct --split-json --split-depth 2
+```
+
+**输出结构：**
+
+```
+output_dir/
+├── tileset.json                       ← 根索引（仅轻量引用瓦片）
+├── subtilesets/
+│   ├── Tile_-051_+050.json            ← Flat 模式 / PagedLOD 外置子树
+│   ├── HLOD_L1_X+000_Y+000.json       ← HLOD 模式：按 --split-depth 切割的四叉树子树
+│   └── ...
+└── Data/...
+```
+
+**分割行为：**
+
+- **Flat 模式**（未开 HLOD）：每个顶层 Tile 树写为独立的 `subtilesets/<stem>.json`，根 tileset.json 只保留轻量引用瓦片（boundingVolume + content.uri + geometricError）
+- **HLOD 模式**：`encode_quadtree_json()` 在显示层级 == `--split-depth` 处切割四叉树，整个子树写为外部子瓦片集 `HLOD_L{level}_X±xxxx_Y±yyyy.json`；同时 level-0 的 PagedLOD 子树也外置为 `subtilesets/<stem>.json`——PagedLOD 树每棵可含数百层 LOD 节点，是 HLOD 模式 JSON 体积过大的主要来源
+- **URI 重写**：子瓦片集位于 `subtilesets/`（比根低一级），内部所有 `./Data/...` URI 自动改写为 `../Data/...`
+- 每个子瓦片集是完整合法的 3D Tiles 1.1 tileset（含 `asset.version` 和 `3DTILES_content_gltf` 声明）
+
+**与 split_tileset.py 的关系**：Python 工具用于对**已生成**的 tileset.json 做后处理分割；内置分割在转换时直接生成分割结构，推荐新转换任务直接使用 `--split-json`。
 
 ### tileset.json 分割工具（split_tileset.py）
 
