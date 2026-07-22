@@ -171,8 +171,10 @@ int main(int argc, char* argv[])
 
             std::string stem = entry.path().stem().string();
 
-            // Skip HLOD files unless --hollow-hlod
+            // HLOD files: copy as-is unless --hollow-hlod
             if (is_hlod_file(stem) && !opt.hollow_hlod) {
+                fs::copy_file(entry.path(), subs_out / entry.path().filename(),
+                              fs::copy_options::overwrite_existing);
                 ++skipped;
                 continue;
             }
