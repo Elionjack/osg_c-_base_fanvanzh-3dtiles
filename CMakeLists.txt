@@ -143,3 +143,9 @@ set(HEADERS_1_1
 add_executable(osgb_converter_1_1 ${SOURCES_1_1} ${HEADERS_1_1})
 configure_osgb_target(osgb_converter_1_1 src1.1)
 
+# ============================================================
+# Target 3: tileset_hollow (tileset.json post-processing tool)
+# Minimal dependency — only nlohmann_json
+# ============================================================
+add_subdirectory(tileset_hollow)
+
