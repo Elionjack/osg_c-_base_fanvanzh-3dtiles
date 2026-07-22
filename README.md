@@ -441,7 +441,7 @@ Step 4.2: build_quadtree()
   ├── 从 size=2 开始自底向上递归构建 QuadNode
   │   - Level 0 (size=2): 合并 4 个 GridCell → 1 个 quadtree 节点
   │   - Level N (size=2^(N+2)): 合并 4 个 Level N-1 节点
-  └── geometricError 逐级翻倍（每个父级 = max(子级) × 2）
+  └── geometricError 逐级递增（每个父级 = max(子级) × 1.55）
        │
        ▼
 Step 4.3: 逐级合并生成 GLB
