@@ -30,7 +30,7 @@ if(NOT TINYGLTF_INCLUDE_DIRS)
 endif()
 
 # GeographicLib (geoid height correction)
-find_package(GeographicLib CONFIG REQUIRED)
+find_package(GeographicLib REQUIRED)
 
 # Required: basisu (KTX2 texture compression)
 find_package(basisu CONFIG REQUIRED)
@@ -65,7 +65,7 @@ target_link_libraries(osgb_converter_deps INTERFACE
     nlohmann_json::nlohmann_json
     ${GDAL_LIBRARIES}
     ${OPENSCENEGRAPH_LIBRARIES}
-    glm::glm-header-only
+    glm::glm
     Eigen3::Eigen
     ${GeographicLib_LIBRARIES}
 )

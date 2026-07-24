@@ -91,48 +91,84 @@ static const HardcodedConfig g_config = {
 // ============================================================
 // OSG/GDAL environment setup
 // ============================================================
-static void setup_environment(const char* exe_path) {
-    // Derive executable directory
-    std::string exe_dir;
-    {
-        std::string ep(exe_path);
-        auto pos = ep.find_last_of("/\\");
-        if (pos != std::string::npos) exe_dir = ep.substr(0, pos);
+static bool path_exists(const std::string& path) {
+    std::error_code ec;
+    return !path.empty() && fs::exists(path, ec);
+}
+
+static bool osg_library_path_exists(const std::string& paths) {
+#ifdef _WIN32
+    const char delimiter = ';';
+#else
+    const char delimiter = ':';
+#endif
+    size_t start = 0;
+    while (start <= paths.size()) {
+        const size_t end = paths.find(delimiter, start);
+        const std::string path = paths.substr(
+            start, end == std::string::npos ? std::string::npos : end - start);
+        if (path_exists(path)) return true;
+        if (end == std::string::npos) break;
+        start = end + 1;
     }
+    return false;
+}
+
+static void setup_environment(const char* exe_path) {
+    std::error_code ec;
+    const fs::path absolute_exe = fs::absolute(fs::path(exe_path), ec);
+    const std::string exe_dir = ec
+        ? fs::path(exe_path).parent_path().string()
+        : absolute_exe.parent_path().string();
 
     // Set OSG_LIBRARY_PATH for runtime plugin loading
     // OSG needs to find plugins like osgdb_osg.dll to read .osgb files
     {
         std::string osg_plugins;
 
-        // 1) Try vcpkg release plugins directory first
-        const char* vcpkg_root = getenv("VCPKG_ROOT");
-        if (vcpkg_root) {
-            std::string vcpkg_debug_plugins = std::string(vcpkg_root)
-                + "/installed/x64-windows/debug/plugins/osgPlugins-3.6.5";
-            std::string vcpkg_rel_plugins  = std::string(vcpkg_root)
-                + "/installed/x64-windows/plugins/osgPlugins-3.6.5";
-#ifdef _WIN32
-            if (GetFileAttributesA(vcpkg_rel_plugins.c_str()) != INVALID_FILE_ATTRIBUTES) {
-                osg_plugins = vcpkg_rel_plugins;
-            } else if (GetFileAttributesA(vcpkg_debug_plugins.c_str()) != INVALID_FILE_ATTRIBUTES) {
-                osg_plugins = vcpkg_debug_plugins;
-            }
-#else
-            if (fs::exists(vcpkg_rel_plugins)) osg_plugins = vcpkg_rel_plugins;
-            else if (fs::exists(vcpkg_debug_plugins)) osg_plugins = vcpkg_debug_plugins;
-#endif
+        // 1) Keep an existing, valid setting from the launch environment.
+        const char* existing_osg = getenv("OSG_LIBRARY_PATH");
+        if (existing_osg && osg_library_path_exists(existing_osg)) {
+            osg_plugins = existing_osg;
         }
 
-        // 2) Fallback: local directory next to executable
-        if (osg_plugins.empty()) {
-            std::string local_plugins = exe_dir + "/osgPlugins-3.6.5";
+        // 2) Try the platform's vcpkg plugins directory.
+        const char* vcpkg_root = getenv("VCPKG_ROOT");
+        if (osg_plugins.empty() && vcpkg_root) {
 #ifdef _WIN32
-            if (GetFileAttributesA(local_plugins.c_str()) != INVALID_FILE_ATTRIBUTES)
-                osg_plugins = local_plugins;
+            const char* default_triplet = "x64-windows";
 #else
-            if (fs::exists(local_plugins)) osg_plugins = local_plugins;
+            const char* default_triplet = "x64-linux";
 #endif
+            const char* configured_triplet = getenv("VCPKG_DEFAULT_TRIPLET");
+            const std::string triplet =
+                configured_triplet && configured_triplet[0]
+                    ? configured_triplet : default_triplet;
+            const std::string installed =
+                (fs::path(vcpkg_root) / "installed" / triplet).string();
+            const std::string release_plugins =
+                (fs::path(installed) / "plugins" / "osgPlugins-3.6.5").string();
+            const std::string debug_plugins =
+                (fs::path(installed) / "debug" / "plugins" / "osgPlugins-3.6.5").string();
+            if (path_exists(release_plugins)) osg_plugins = release_plugins;
+            else if (path_exists(debug_plugins)) osg_plugins = debug_plugins;
+        }
+
+        // 3) Fall back to a local directory next to the executable.
+        if (osg_plugins.empty()) {
+#ifdef _WIN32
+            const std::string versioned_plugins =
+                (fs::path(exe_dir) / "osgPlugins-3.6.5").string();
+            const std::string packaged_plugins =
+                (fs::path(exe_dir) / "osgPlugins").string();
+#else
+            const std::string packaged_plugins =
+                (fs::path(exe_dir) / "osgPlugins").string();
+            const std::string versioned_plugins =
+                (fs::path(exe_dir) / "osgPlugins-3.6.5").string();
+#endif
+            if (path_exists(versioned_plugins)) osg_plugins = versioned_plugins;
+            else if (path_exists(packaged_plugins)) osg_plugins = packaged_plugins;
         }
 
         if (!osg_plugins.empty()) {
@@ -148,59 +184,77 @@ static void setup_environment(const char* exe_path) {
         }
     }
 
-    // Find GDAL_DATA and PROJ_LIB — try vcpkg first, then local dirs
+    // Find GDAL_DATA and PROJ_LIB.
     // Need proj.db (PROJ) and epsg.wkt (GDAL) for coordinate transformations
     std::string gdal_data_path;
     std::string proj_lib_path;
 
-    // 1) Check VCPKG_ROOT environment variable
-    {
-        const char* vcpkg_root = getenv("VCPKG_ROOT");
-        if (vcpkg_root) {
-            std::string vcpkg_share = std::string(vcpkg_root) + "/installed/x64-windows/share";
-            std::string vcpkg_gdal = vcpkg_share + "/gdal";
-            std::string vcpkg_proj = vcpkg_share + "/proj";
+    // 1) Keep valid settings supplied by the launch environment.
+    const char* existing_gdal = getenv("GDAL_DATA");
+    if (existing_gdal && path_exists((fs::path(existing_gdal) / "epsg.wkt").string())) {
+        gdal_data_path = existing_gdal;
+    }
+    const char* existing_proj = getenv("PROJ_LIB");
+    if (existing_proj && path_exists((fs::path(existing_proj) / "proj.db").string())) {
+        proj_lib_path = existing_proj;
+    }
+
+    // 2) Check the platform's vcpkg installation.
+    const char* vcpkg_root = getenv("VCPKG_ROOT");
+    if ((gdal_data_path.empty() || proj_lib_path.empty()) && vcpkg_root) {
 #ifdef _WIN32
-            if (GetFileAttributesA((vcpkg_proj + "/proj.db").c_str()) != INVALID_FILE_ATTRIBUTES
-                && GetFileAttributesA((vcpkg_gdal + "/epsg.wkt").c_str()) != INVALID_FILE_ATTRIBUTES) {
-                gdal_data_path = vcpkg_gdal;
-                proj_lib_path = vcpkg_proj;
-            }
+        const char* default_triplet = "x64-windows";
 #else
-            if (fs::exists(vcpkg_proj + "/proj.db") && fs::exists(vcpkg_gdal + "/epsg.wkt")) {
-                gdal_data_path = vcpkg_gdal;
-                proj_lib_path = vcpkg_proj;
-            }
+        const char* default_triplet = "x64-linux";
 #endif
+        const char* configured_triplet = getenv("VCPKG_DEFAULT_TRIPLET");
+        const std::string triplet =
+            configured_triplet && configured_triplet[0]
+                ? configured_triplet : default_triplet;
+        const fs::path vcpkg_share =
+            fs::path(vcpkg_root) / "installed" / triplet / "share";
+        const std::string vcpkg_gdal = (vcpkg_share / "gdal").string();
+        const std::string vcpkg_proj = (vcpkg_share / "proj").string();
+        if (gdal_data_path.empty()
+            && path_exists((fs::path(vcpkg_gdal) / "epsg.wkt").string())) {
+            gdal_data_path = vcpkg_gdal;
+        }
+        if (proj_lib_path.empty()
+            && path_exists((fs::path(vcpkg_proj) / "proj.db").string())) {
+            proj_lib_path = vcpkg_proj;
         }
     }
 
-    // 2) Fallback: local directories next to executable
+    // 3) Fall back to directories next to the executable.
     if (gdal_data_path.empty()) {
-        std::string gdal_local = exe_dir + "/gdal";
 #ifdef _WIN32
-        if (GetFileAttributesA((gdal_local + "/epsg.wkt").c_str()) != INVALID_FILE_ATTRIBUTES)
-            gdal_data_path = gdal_local;
+        const std::string primary_gdal = (fs::path(exe_dir) / "gdal").string();
+        const std::string packaged_gdal = (fs::path(exe_dir) / "share" / "gdal").string();
 #else
-        if (fs::exists(gdal_local + "/epsg.wkt"))
-            gdal_data_path = gdal_local;
+        const std::string primary_gdal = (fs::path(exe_dir) / "share" / "gdal").string();
+        const std::string packaged_gdal = (fs::path(exe_dir) / "gdal").string();
 #endif
+        if (path_exists((fs::path(primary_gdal) / "epsg.wkt").string()))
+            gdal_data_path = primary_gdal;
+        else if (path_exists((fs::path(packaged_gdal) / "epsg.wkt").string()))
+            gdal_data_path = packaged_gdal;
     }
     if (proj_lib_path.empty()) {
-        std::string proj_local = exe_dir + "/proj";
 #ifdef _WIN32
-        if (GetFileAttributesA((proj_local + "/proj.db").c_str()) != INVALID_FILE_ATTRIBUTES)
-            proj_lib_path = proj_local;
+        const std::string primary_proj = (fs::path(exe_dir) / "proj").string();
+        const std::string packaged_proj = (fs::path(exe_dir) / "share" / "proj").string();
 #else
-        if (fs::exists(proj_local + "/proj.db"))
-            proj_lib_path = proj_local;
+        const std::string primary_proj = (fs::path(exe_dir) / "share" / "proj").string();
+        const std::string packaged_proj = (fs::path(exe_dir) / "proj").string();
 #endif
+        if (path_exists((fs::path(primary_proj) / "proj.db").string()))
+            proj_lib_path = primary_proj;
+        else if (path_exists((fs::path(packaged_proj) / "proj.db").string()))
+            proj_lib_path = packaged_proj;
     }
 
-    // Set GDAL_DATA
-    // IMPORTANT: On Windows, SetEnvironmentVariableA doesn't update CRT's _environ,
-    // so getenv() still returns the old value. Must use _putenv() + CPLSetConfigOption.
-    {
+    // Only set valid paths; never erase settings supplied by the caller.
+    if (!gdal_data_path.empty()) {
         std::string gdal_env = "GDAL_DATA=" + gdal_data_path;
 #ifdef _WIN32
         _putenv(gdal_env.c_str());
@@ -209,10 +263,11 @@ static void setup_environment(const char* exe_path) {
 #endif
         CPLSetConfigOption("GDAL_DATA", gdal_data_path.c_str());
         fprintf(stderr, "GDAL_DATA set to: %s\n", gdal_data_path.c_str());
+    } else {
+        fprintf(stderr, "WARNING: GDAL_DATA not found! Coordinate transforms may fail.\n");
     }
 
-    // Set PROJ_LIB — critical for WKT SRS parsing
-    {
+    if (!proj_lib_path.empty()) {
         std::string proj_env = "PROJ_LIB=" + proj_lib_path;
 #ifdef _WIN32
         _putenv(proj_env.c_str());
@@ -221,11 +276,8 @@ static void setup_environment(const char* exe_path) {
 #endif
         CPLSetConfigOption("PROJ_LIB", proj_lib_path.c_str());
         fprintf(stderr, "PROJ_LIB set to: %s\n", proj_lib_path.c_str());
-    }
-
-    if (gdal_data_path.empty() || proj_lib_path.empty()) {
-        fprintf(stderr, "WARNING: GDAL_DATA or PROJ_LIB not found! "
-                "Coordinate transforms will fail.\n");
+    } else {
+        fprintf(stderr, "WARNING: PROJ_LIB not found! Coordinate transforms may fail.\n");
     }
 }
 
