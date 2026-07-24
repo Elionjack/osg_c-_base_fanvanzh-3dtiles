@@ -8,8 +8,10 @@
 
 ```
 .
-├── CMakeLists.txt              # CMake 构建（两个 target）
+├── CMakeLists.txt              # CMake 构建（两个转换器 + tileset_hollow）
 ├── README.md
+├── run_pkg/                    # Linux x64 预打包运行目录（程序、插件、动态库和数据）
+├── run_pkg.tar.gz              # Linux x64 运行包压缩文件
 ├── src/                        # 3D Tiles 1.0（输出 .b3dm）
 │   ├── main.cpp                # 入口：环境配置、参数解析
 │   ├── osgb_converter.cpp/.h   # 主控：metadata.xml 解析、坐标初始化、tileset.json 生成
@@ -22,6 +24,7 @@
 ├── src1.1/                     # 3D Tiles 1.1（输出 .glb + 3DTILES_content_gltf）
 │   ├── （文件与 src/ 对应，差异见下方说明）
 │   └── split_tileset.py         # tileset.json 层级分割工具（流式 2-pass）
+├── tileset_hollow/             # tileset.json 层级虚挂后处理工具
 ├── out/                        # CMake 构建输出
 └── display/                    # CesiumJS 网页查看器（独立 git 仓库）
     ├── server.js               # Node.js 静态文件服务器
@@ -107,6 +110,81 @@ vcpkg install tinygltf nlohmann-json stb
 # 构建
 cmake -B out/build -DCMAKE_TOOLCHAIN_FILE=.../vcpkg.cmake -DCMAKE_BUILD_TYPE=Release
 cmake --build out/build -j$(nproc)
+```
+
+### Linux + Windows 版本
+
+跨平台版本位于 Git 分支 `linux+windows-ver`。Windows 建议从源码构建；Linux 既可以从源码构建，也可以直接使用仓库内的 x64 预打包运行包。
+
+#### Windows（源码构建）
+
+在 PowerShell 中执行：
+
+```powershell
+# 根据本机 vcpkg 路径调整 D:/vcpkg
+cmake -B out/build/x64-Release -G Ninja `
+  -DCMAKE_TOOLCHAIN_FILE=D:/vcpkg/scripts/buildsystems/vcpkg.cmake `
+  -DCMAKE_BUILD_TYPE=Release
+
+cmake --build out/build/x64-Release --target osgb_converter_1_1
+
+# 转换为 3D Tiles 1.1
+.\out\build\x64-Release\osgb_converter_1_1.exe `
+  -i "D:\data\input" `
+  -o "D:\data\output"
+```
+
+Visual Studio 2022 也可以直接“打开文件夹”，选择 `CMakeSettings.json` 中的 `x64-Release` 配置进行构建。
+
+#### Linux（直接使用预打包运行包）
+
+仓库中的 `run_pkg.tar.gz` 包含 `osgb_converter_1_1`、OSG 插件、运行所需动态库以及 GDAL/PROJ 数据。无需把其中的文件安装到系统目录：
+
+```bash
+# 解压压缩包；如果已经克隆仓库，也可以直接进入现有 run_pkg/
+tar -xzf run_pkg.tar.gz
+cd run_pkg
+
+# 查看参数
+bash ./run.sh --help
+
+# 执行转换
+bash ./run.sh \
+  -i /absolute/path/to/input \
+  -o /absolute/path/to/output
+
+# 常用生产配置示例
+bash ./run.sh \
+  -i /absolute/path/to/input \
+  -o /absolute/path/to/output \
+  --enable-simplify \
+  --enable-draco \
+  --enable-texture-compress \
+  --split-json \
+  --threads 8
+```
+
+`run.sh` 会基于自身所在目录自动设置：
+
+- `LD_LIBRARY_PATH=run_pkg/lib`
+- `OSG_LIBRARY_PATH=run_pkg/osgPlugins`
+- `GDAL_DATA=run_pkg/share/gdal`
+- `PROJ_LIB`、`PROJ_DATA=run_pkg/share/proj`
+
+因此应保留 `run_pkg` 的目录结构，不要只复制可执行文件。该预编译包面向 Linux x64；若目标机器的 CPU 架构或系统 ABI 不兼容，请按“Linux 构建”章节在目标环境重新编译。可用 `ldd run_pkg/osgb_converter_1_1` 检查动态库解析结果。
+
+#### Linux 运行包结构
+
+```text
+run_pkg/
+├── osgb_converter_1_1       # 3D Tiles 1.1 转换器
+├── run.sh                    # 环境变量设置与启动脚本
+├── ldd-libs.txt              # 打包时的动态库依赖记录
+├── lib/                      # 随包动态库
+├── osgPlugins/               # OpenSceneGraph 数据库插件
+└── share/
+    ├── gdal/                 # GDAL 运行数据
+    └── proj/                 # PROJ 数据库及格网文件
 ```
 
 ## 使用
@@ -518,4 +596,3 @@ python src1.1/split_tileset.py output/tileset.json output_split/ --min-tiles 100
 - 每个子树写入 `subtilesets/` 目录，主 tileset 中替换为轻量引用（boundingVolume + content.uri）
 - `auto_select_depth()` 自动选择 tile 数在 [100, 2000] 范围内的最浅深度
 - 自动复制 Data 目录（可用 `--no-copy-data` 跳过）
-
