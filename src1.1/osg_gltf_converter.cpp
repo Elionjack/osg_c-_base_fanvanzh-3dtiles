@@ -37,10 +37,11 @@ namespace fs = std::filesystem;
 #include <stb_image_resize2.h>
 
 // OSG plugin registration (needed for static linking on Linux/macOS)
-#if defined(__unix__) || defined(__APPLE__)
 #include <atomic>
 #include <chrono>
 #include <osgDB/Registry>
+
+#if defined(__APPLE__)
 USE_OSGPLUGIN(osg)
 USE_OSGPLUGIN(osg2)
 USE_OSGPLUGIN(rgb)
