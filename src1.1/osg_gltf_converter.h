@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <memory>
 #include <osg/Node>
 #include <osg/Geometry>
 #include <nlohmann/json.hpp>
@@ -162,6 +163,9 @@ struct GridCell {
 // Spatial grid: grid_x → grid_y → GridCell
 using SpatialGrid = std::map<int, std::map<int, GridCell>>;
 
+struct HlodIntermediate;
+using HlodIntermediatePtr = std::shared_ptr<HlodIntermediate>;
+
 // Quadtree node for HLOD hierarchy
 struct QuadNode {
     int grid_x = 0;              // top-left grid coordinate
@@ -176,6 +180,7 @@ struct QuadNode {
     std::vector<QuadNode> children; // 0-4 sub-quadtree nodes
     std::vector<std::string> leaf_stems;           // level=0: tile stems under this node
     std::vector<std::string> leaf_coarsest_paths;  // level=0: coarsest OSGB paths under this node
+    HlodIntermediatePtr intermediate; // uncompressed coarse model for direct parent merge
 };
 
 // ============================================================
@@ -218,7 +223,9 @@ bool build_merged_glb(
     int top_texture_max_size = 512,
     double simplify_ratio = 0.5,
     int draco_pos_bits = 11, int draco_normal_bits = 10,
-    int draco_uv_bits = 12, int ktx2_quality = 128);
+    int draco_uv_bits = 12, int ktx2_quality = 128,
+    const std::vector<HlodIntermediatePtr>& child_intermediates = {},
+    HlodIntermediatePtr* out_intermediate = nullptr);
 
 // Generate tileset JSON for a quadtree node hierarchy.
 // Returns a nlohmann::json object representing the tile subtree.

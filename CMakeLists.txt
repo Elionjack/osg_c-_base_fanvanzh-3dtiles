@@ -3,6 +3,8 @@ project(OsgbTo3dTiles)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+option(OSGB_ENABLE_BASISU_OPENCL
+       "Link the OpenCL loader for an OpenCL-enabled BasisU build" ON)
 
 # ============================================================
 # Find required packages via vcpkg
@@ -30,6 +32,9 @@ if(NOT TINYGLTF_INCLUDE_DIRS)
 endif()
 
 # GeographicLib (geoid height correction)
+if(UNIX AND EXISTS "/usr/share/cmake/geographiclib/FindGeographicLib.cmake")
+    list(APPEND CMAKE_MODULE_PATH "/usr/share/cmake/geographiclib")
+endif()
 find_package(GeographicLib REQUIRED)
 
 # Required: basisu (KTX2 texture compression)
@@ -143,9 +148,25 @@ set(HEADERS_1_1
 add_executable(osgb_converter_1_1 ${SOURCES_1_1} ${HEADERS_1_1})
 configure_osgb_target(osgb_converter_1_1 src1.1)
 
+# OpenCL-enabled BasisU is still a static library. BasisU 2.1 does not export
+# its OpenCL loader dependency, so link it explicitly when the overlay package
+# (Windows) or a system OpenCL SDK (Linux/macOS) is available.
+if(OSGB_ENABLE_BASISU_OPENCL AND WIN32)
+    find_library(BASISU_OPENCL_LIBRARY NAMES OpenCL64 OpenCL)
+    if(BASISU_OPENCL_LIBRARY)
+        target_link_libraries(osgb_converter_deps INTERFACE ${BASISU_OPENCL_LIBRARY})
+        message(STATUS "BasisU OpenCL loader found: ${BASISU_OPENCL_LIBRARY}")
+    endif()
+elseif(OSGB_ENABLE_BASISU_OPENCL)
+    find_package(OpenCL QUIET)
+    if(OpenCL_FOUND)
+        target_link_libraries(osgb_converter_deps INTERFACE OpenCL::OpenCL)
+        message(STATUS "BasisU OpenCL loader found: ${OpenCL_LIBRARIES}")
+    endif()
+endif()
+
 # ============================================================
 # Target 3: tileset_hollow (tileset.json post-processing tool)
 # Minimal dependency — only nlohmann_json
 # ============================================================
 add_subdirectory(tileset_hollow)
-

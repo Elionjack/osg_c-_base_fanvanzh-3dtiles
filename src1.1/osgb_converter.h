@@ -20,6 +20,8 @@ struct ConvertOptions {
     bool enable_parallel = true;     // multi-threaded tile conversion
     int  num_threads = 0;            // thread count (0=auto: hardware_concurrency)
     int  ktx2_quality = 128;         // basisu encoding quality (lower=faster, 1-255)
+    bool enable_gpu_texture_compress = false; // BasisU ETC1S OpenCL acceleration
+    bool gpu_texture_serialize = false;       // serialize OpenCL queues for unstable drivers
 
     // Geoid
     std::string geoid_model = "none";
@@ -27,7 +29,8 @@ struct ConvertOptions {
 
     // Tileset JSON splitting (external tilesets)
     bool enable_split_json = false;    // split monolithic tileset.json into index + sub-tilesets
-    int  split_depth = 1;              // split depth (1 = one sub-tileset per top-level tree)
+    int  split_depth = 0;              // 0=auto, >0=fixed HLOD display depth
+    int  split_target_tiles = 256;     // auto mode target source tiles per HLOD shard
     int  lod_step = 2;                 // keep every Nth node in single-child LOD chains
     bool enable_fine_merge = true;     // merge small finest-LOD spatial subtrees
     int  fine_merge_max_sources = 16;  // max leaf OSGB files in one fine aggregate

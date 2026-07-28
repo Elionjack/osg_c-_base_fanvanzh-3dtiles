@@ -5,6 +5,7 @@
 
 #include <osg/Material>
 #include <osg/PagedLOD>
+#include <osg/CopyOp>
 #include <osgDB/ReadFile>
 #include <osgDB/ConvertUTF>
 #include <osgUtil/SmoothingVisitor>
@@ -2049,6 +2050,15 @@ double calc_level_ratio(int level, double base_ratio) {
     return std::max(0.01, r);
 }
 
+struct HlodIntermediateEntry {
+    osg::ref_ptr<osg::Geometry> geometry;
+    osg::ref_ptr<osg::Texture> texture;
+};
+
+struct HlodIntermediate {
+    std::vector<HlodIntermediateEntry> entries;
+};
+
 // ============================================================
 // General merge: multiple OSGB files → one GLB with level-based simplification
 // ============================================================
@@ -2064,14 +2074,21 @@ bool build_merged_glb(
     int top_texture_max_size,
     double simplify_ratio,
     int draco_pos_bits, int draco_normal_bits, int draco_uv_bits,
-    int ktx2_quality)
+    int ktx2_quality,
+    const std::vector<HlodIntermediatePtr>& child_intermediates,
+    HlodIntermediatePtr* out_intermediate)
 {
-    if (osgb_paths.empty()) return false;
+    if (osgb_paths.empty() && child_intermediates.empty()) return false;
 
-    // Compute level-specific simplify ratio
-    double level_ratio = calc_level_ratio(quadtree_level, simplify_ratio);
-    LOG_I("build_merged_glb: level=%d, ratio=%.4f (%zu tiles)",
-          quadtree_level, level_ratio, osgb_paths.size());
+    // Original OSGB inputs use the absolute level ratio. Direct-child HLOD
+    // inputs have already been simplified, so each parent applies one further
+    // 4:1 reduction instead of reapplying an absolute ratio to original data.
+    const bool uses_child_coarse_models = !child_intermediates.empty();
+    double level_ratio = uses_child_coarse_models
+        ? 0.25
+        : calc_level_ratio(quadtree_level, simplify_ratio);
+    LOG_I("build_merged_glb: level=%d, ratio=%.4f (%zu OSGB, %zu child coarse models)",
+          quadtree_level, level_ratio, osgb_paths.size(), child_intermediates.size());
 
     tinygltf::TinyGLTF gltf;
     tinygltf::Model model;
@@ -2102,6 +2119,52 @@ bool build_merged_glb(
     };
 
     std::vector<osg::ref_ptr<osg::Node>> loaded_nodes;
+    std::vector<osg::ref_ptr<osg::Geometry>> cloned_geometry;
+    std::vector<osg::ref_ptr<osg::Texture>> cloned_textures;
+
+    auto register_geometry = [&](osg::Geometry* g, osg::Texture* raw_tex) {
+        if (!g) return;
+        all_geometry.push_back(g);
+        if (!raw_tex) return;
+
+        size_t h = hash_texture_image(raw_tex);
+        auto dedup_it = tex_hash_to_idx.find(h);
+        if (dedup_it != tex_hash_to_idx.end()) {
+            geom_to_tex[g] = all_textures[dedup_it->second];
+        } else {
+            tex_hash_to_idx[h] = all_textures.size();
+            all_textures.push_back(raw_tex);
+            geom_to_tex[g] = raw_tex;
+        }
+    };
+
+    // Consume the already-corrected and already-simplified direct children.
+    // Deep-copy before simplifying so the child GLB and sibling processing are
+    // unaffected by the parent's additional reduction/downsampling.
+    for (const auto& child : child_intermediates) {
+        if (!child) continue;
+        for (const auto& entry : child->entries) {
+            if (!entry.geometry.valid()) continue;
+
+            osg::ref_ptr<osg::Geometry> geom = dynamic_cast<osg::Geometry*>(
+                entry.geometry->clone(osg::CopyOp::DEEP_COPY_ALL));
+            if (!geom.valid()) continue;
+
+            osg::ref_ptr<osg::Texture> tex;
+            if (entry.texture.valid()) {
+                tex = dynamic_cast<osg::Texture*>(
+                    entry.texture->clone(osg::CopyOp::DEEP_COPY_ALL));
+                if (tex.valid()) {
+                    geom->getOrCreateStateSet()->setTextureAttributeAndModes(
+                        0, tex.get(), osg::StateAttribute::ON);
+                    cloned_textures.push_back(tex);
+                }
+            }
+
+            cloned_geometry.push_back(geom);
+            register_geometry(geom.get(), tex.get());
+        }
+    }
 
     // Phase 1: Load all OSGB files and collect geometry/textures
     for (const auto& fpath : osgb_paths) {
@@ -2130,20 +2193,8 @@ bool build_merged_glb(
         }
 
         for (auto* g : geoms) {
-            all_geometry.push_back(g);
             auto it = infoVisitor.texture_map.find(g);
-            if (it != infoVisitor.texture_map.end()) {
-                osg::Texture* raw_tex = it->second;
-                size_t h = hash_texture_image(raw_tex);
-                auto dedup_it = tex_hash_to_idx.find(h);
-                if (dedup_it != tex_hash_to_idx.end()) {
-                    geom_to_tex[g] = all_textures[dedup_it->second];
-                } else {
-                    tex_hash_to_idx[h] = all_textures.size();
-                    all_textures.push_back(raw_tex);
-                    geom_to_tex[g] = raw_tex;
-                }
-            }
+            register_geometry(g, it != infoVisitor.texture_map.end() ? it->second : nullptr);
         }
 
         loaded_nodes.push_back(root);
@@ -2204,14 +2255,21 @@ bool build_merged_glb(
     }
 
     // Phase 3: Process textures (with optional downsampling)
+    int effective_texture_max_size = top_texture_max_size;
+    if (uses_child_coarse_models && effective_texture_max_size > 32) {
+        const int parent_steps = std::max(1, quadtree_level - 1);
+        for (int step = 0; step < parent_steps && effective_texture_max_size > 32; ++step)
+            effective_texture_max_size = std::max(32, effective_texture_max_size / 2);
+    }
+
     for (auto* tex : all_textures) {
-        if (top_texture_max_size > 0 && tex && tex->getNumImages() > 0) {
+        if (effective_texture_max_size > 0 && tex && tex->getNumImages() > 0) {
             osg::Image* img = tex->getImage(0);
             if (img && img->data()) {
                 int w = img->s(), h = img->t();
                 int max_dim = std::max(w, h);
-                if (max_dim > top_texture_max_size) {
-                    double scale = (double)top_texture_max_size / max_dim;
+                if (max_dim > effective_texture_max_size) {
+                    double scale = (double)effective_texture_max_size / max_dim;
                     int new_w = std::max(1, (int)(w * scale));
                     int new_h = std::max(1, (int)(h * scale));
                     int channels = img->getPixelFormat() == GL_RGB ? 3 : 4;
@@ -2338,6 +2396,20 @@ bool build_merged_glb(
 
     out_bbox.min = { (double)global_min.x(), (double)global_min.y(), (double)global_min.z() };
     out_bbox.max = { (double)global_max.x(), (double)global_max.y(), (double)global_max.z() };
+
+    if (out_intermediate) {
+        auto intermediate = std::make_shared<HlodIntermediate>();
+        intermediate->entries.reserve(all_geometry.size());
+        for (auto* geometry : all_geometry) {
+            HlodIntermediateEntry entry;
+            entry.geometry = geometry;
+            auto tex_it = geom_to_tex.find(geometry);
+            if (tex_it != geom_to_tex.end())
+                entry.texture = tex_it->second;
+            intermediate->entries.push_back(std::move(entry));
+        }
+        *out_intermediate = std::move(intermediate);
+    }
 
     LOG_I("build_merged_glb: success, GLB size=%zu bytes, level=%d",
           out_glb_buf.size(), quadtree_level);
@@ -2530,6 +2602,66 @@ QuadNode build_quadtree(const SpatialGrid& grid) {
 // ============================================================
 // Generate tileset JSON for quadtree hierarchy
 // ============================================================
+namespace {
+
+// An index-only tile has no drawable fallback.  If Cesium is allowed to
+// satisfy SSE at such a tile it stops refining and renders an empty area.
+// Keep a finite JSON number, but make it large enough that an index-only
+// wrapper always traverses to its drawable descendants at normal globe
+// viewing distances.
+constexpr double kIndexOnlyGeometricError = 1.0e12;
+
+bool has_tile_content(const nlohmann::json& tile) {
+    return tile.contains("content")
+        && tile["content"].is_object()
+        && tile["content"].contains("uri")
+        && tile["content"]["uri"].is_string()
+        && !tile["content"]["uri"].get_ref<const std::string&>().empty();
+}
+
+// Recursively remove consecutive index-only child levels.  The current tile
+// is retained because it may be the root of a tileset and carry its transform,
+// but index-only children are replaced by their already-normalized children.
+// This avoids several rounds of empty REPLACE refinement before Cesium reaches
+// the first drawable HLOD.
+void finalize_index_only_tile(nlohmann::json& tile) {
+    if (tile.contains("children") && tile["children"].is_array()) {
+        nlohmann::json normalized_children = nlohmann::json::array();
+
+        for (auto& child : tile["children"]) {
+            finalize_index_only_tile(child);
+
+            const bool promotable =
+                !has_tile_content(child)
+                && child.contains("children")
+                && child["children"].is_array()
+                && !child["children"].empty();
+
+            if (promotable) {
+                for (auto& grandchild : child["children"]) {
+                    normalized_children.push_back(std::move(grandchild));
+                }
+            } else {
+                normalized_children.push_back(std::move(child));
+            }
+        }
+
+        tile["children"] = std::move(normalized_children);
+    }
+
+    const bool has_children =
+        tile.contains("children")
+        && tile["children"].is_array()
+        && !tile["children"].empty();
+    if (!has_tile_content(tile) && has_children) {
+        tile["geometricError"] = std::max(
+            tile.value("geometricError", 0.0),
+            kIndexOnlyGeometricError);
+    }
+}
+
+} // namespace
+
 nlohmann::json encode_quadtree_json(
     const QuadNode& node,
     const std::map<std::string, nlohmann::json>& tile_jsons,
@@ -2543,12 +2675,13 @@ nlohmann::json encode_quadtree_json(
     //     write the full subtree as an external tileset and return a reference ---
     if (split_depth > 0 && current_display_level == split_depth && !output_dir.empty()) {
         // Build the full subtree JSON.
-        // Pass split_depth=0 to prevent this node from splitting itself again,
-        // but keep externalize_pagedlod so level-0 PagedLOD subtrees are
-        // still externalized inside the sub-tileset.
+        // Pass split_depth=0 to prevent this node from splitting itself again.
+        // PagedLOD trees are embedded in this spatial HLOD shard; writing one
+        // external JSON per source Tile recreated thousands of HTTP requests.
         nlohmann::json full_subtree = encode_quadtree_json(
             node, tile_jsons, current_display_level, root_level,
-            0, output_dir, externalize_pagedlod);
+            0, output_dir, false);
+        finalize_index_only_tile(full_subtree);
 
         // Rewrite URIs for sub-tileset location (subtilesets/ is one level deep)
         std::function<void(nlohmann::json&)> rewrite_uris;
@@ -2675,6 +2808,7 @@ nlohmann::json encode_quadtree_json(
                 tile["children"].push_back(it->second);
             }
         }
+        finalize_index_only_tile(tile);
         return tile;
     }
 
@@ -2706,5 +2840,6 @@ nlohmann::json encode_quadtree_json(
         tile["children"] = nlohmann::json::array();
     }
 
+    finalize_index_only_tile(tile);
     return tile;
 }

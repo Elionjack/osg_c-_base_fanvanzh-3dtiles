@@ -80,6 +80,11 @@ vcpkg install osg gdal glm eigen3 tinygltf geographiclib nlohmann-json stb
 # 可选
 vcpkg install draco meshoptimizer basisu
 
+# 如需启用 src1.1 的 GPU 纹理压缩，请改用仓库内 OpenCL 版 BasisU
+vcpkg remove basisu:x64-windows
+vcpkg install basisu:x64-windows \
+  --overlay-ports=./vcpkg-overlay
+
 # 2. 配置 CMake（Windows）
 cmake -B out/build/x64-Debug -G Ninja \
   -DCMAKE_TOOLCHAIN_FILE=D:/vcpkg/scripts/buildsystems/vcpkg.cmake \
@@ -415,13 +420,14 @@ src/ 和 src1.1/ 现在共享完整的网格处理管线。核心差异仅在于
 | `--enable-top-reconstruct` | 构建四叉树 HLOD（逐级合并生成简化 GLB） | off |
 | `--no-parallel` | 禁用多线程 tile 转换（默认开启并行） | off（即默认并行） |
 | `--split-json` | 将 tileset.json 分割为根索引 + `subtilesets/` 外部子瓦片集 | off |
-| `--split-depth` | HLOD 四叉树分割显示层级（1=顶层每节点一个子瓦片集） | 1 |
+| `--split-depth` | HLOD 四叉树分割显示层级（0=按目标瓦片数自动选择） | 0 |
+| `--split-target-tiles` | 自动分割时每个 HLOD 外部 JSON 的目标源瓦片数 | 256 |
 | `--lod-step` | 单子节点 LOD 链每隔 N 级保留一级（1=不裁剪） | 2 |
 | `--no-fine-merge` | 禁用最细层空间子树聚合 | off |
 | `--fine-merge-max-sources` | 单个细节聚合 GLB 最多包含的叶级源文件数 | 16 |
 | `--fine-merge-max-input-mb` | 单个细节聚合的源 OSGB 总大小上限（MB） | 64 |
-| `--hlod-max-source-tiles` | 单个 HLOD GLB 最多合并的源瓦片数（0=不限制）；超限节点仅作空间索引 | 16 |
-| `--hlod-max-output-mb` | HLOD GLB 输出大小硬上限（0=不限制）；超限节点仅作空间索引 | 8 |
+| `--hlod-max-source-tiles` | 兼容参数；逐级直接子粗模合并不再因源瓦片总数制造空 HLOD 节点 | 16 |
+| `--hlod-max-output-mb` | HLOD GLB 大小告警阈值（0=关闭告警），不会丢弃粗模 | 8 |
 | `--max-lvl` | 转换并写入 tileset 的最大源 LOD 层级 | 100 |
 | `--top-texture-max-size` | Root GLB 纹理最大尺寸（0=不限制） | 512 |
 | `--simplify-ratio` | Meshopt 简化目标比例（1.0=不简化） | 0.5 |
@@ -429,10 +435,16 @@ src/ 和 src1.1/ 现在共享完整的网格处理管线。核心差异仅在于
 | `--draco-normal-bits` | Draco 法向量化位数 | 10 |
 | `--draco-uv-bits` | Draco UV 量化位数 | 12 |
 | `--ktx2-quality` | KTX2 编码质量 (1-255，越低越快) | 128 |
+| `--gpu-texture-compress` | 使用 BasisU OpenCL 加速 ETC1S；不可用时自动回退 CPU | off |
+| `--gpu-texture-serialize` | 串行提交 OpenCL 命令，用于规避个别显卡驱动并发问题 | off |
 | `--threads` | 工作线程数（0=自动=CPU 核心数） | 0 |
-
 | `--geoid` | 大地水准面模型：`none`/`egm84`/`egm96`/`egm2008` | none |
 | `--geoid-path` | 大地水准面数据文件路径 | 自动 |
+
+> GPU 纹理压缩要求 BasisU 以 `BASISU_OPENCL=ON` 编译。vcpkg 默认端口通常关闭此选项；
+> 如果启动日志出现 `OpenCL requested but unavailable`，需要用开启该 CMake 选项的
+> BasisU overlay port 重新安装。GPU 模式只作用于 ETC1S，生成结果仍为 Cesium 可用的
+> `KHR_texture_basisu` KTX2；无需改变 tileset 或 glTF 扩展。
 
 ## 许可证
 
@@ -531,11 +543,11 @@ Step 4.2: build_quadtree()
        │
        ▼
 Step 4.3: 逐级合并生成 GLB
-  ├── build_merged_glb(leaf_paths, level, ...)
-  │   - 加载所有子节点 OSGB 文件
+  ├── Level 0 从本区域 coarsest OSGB 生成粗模
+  ├── Level 1+ 只合并直接子节点已经生成的粗模
   │   - 纹理去重（hash 采样）
-  │   - calc_level_ratio(level, base_ratio) = base_ratio × 0.25^level
-  │   - 逐级简化：level 越高（越粗），简化越多
+  │   - 每升一级继续按 0.25 简化并逐级降低纹理尺寸
+  │   - 子节点失败时仅回退收集该子区域原始 OSGB，避免区域缺失
   └── 输出: Data/HLOD/root.glb, L0_X+0000_Y+0000.glb, ...
        │
        ▼
@@ -546,6 +558,8 @@ Step 5: encode_quadtree_json()
 
 **关键设计点：**
 - 叶子节点保留 PagedLOD 原始 GLB（不修改），作为 HLOD level-0 的 children
+- 无 content 的索引层会被压平，并使用高 geometricError 强制 Cesium 继续细化
+- HLOD 根节点必须成功生成可显示的 `root.glb`，否则转换直接报错而不输出空根 tileset
 - 合并后的 GLB 写入 `Data/HLOD/` 目录
 - tileset.json root 直接使用 quadtree 结构（替代 flat children 列表）
 - 单 tile 数据集的 2×2 区域不合并（保持原始质量）
@@ -558,7 +572,10 @@ Step 5: encode_quadtree_json()
 # Flat 模式：每个顶层 Tile 树一个子瓦片集
 ./osgb_converter_1_1 -i input -o output --split-json
 
-# HLOD 模式：在四叉树显示层级 2 处切割
+# HLOD 模式：自动选择分割深度，使每个外部 JSON 约含 256 个源 Tile
+./osgb_converter_1_1 -i input -o output --enable-top-reconstruct --split-json
+
+# 也可手动固定分割深度
 ./osgb_converter_1_1 -i input -o output --enable-top-reconstruct --split-json --split-depth 2
 ```
 
@@ -568,7 +585,7 @@ Step 5: encode_quadtree_json()
 output_dir/
 ├── tileset.json                       ← 根索引（仅轻量引用瓦片）
 ├── subtilesets/
-│   ├── Tile_-051_+050.json            ← Flat 模式 / PagedLOD 外置子树
+│   ├── Tile_-051_+050.json            ← Flat 模式外置子树
 │   ├── HLOD_L1_X+000_Y+000.json       ← HLOD 模式：按 --split-depth 切割的四叉树子树
 │   └── ...
 └── Data/...
@@ -577,7 +594,8 @@ output_dir/
 **分割行为：**
 
 - **Flat 模式**（未开 HLOD）：每个顶层 Tile 树写为独立的 `subtilesets/<stem>.json`，根 tileset.json 只保留轻量引用瓦片（boundingVolume + content.uri + geometricError）
-- **HLOD 模式**：`encode_quadtree_json()` 在显示层级 == `--split-depth` 处切割四叉树，整个子树写为外部子瓦片集 `HLOD_L{level}_X±xxxx_Y±yyyy.json`；同时 level-0 的 PagedLOD 子树也外置为 `subtilesets/<stem>.json`——PagedLOD 树每棵可含数百层 LOD 节点，是 HLOD 模式 JSON 体积过大的主要来源
+- **HLOD 模式**：默认依据 `--split-target-tiles` 自动选择分割深度，也可通过 `--split-depth` 固定；每个空间 HLOD 分片内部直接嵌入 PagedLOD 树，不再为每个源 Tile 额外生成一个 JSON，从而把原先数千个 HTTP 请求压缩为少量空间分片请求
+- Web 服务建议启用 HTTP/2 和长期静态缓存，进一步降低并发调度与重复传输成本
 - **URI 重写**：子瓦片集位于 `subtilesets/`（比根低一级），内部所有 `./Data/...` URI 自动改写为 `../Data/...`
 - 每个子瓦片集是完整合法的 3D Tiles 1.1 tileset（含 `asset.version` 和 `3DTILES_content_gltf` 声明）
 

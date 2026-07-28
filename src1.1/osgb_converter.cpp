@@ -3,6 +3,7 @@
 #include "coordinate_system.h"
 #include "coordinate_transformer.h"
 #include "geoid_height.h"
+#include "mesh_processor.h"
 
 #include <nlohmann/json.hpp>
 #include <ogr_spatialref.h>
@@ -444,6 +445,13 @@ static size_t aggregate_fine_lod_subtrees(
 // Main conversion entry point
 // ============================================================
 int convert_osgb(const ConvertOptions& opts) {
+    if (opts.enable_texture_compress) {
+        const bool gpu_active = initialize_ktx2_encoder(
+            opts.enable_gpu_texture_compress, opts.gpu_texture_serialize);
+        LOG_I("KTX2 encoder: requested=%s, active=%s, quality=%d",
+              opts.enable_gpu_texture_compress ? "OpenCL GPU" : "CPU",
+              gpu_active ? "OpenCL GPU" : "CPU", opts.ktx2_quality);
+    }
     using namespace std::chrono;
     auto tick = high_resolution_clock::now();
 
@@ -902,26 +910,30 @@ int convert_osgb(const ConvertOptions& opts) {
                         merge_node(child);
                     }
 
-                    // Collect all leaf OSGB paths under this node
-                    std::vector<std::string> leaf_paths;
-                    collect_leaf_paths(node, grid, leaf_paths);
-
-                    if (leaf_paths.empty()) {
-                        LOG_W("HLOD merge: level %d node at (%d,%d) has no leaf paths, skipping",
-                              node.level, node.grid_x, node.grid_y);
-                        node.has_content = false;
-                        return;
+                    // Level 0 is seeded from at most four coarsest source
+                    // OSGBs. Every upper level consumes only the uncompressed
+                    // coarse intermediates produced by its direct children.
+                    std::vector<std::string> source_paths;
+                    std::vector<HlodIntermediatePtr> child_intermediates;
+                    if (node.level == 0) {
+                        source_paths = node.leaf_coarsest_paths;
+                    } else {
+                        for (auto& child : node.children) {
+                            if (child.intermediate) {
+                                child_intermediates.push_back(child.intermediate);
+                            } else {
+                                // A failed child must not leave a hole in its
+                                // parent overview. Fall back only for that
+                                // child's source region.
+                                collect_leaf_paths(child, grid, source_paths);
+                            }
+                        }
                     }
 
-                    // Large upper-level merges create GLBs with thousands of
-                    // textures. Keep those nodes as spatial indexes only.
-                    if (opts.hlod_max_source_tiles > 0
-                        && leaf_paths.size() > static_cast<size_t>(opts.hlod_max_source_tiles)) {
-                        LOG_I("HLOD index-only: level %d node at (%d,%d), %zu sources > limit %d",
-                              node.level, node.grid_x, node.grid_y, leaf_paths.size(),
-                              opts.hlod_max_source_tiles);
+                    if (source_paths.empty() && child_intermediates.empty()) {
+                        LOG_W("HLOD merge: level %d node at (%d,%d) has no coarse inputs, skipping",
+                              node.level, node.grid_x, node.grid_y);
                         node.has_content = false;
-                        node.glb_uri.clear();
                         return;
                     }
 
@@ -939,31 +951,35 @@ int convert_osgb(const ConvertOptions& opts) {
 
                     // Pass node.level + 1 to preserve calc_level_ratio semantics:
                     // level 0 (first merge) → ratio = 0.25, level 1 → 0.0625, etc.
-                    LOG_I("HLOD merge: %s (level=%d, %zu leaf paths, grid=(%d,%d) size=%d)",
-                          glb_name.c_str(), node.level, leaf_paths.size(),
+                    LOG_I("HLOD merge: %s (level=%d, %zu OSGB fallbacks, %zu direct child models, grid=(%d,%d) size=%d)",
+                          glb_name.c_str(), node.level, source_paths.size(),
+                          child_intermediates.size(),
                           node.grid_x, node.grid_y, node.grid_size);
 
                     std::string glb_buf;
                     TileBox merged_bbox;
                     bool ok = build_merged_glb(
-                        leaf_paths, node.level + 1, glb_buf, merged_bbox,
+                        source_paths, node.level + 1, glb_buf, merged_bbox,
                         opts.enable_texture_compress, opts.enable_meshopt,
                         opts.enable_draco, opts.enable_unlit,
                         opts.top_texture_max_size, opts.simplify_ratio,
                         opts.draco_pos_bits, opts.draco_normal_bits, opts.draco_uv_bits,
-                        opts.ktx2_quality);
+                        opts.ktx2_quality, child_intermediates, &node.intermediate);
+
+                    // The parent now owns deep copies of the direct-child
+                    // intermediates. Release child levels immediately to keep
+                    // peak memory bounded during the bottom-up build.
+                    for (auto& child : node.children)
+                        child.intermediate.reset();
 
                     if (ok && !glb_buf.empty()) {
                         const size_t max_hlod_bytes =
                             static_cast<size_t>(opts.hlod_max_output_mb) * 1024u * 1024u;
                         if (opts.hlod_max_output_mb > 0
                             && glb_buf.size() > max_hlod_bytes) {
-                            LOG_W("  HLOD index-only: generated content %.2f MB exceeds limit %d MB",
+                            LOG_W("  HLOD content %.2f MB exceeds advisory limit %d MB; keeping drawable fallback",
                                   glb_buf.size() / (1024.0 * 1024.0),
                                   opts.hlod_max_output_mb);
-                            node.has_content = false;
-                            node.glb_uri.clear();
-                            return;
                         }
 
                         fs::path glb_path = hlod_dir / glb_name;
@@ -976,15 +992,23 @@ int convert_osgb(const ConvertOptions& opts) {
                         } else {
                             LOG_E("  failed to write: %s", glb_path.string().c_str());
                             node.has_content = false;
+                            node.glb_uri.clear();
                         }
                     } else {
                         LOG_W("  merge failed for level %d node at (%d,%d)",
                               node.level, node.grid_x, node.grid_y);
                         node.has_content = false;
+                        node.glb_uri.clear();
+                        node.intermediate.reset();
                     }
                 };
 
                 merge_node(quadtree_root);
+
+                if (!quadtree_root.has_content || quadtree_root.glb_uri.empty()) {
+                    LOG_E("HLOD root coarse model generation failed; refusing to emit an empty-root tileset");
+                    return 1;
+                }
 
                 LOG_I("Phase 4 complete: HLOD quadtree built (%d levels)", root_level);
             } else {
@@ -1088,8 +1112,27 @@ int convert_osgb(const ConvertOptions& opts) {
         // HLOD mode: root tile is the quadtree root.
         // When split_json is enabled, writes sub-tilesets at the specified
         // display level and returns reference tiles instead of full subtrees.
-        int split_d = opts.enable_split_json ? opts.split_depth : 0;
-        bool do_split = (split_d > 0);
+        int split_d = 0;
+        if (opts.enable_split_json) {
+            if (opts.split_depth > 0) {
+                split_d = std::min(opts.split_depth, quadtree_root.level);
+            } else {
+                // Select a uniform spatial split depth so each external HLOD
+                // JSON contains roughly split_target_tiles source tile trees.
+                // Keep at least one lightweight root-index level.
+                split_d = 1;
+                size_t shard_count = 4;
+                while (split_d < quadtree_root.level
+                       && (tile_results.size() + shard_count - 1) / shard_count
+                            > static_cast<size_t>(opts.split_target_tiles)) {
+                    ++split_d;
+                    shard_count *= 4;
+                }
+                LOG_I("split-json auto depth=%d, target=%d source tiles/shard, estimated shards=%zu",
+                      split_d, opts.split_target_tiles, shard_count);
+            }
+        }
+        bool do_split = opts.enable_split_json && split_d > 0;
         std::string out_dir_str = do_split ? out_dir.string() : "";
         json quadtree_json = encode_quadtree_json(
             quadtree_root, tile_jsons_map,
@@ -1097,15 +1140,19 @@ int convert_osgb(const ConvertOptions& opts) {
             quadtree_root.level,     // root_level of quadtree
             split_d,
             out_dir_str,
-            do_split);               // externalize_pagedlod = true when split enabled
+            false);                  // embed PagedLOD trees inside spatial HLOD shards
 
         // Add ECEF transform to root
         quadtree_json["transform"] = trans_vec;
         quadtree_json["boundingVolume"]["box"] = box_to_tileset_box(root_box);
 
-        // Root GE computed from quadtree hierarchy (no cap)
-        quadtree_json["geometricError"] = root_ge;
-        root_tileset["geometricError"] = root_ge;
+        // encode_quadtree_json raises the GE of an index-only root so Cesium
+        // cannot stop refinement at a tile that has no drawable content.
+        // Preserve that effective value instead of overwriting it with the
+        // finite quadtree approximation error.
+        const double encoded_root_ge =
+            quadtree_json.value("geometricError", root_ge);
+        root_tileset["geometricError"] = encoded_root_ge;
 
         root_tileset["root"] = quadtree_json;
     } else {
