@@ -3,6 +3,7 @@
 #include "coordinate_system.h"
 #include "coordinate_transformer.h"
 #include "geoid_height.h"
+#include "mesh_processor.h"
 
 #include <nlohmann/json.hpp>
 #include <ogr_spatialref.h>
