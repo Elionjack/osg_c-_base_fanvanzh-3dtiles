@@ -58,12 +58,6 @@ struct MeshoptCompressionResult {
 };
 
 // Function to compress image data to KTX2 using Basis Universal
-// Initializes BasisU once. When use_gpu is true, ETC1S compression uses
-// OpenCL if the linked BasisU library was built with BASISU_OPENCL=ON.
-// Returns true when an OpenCL device is actually available.
-bool initialize_ktx2_encoder(bool use_gpu = false,
-                             bool opencl_force_serialization = false);
-
 bool compress_to_ktx2(const std::vector<unsigned char>& rgba_data, int width, int height,
                       std::vector<unsigned char>& ktx2_data, int quality = 128);
 

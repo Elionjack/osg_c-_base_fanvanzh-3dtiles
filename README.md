@@ -429,14 +429,8 @@ src/ 和 src1.1/ 现在共享完整的网格处理管线。核心差异仅在于
 | `--draco-normal-bits` | Draco 法向量化位数 | 10 |
 | `--draco-uv-bits` | Draco UV 量化位数 | 12 |
 | `--ktx2-quality` | KTX2 编码质量 (1-255，越低越快) | 128 |
-| `--gpu-texture-compress` | 使用 BasisU OpenCL 加速 ETC1S；不可用时自动回退 CPU | off |
-| `--gpu-texture-serialize` | 串行提交 OpenCL 命令，用于规避个别显卡驱动并发问题 | off |
 | `--threads` | 工作线程数（0=自动=CPU 核心数） | 0 |
 
-> GPU 纹理压缩要求 BasisU 以 `BASISU_OPENCL=ON` 编译。vcpkg 默认端口通常关闭此选项；
-> 如果启动日志出现 `OpenCL requested but unavailable`，需要用开启该 CMake 选项的
-> BasisU overlay port 重新安装。GPU 模式只作用于 ETC1S，生成结果仍为 Cesium 可用的
-> `KHR_texture_basisu` KTX2；无需改变 tileset 或 glTF 扩展。
 | `--geoid` | 大地水准面模型：`none`/`egm84`/`egm96`/`egm2008` | none |
 | `--geoid-path` | 大地水准面数据文件路径 | 自动 |
 

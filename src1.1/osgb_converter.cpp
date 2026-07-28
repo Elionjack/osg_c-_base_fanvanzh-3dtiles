@@ -3,7 +3,6 @@
 #include "coordinate_system.h"
 #include "coordinate_transformer.h"
 #include "geoid_height.h"
-#include "mesh_processor.h"
 
 #include <nlohmann/json.hpp>
 #include <ogr_spatialref.h>
@@ -445,13 +444,6 @@ static size_t aggregate_fine_lod_subtrees(
 // Main conversion entry point
 // ============================================================
 int convert_osgb(const ConvertOptions& opts) {
-    if (opts.enable_texture_compress) {
-        const bool gpu_active = initialize_ktx2_encoder(
-            opts.enable_gpu_texture_compress, opts.gpu_texture_serialize);
-        LOG_I("KTX2 encoder: requested=%s, active=%s, quality=%d",
-              opts.enable_gpu_texture_compress ? "OpenCL GPU" : "CPU",
-              gpu_active ? "OpenCL GPU" : "CPU", opts.ktx2_quality);
-    }
     using namespace std::chrono;
     auto tick = high_resolution_clock::now();
 

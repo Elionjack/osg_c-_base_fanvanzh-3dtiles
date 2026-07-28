@@ -20,8 +20,6 @@ struct ConvertOptions {
     bool enable_parallel = true;     // multi-threaded tile conversion
     int  num_threads = 0;            // thread count (0=auto: hardware_concurrency)
     int  ktx2_quality = 128;         // basisu encoding quality (lower=faster, 1-255)
-    bool enable_gpu_texture_compress = false; // BasisU ETC1S OpenCL acceleration
-    bool gpu_texture_serialize = false;       // serialize OpenCL queues for unstable drivers
 
     // Geoid
     std::string geoid_model = "none";

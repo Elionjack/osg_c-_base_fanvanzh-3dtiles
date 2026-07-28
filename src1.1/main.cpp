@@ -51,8 +51,6 @@ struct HardcodedConfig {
     int  draco_normal_bits;
     int  draco_uv_bits;
     int  ktx2_quality;
-    bool enable_gpu_texture_compress;
-    bool gpu_texture_serialize;
     bool enable_parallel;
     int  num_threads;
     bool enable_split_json;
@@ -86,8 +84,6 @@ static const HardcodedConfig g_config = {
     /* draco_normal_bits */ 10,
     /* draco_uv_bits */ 12,
     /* ktx2_quality */ 128,
-    /* gpu texture compress */ false,
-    /* gpu texture serialize */ false,
     /* enable_parallel */ true,
     /* num_threads     */ 0,
     /* enable_split_json */ false,
@@ -323,8 +319,6 @@ static void print_usage(const char* prog) {
         "  --draco-normal-bits N   Draco normal quant bits (default: 10)\n"
         "  --draco-uv-bits N       Draco UV quant bits (default: 12)\n"
         "  --ktx2-quality N      KTX2 encode quality (1-255, lower=faster, default: 128)\n"
-        "  --gpu-texture-compress Enable BasisU ETC1S OpenCL GPU compression\n"
-        "  --gpu-texture-serialize Serialize OpenCL queues (driver workaround)\n"
         "  --no-parallel           Disable all multi-threading (Phase 1 + Phase 2)\n"
         "  --threads N             Number of worker threads (default: auto=CPU cores)\n"
         "  --split-json            Split tileset.json into root index + sub-tilesets\n"
@@ -378,8 +372,6 @@ int main(int argc, char* argv[]) {
     opts.draco_normal_bits       = g_config.draco_normal_bits;
     opts.draco_uv_bits           = g_config.draco_uv_bits;
     opts.ktx2_quality            = g_config.ktx2_quality;
-    opts.enable_gpu_texture_compress = g_config.enable_gpu_texture_compress;
-    opts.gpu_texture_serialize   = g_config.gpu_texture_serialize;
     opts.enable_parallel         = g_config.enable_parallel;
     opts.num_threads             = g_config.num_threads;
     opts.enable_split_json       = g_config.enable_split_json;
@@ -422,11 +414,6 @@ int main(int argc, char* argv[]) {
             opts.enable_meshopt = true;
         } else if (arg == "--enable-texture-compress") {
             opts.enable_texture_compress = true;
-        } else if (arg == "--gpu-texture-compress") {
-            opts.enable_texture_compress = true;
-            opts.enable_gpu_texture_compress = true;
-        } else if (arg == "--gpu-texture-serialize") {
-            opts.gpu_texture_serialize = true;
         } else if (arg == "--enable-lod") {
             LOG_I("LOD enabled (not fully implemented)");
         } else if (arg == "--enable-unlit") {
