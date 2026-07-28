@@ -7,13 +7,16 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <atomic>
 #include <cmath>
 #include <algorithm>
+#include <cstdio>
 
 // ============================================================
 // Required dependencies (unconditional — must be available)
 // ============================================================
 #include <basisu/encoder/basisu_comp.h>
+#include <basisu/encoder/basisu_opencl.h>
 #include <basisu/transcoder/basisu_transcoder.h>
 #include <meshoptimizer.h>
 #include "draco/compression/encode.h"
@@ -36,13 +39,41 @@ static void write_buf_callback(void* context, void* data, int len) {
 // ============================================================
 // KTX2 Compression (requires basisu)
 // ============================================================
+namespace {
+std::once_flag g_basisu_init;
+std::atomic<bool> g_basisu_opencl_available{false};
+}
+
+bool initialize_ktx2_encoder(bool use_gpu, bool opencl_force_serialization) {
+    std::call_once(g_basisu_init, [use_gpu, opencl_force_serialization]() {
+        const bool initialized = basisu::basisu_encoder_init(
+            use_gpu, use_gpu && opencl_force_serialization);
+        const bool opencl_available = initialized && use_gpu && basisu::opencl_is_available();
+        g_basisu_opencl_available.store(opencl_available, std::memory_order_release);
+
+        if (use_gpu && opencl_available) {
+            std::fprintf(stderr,
+                "[KTX2] BasisU ETC1S OpenCL GPU acceleration enabled%s\n",
+                opencl_force_serialization ? " (serialized command queues)" : "");
+        } else if (use_gpu) {
+            std::fprintf(stderr,
+                "[KTX2] OpenCL requested but unavailable; falling back to CPU. "
+                "Rebuild BasisU with BASISU_OPENCL=ON.\n");
+        } else {
+            std::fprintf(stderr, "[KTX2] BasisU ETC1S CPU encoder enabled\n");
+        }
+    });
+    return g_basisu_opencl_available.load(std::memory_order_acquire);
+}
+
 bool compress_to_ktx2(const std::vector<unsigned char>& rgba_data, int width, int height,
                       std::vector<unsigned char>& ktx2_data, int quality) {
     try {
         if (rgba_data.empty() || width <= 0 || height <= 0) return false;
 
-        static std::once_flag basisu_init;
-        std::call_once(basisu_init, []() { basisu::basisu_encoder_init(); });
+        // Normal conversion initializes this explicitly before worker threads start.
+        // This fallback preserves compatibility for direct callers of this function.
+        initialize_ktx2_encoder(false, false);
 
         basisu::vector<basisu::image> source_images;
         source_images.push_back(basisu::image(rgba_data.data(), width, height, 4));
@@ -53,8 +84,12 @@ bool compress_to_ktx2(const std::vector<unsigned char>& rgba_data, int width, in
         // When tiles are already processed in parallel (Phase 2), enabling
         // basisu's internal threads would cause N×M thread oversubscription.
         unsigned int flags = quality_level | basisu::cFlagKTX2 | basisu::cFlagGenMipsWrap;
+        if (g_basisu_opencl_available.load(std::memory_order_acquire))
+            flags |= basisu::cFlagUseOpenCL;
         void* pKTX2_data = basisu::basis_compress(
             basist::basis_tex_format::cETC1S, source_images, flags, 1.0f, &file_size, nullptr);
+
+        if (!pKTX2_data || file_size == 0) return false;
 
         ktx2_data.assign((unsigned char*)pKTX2_data, (unsigned char*)pKTX2_data + file_size);
         basisu::basis_free_data(pKTX2_data);

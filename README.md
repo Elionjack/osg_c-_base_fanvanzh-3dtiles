@@ -416,13 +416,27 @@ src/ 和 src1.1/ 现在共享完整的网格处理管线。核心差异仅在于
 | `--no-parallel` | 禁用多线程 tile 转换（默认开启并行） | off（即默认并行） |
 | `--split-json` | 将 tileset.json 分割为根索引 + `subtilesets/` 外部子瓦片集 | off |
 | `--split-depth` | HLOD 四叉树分割显示层级（1=顶层每节点一个子瓦片集） | 1 |
+| `--lod-step` | 单子节点 LOD 链每隔 N 级保留一级（1=不裁剪） | 2 |
+| `--no-fine-merge` | 禁用最细层空间子树聚合 | off |
+| `--fine-merge-max-sources` | 单个细节聚合 GLB 最多包含的叶级源文件数 | 16 |
+| `--fine-merge-max-input-mb` | 单个细节聚合的源 OSGB 总大小上限（MB） | 64 |
+| `--hlod-max-source-tiles` | 单个 HLOD GLB 最多合并的源瓦片数（0=不限制）；超限节点仅作空间索引 | 16 |
+| `--hlod-max-output-mb` | HLOD GLB 输出大小硬上限（0=不限制）；超限节点仅作空间索引 | 8 |
+| `--max-lvl` | 转换并写入 tileset 的最大源 LOD 层级 | 100 |
 | `--top-texture-max-size` | Root GLB 纹理最大尺寸（0=不限制） | 512 |
 | `--simplify-ratio` | Meshopt 简化目标比例（1.0=不简化） | 0.5 |
 | `--draco-pos-bits` | Draco 位置量化位数 | 11 |
 | `--draco-normal-bits` | Draco 法向量化位数 | 10 |
 | `--draco-uv-bits` | Draco UV 量化位数 | 12 |
 | `--ktx2-quality` | KTX2 编码质量 (1-255，越低越快) | 128 |
+| `--gpu-texture-compress` | 使用 BasisU OpenCL 加速 ETC1S；不可用时自动回退 CPU | off |
+| `--gpu-texture-serialize` | 串行提交 OpenCL 命令，用于规避个别显卡驱动并发问题 | off |
 | `--threads` | 工作线程数（0=自动=CPU 核心数） | 0 |
+
+> GPU 纹理压缩要求 BasisU 以 `BASISU_OPENCL=ON` 编译。vcpkg 默认端口通常关闭此选项；
+> 如果启动日志出现 `OpenCL requested but unavailable`，需要用开启该 CMake 选项的
+> BasisU overlay port 重新安装。GPU 模式只作用于 ETC1S，生成结果仍为 Cesium 可用的
+> `KHR_texture_basisu` KTX2；无需改变 tileset 或 glTF 扩展。
 | `--geoid` | 大地水准面模型：`none`/`egm84`/`egm96`/`egm2008` | none |
 | `--geoid-path` | 大地水准面数据文件路径 | 自动 |
 

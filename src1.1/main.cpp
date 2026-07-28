@@ -51,10 +51,18 @@ struct HardcodedConfig {
     int  draco_normal_bits;
     int  draco_uv_bits;
     int  ktx2_quality;
+    bool enable_gpu_texture_compress;
+    bool gpu_texture_serialize;
     bool enable_parallel;
     int  num_threads;
     bool enable_split_json;
     int  split_depth;
+    int  lod_step;
+    bool enable_fine_merge;
+    int  fine_merge_max_sources;
+    int  fine_merge_max_input_mb;
+    int  hlod_max_source_tiles;
+    int  hlod_max_output_mb;
     double override_lon;
     double override_lat;
     double override_alt;
@@ -78,10 +86,18 @@ static const HardcodedConfig g_config = {
     /* draco_normal_bits */ 10,
     /* draco_uv_bits */ 12,
     /* ktx2_quality */ 128,
+    /* gpu texture compress */ false,
+    /* gpu texture serialize */ false,
     /* enable_parallel */ true,
     /* num_threads     */ 0,
     /* enable_split_json */ false,
     /* split_depth     */ 1,
+    /* lod_step        */ 2,
+    /* enable_fine_merge */ true,
+    /* fine_merge_max_sources */ 16,
+    /* fine_merge_max_input_mb */ 64,
+    /* hlod_max_source_tiles */ 16,
+    /* hlod_max_output_mb */ 8,
     /* override_lon */ 0.0,
     /* override_lat */ 0.0,
     /* override_alt */ 0.0,
@@ -307,10 +323,19 @@ static void print_usage(const char* prog) {
         "  --draco-normal-bits N   Draco normal quant bits (default: 10)\n"
         "  --draco-uv-bits N       Draco UV quant bits (default: 12)\n"
         "  --ktx2-quality N      KTX2 encode quality (1-255, lower=faster, default: 128)\n"
+        "  --gpu-texture-compress Enable BasisU ETC1S OpenCL GPU compression\n"
+        "  --gpu-texture-serialize Serialize OpenCL queues (driver workaround)\n"
         "  --no-parallel           Disable all multi-threading (Phase 1 + Phase 2)\n"
         "  --threads N             Number of worker threads (default: auto=CPU cores)\n"
         "  --split-json            Split tileset.json into root index + sub-tilesets\n"
         "  --split-depth N         Split depth (default: 1, 1=per top-level tile)\n"
+        "  --lod-step N            Keep every Nth single-child LOD node (default: 2, 1=off)\n"
+        "  --no-fine-merge         Disable finest-LOD subtree aggregation\n"
+        "  --fine-merge-max-sources N  Max leaf files per fine aggregate (default: 16)\n"
+        "  --fine-merge-max-input-mb N  Max source MB per fine aggregate (default: 64)\n"
+        "  --hlod-max-source-tiles N  Max source tiles per HLOD GLB (default: 16, 0=unlimited)\n"
+        "  --hlod-max-output-mb N  Max generated HLOD GLB size (default: 8, 0=unlimited)\n"
+        "  --max-lvl N             Maximum source LOD level to convert (default: 100)\n"
         "  --geoid <model>         Geoid model: none, egm84, egm96, egm2008\n"
         "  --geoid-path <path>     Path to geoid data files\n"
         "  --lon <degrees>         Override longitude\n"
@@ -353,10 +378,18 @@ int main(int argc, char* argv[]) {
     opts.draco_normal_bits       = g_config.draco_normal_bits;
     opts.draco_uv_bits           = g_config.draco_uv_bits;
     opts.ktx2_quality            = g_config.ktx2_quality;
+    opts.enable_gpu_texture_compress = g_config.enable_gpu_texture_compress;
+    opts.gpu_texture_serialize   = g_config.gpu_texture_serialize;
     opts.enable_parallel         = g_config.enable_parallel;
     opts.num_threads             = g_config.num_threads;
     opts.enable_split_json       = g_config.enable_split_json;
     opts.split_depth             = g_config.split_depth;
+    opts.lod_step                = g_config.lod_step;
+    opts.enable_fine_merge       = g_config.enable_fine_merge;
+    opts.fine_merge_max_sources  = g_config.fine_merge_max_sources;
+    opts.fine_merge_max_input_mb = g_config.fine_merge_max_input_mb;
+    opts.hlod_max_source_tiles   = g_config.hlod_max_source_tiles;
+    opts.hlod_max_output_mb      = g_config.hlod_max_output_mb;
 
     if (g_config.override_lon != 0.0) opts.center_x = g_config.override_lon;
     if (g_config.override_lat != 0.0) opts.center_y = g_config.override_lat;
@@ -389,6 +422,11 @@ int main(int argc, char* argv[]) {
             opts.enable_meshopt = true;
         } else if (arg == "--enable-texture-compress") {
             opts.enable_texture_compress = true;
+        } else if (arg == "--gpu-texture-compress") {
+            opts.enable_texture_compress = true;
+            opts.enable_gpu_texture_compress = true;
+        } else if (arg == "--gpu-texture-serialize") {
+            opts.gpu_texture_serialize = true;
         } else if (arg == "--enable-lod") {
             LOG_I("LOD enabled (not fully implemented)");
         } else if (arg == "--enable-unlit") {
@@ -401,6 +439,20 @@ int main(int argc, char* argv[]) {
             opts.enable_split_json = true;
         } else if (arg == "--split-depth" && i + 1 < argc) {
             opts.split_depth = std::stoi(argv[++i]);
+        } else if (arg == "--lod-step" && i + 1 < argc) {
+            opts.lod_step = std::max(1, std::stoi(argv[++i]));
+        } else if (arg == "--no-fine-merge") {
+            opts.enable_fine_merge = false;
+        } else if (arg == "--fine-merge-max-sources" && i + 1 < argc) {
+            opts.fine_merge_max_sources = std::max(2, std::stoi(argv[++i]));
+        } else if (arg == "--fine-merge-max-input-mb" && i + 1 < argc) {
+            opts.fine_merge_max_input_mb = std::max(1, std::stoi(argv[++i]));
+        } else if (arg == "--hlod-max-source-tiles" && i + 1 < argc) {
+            opts.hlod_max_source_tiles = std::max(0, std::stoi(argv[++i]));
+        } else if (arg == "--hlod-max-output-mb" && i + 1 < argc) {
+            opts.hlod_max_output_mb = std::max(0, std::stoi(argv[++i]));
+        } else if (arg == "--max-lvl" && i + 1 < argc) {
+            opts.max_lvl = std::stoi(argv[++i]);
         } else if (arg == "--enable-top-reconstruct" || arg == "--enable-top_reconstruct") {
             opts.enable_top_reconstruct = true;
         } else if (arg == "--top-texture-max-size" && i + 1 < argc) {

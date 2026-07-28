@@ -1507,7 +1507,30 @@ bool compute_tile_output(const FlatTile& tile,
     bool ok = false;
     bool used_cache = false;
 
-    if (tile.tree && tile.tree->cached_node.valid()) {
+    if (tile.tree && !tile.tree->aggregate_sources.empty()) {
+        TileBox aggregate_bbox;
+        ok = build_merged_glb(
+            tile.tree->aggregate_sources,
+            0,
+            glb_buf,
+            aggregate_bbox,
+            opts.enable_texture_compress,
+            opts.enable_meshopt,
+            opts.enable_draco,
+            opts.enable_unlit,
+            0, // preserve source texture dimensions for finest-detail aggregates
+            opts.simplify_ratio,
+            opts.draco_pos_bits,
+            opts.draco_normal_bits,
+            opts.draco_uv_bits,
+            opts.ktx2_quality);
+        if (ok) {
+            minfo.min = aggregate_bbox.min;
+            minfo.max = aggregate_bbox.max;
+        }
+        LOG_I("  compute_tile: fine aggregate (%zu sources)",
+              tile.tree->aggregate_sources.size());
+    } else if (tile.tree && tile.tree->cached_node.valid()) {
         ok = osgb2glb_buf_from_node(
             tile.tree->cached_node.get(),
             get_parent(tile.file_name),
@@ -1605,8 +1628,7 @@ std::string encode_tile_json_1_1(osg_tree& tree, double x, double y) {
         std::string uri = "./" + replace(file_name, ".osgb", tree.type != 2 ? ".glb" : "o.glb");
         tile += "\"" + uri + "\",";
         // 3D Tiles 1.1: declare 3DTILES_content_gltf extension on content
-        tile += " \"extensions\":{\"3DTILES_content_gltf\":{}},";
-        tile += bbox_str;
+        tile += " \"extensions\":{\"3DTILES_content_gltf\":{}}";
         tile += "}";
     }
 
@@ -2565,7 +2587,7 @@ nlohmann::json encode_quadtree_json(
         fs::path sub_path = fs::path(output_dir) / "subtilesets" / sub_name;
         fs::create_directories(sub_path.parent_path());
         std::ofstream ofs(sub_path);
-        ofs << sub_tileset.dump(2);
+        ofs << sub_tileset.dump();
         ofs.close();
 
         LOG_I("  Wrote HLOD sub-tileset: subtilesets/%s", sub_name.c_str());
@@ -2593,9 +2615,6 @@ nlohmann::json encode_quadtree_json(
             nlohmann::json content;
             content["uri"] = node.glb_uri;
             content["extensions"]["3DTILES_content_gltf"] = nlohmann::json::object();
-            TileBox cb = node.bbox;
-            cb.extend(0.2);
-            content["boundingVolume"]["box"] = convert_bbox(cb);
             tile["content"] = content;
         }
 
@@ -2637,7 +2656,7 @@ nlohmann::json encode_quadtree_json(
                 fs::path sub_path = fs::path(output_dir) / "subtilesets" / (stem + ".json");
                 fs::create_directories(sub_path.parent_path());
                 std::ofstream ofs(sub_path);
-                ofs << sub_tileset.dump(2);
+                ofs << sub_tileset.dump();
                 ofs.close();
 
                 // Build a lightweight reference tile for the quadtree
@@ -2669,9 +2688,6 @@ nlohmann::json encode_quadtree_json(
         nlohmann::json content;
         content["uri"] = node.glb_uri;
         content["extensions"]["3DTILES_content_gltf"] = nlohmann::json::object();
-        TileBox cb = node.bbox;
-        cb.extend(0.2);
-        content["boundingVolume"]["box"] = convert_bbox(cb);
         tile["content"] = content;
     }
 

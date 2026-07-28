@@ -302,10 +302,155 @@ static std::vector<double> box_to_tileset_box(const std::vector<double>& box_v) 
     return box_new;
 }
 
+// Remove source LOD nodes above max_lvl before conversion and JSON encoding.
+// This keeps the generated files and the tileset tree in sync.
+static size_t count_tree_nodes(const osg_tree& tree) {
+    size_t count = 1;
+    for (const auto& child : tree.sub_nodes)
+        count += count_tree_nodes(child);
+    return count;
+}
+
+static size_t prune_above_max_level(osg_tree& tree, int max_lvl) {
+    size_t removed = 0;
+    auto& children = tree.sub_nodes;
+    for (auto it = children.begin(); it != children.end();) {
+        const int level = get_lvl_num(it->file_name);
+        if (level >= 0 && level > max_lvl) {
+            removed += count_tree_nodes(*it);
+            it = children.erase(it);
+        } else {
+            removed += prune_above_max_level(*it, max_lvl);
+            ++it;
+        }
+    }
+    return removed;
+}
+
+// PagedLOD datasets often contain long single-child chains. Keep branch
+// points and leaves, but skip intermediate levels according to lod_step.
+static size_t prune_single_child_lod_chains(osg_tree& tree, int lod_step) {
+    if (lod_step <= 1) return 0;
+
+    size_t removed = 0;
+    for (auto& child : tree.sub_nodes)
+        removed += prune_single_child_lod_chains(child, lod_step);
+
+    for (auto& child : tree.sub_nodes) {
+        while (child.type == 1 && child.sub_nodes.size() == 1) {
+            const int level = get_lvl_num(child.file_name);
+            if (level < 0 || level % lod_step == 0)
+                break;
+
+            osg_tree replacement = std::move(child.sub_nodes.front());
+            child = std::move(replacement);
+            ++removed;
+        }
+    }
+    return removed;
+}
+
+static bool collect_finest_leaf_sources(
+    const osg_tree& tree,
+    size_t max_sources,
+    uintmax_t max_input_bytes,
+    std::vector<std::string>& sources,
+    uintmax_t& input_bytes)
+{
+    // Do not merge group/other-geometry nodes into a PagedLOD aggregate.
+    if (tree.type != 1)
+        return false;
+
+    if (tree.sub_nodes.empty()) {
+        if (tree.file_name.empty() || !tree.aggregate_sources.empty())
+            return false;
+
+        std::error_code ec;
+        const uintmax_t bytes = fs::file_size(fs::path(tree.file_name), ec);
+        if (ec) return false;
+
+        if (sources.size() + 1 > max_sources
+            || bytes > max_input_bytes
+            || input_bytes > max_input_bytes - bytes)
+            return false;
+
+        sources.push_back(tree.file_name);
+        input_bytes += bytes;
+        return true;
+    }
+
+    for (const auto& child : tree.sub_nodes) {
+        if (!collect_finest_leaf_sources(
+                child, max_sources, max_input_bytes, sources, input_bytes))
+            return false;
+    }
+    return true;
+}
+
+// Replace the largest qualifying finest-LOD spatial subtree with one
+// synthetic aggregate leaf. The current node's coarse content is retained.
+static size_t aggregate_fine_lod_subtrees(
+    osg_tree& tree,
+    const std::string& tile_stem,
+    size_t max_sources,
+    uintmax_t max_input_bytes,
+    size_t& aggregate_counter,
+    size_t& aggregated_source_count)
+{
+    if (tree.type == 1 && !tree.sub_nodes.empty()) {
+        std::vector<std::string> sources;
+        uintmax_t input_bytes = 0;
+        bool eligible = true;
+        for (const auto& child : tree.sub_nodes) {
+            if (!collect_finest_leaf_sources(
+                    child, max_sources, max_input_bytes, sources, input_bytes)) {
+                eligible = false;
+                break;
+            }
+        }
+
+        if (eligible && sources.size() >= 2) {
+            size_t old_descendants = 0;
+            for (const auto& child : tree.sub_nodes)
+                old_descendants += count_tree_nodes(child);
+
+            char suffix[64];
+            std::snprintf(suffix, sizeof(suffix), "_FINE_MERGE_%05zu.osgb",
+                          aggregate_counter++);
+
+            osg_tree aggregate;
+            aggregate.type = 1;
+            aggregate.file_name =
+                (fs::path(get_parent(tree.file_name)) / (tile_stem + suffix)).string();
+            aggregate.aggregate_sources = std::move(sources);
+
+            aggregated_source_count += aggregate.aggregate_sources.size();
+            tree.sub_nodes.clear();
+            tree.sub_nodes.push_back(std::move(aggregate));
+            return old_descendants > 0 ? old_descendants - 1 : 0;
+        }
+    }
+
+    size_t removed = 0;
+    for (auto& child : tree.sub_nodes) {
+        removed += aggregate_fine_lod_subtrees(
+            child, tile_stem, max_sources, max_input_bytes,
+            aggregate_counter, aggregated_source_count);
+    }
+    return removed;
+}
+
 // ============================================================
 // Main conversion entry point
 // ============================================================
 int convert_osgb(const ConvertOptions& opts) {
+    if (opts.enable_texture_compress) {
+        const bool gpu_active = initialize_ktx2_encoder(
+            opts.enable_gpu_texture_compress, opts.gpu_texture_serialize);
+        LOG_I("KTX2 encoder: requested=%s, active=%s, quality=%d",
+              opts.enable_gpu_texture_compress ? "OpenCL GPU" : "CPU",
+              gpu_active ? "OpenCL GPU" : "CPU", opts.ktx2_quality);
+    }
     using namespace std::chrono;
     auto tick = high_resolution_clock::now();
 
@@ -517,6 +662,33 @@ int convert_osgb(const ConvertOptions& opts) {
         LOG_E("No tile trees were built");
         return 1;
     }
+
+    // Apply source-level filtering before flattening. Doing this here ensures
+    // Phase 2 conversion and Phase 3 JSON encoding see the exact same tree.
+    size_t max_level_pruned = 0;
+    size_t lod_chain_pruned = 0;
+    size_t fine_merge_pruned = 0;
+    size_t fine_merge_count = 0;
+    size_t fine_merge_sources = 0;
+    const uintmax_t fine_merge_max_bytes =
+        static_cast<uintmax_t>(opts.fine_merge_max_input_mb) * 1024u * 1024u;
+    for (auto& tr : all_trees) {
+        max_level_pruned += prune_above_max_level(tr.root, max_lvl);
+        lod_chain_pruned += prune_single_child_lod_chains(tr.root, opts.lod_step);
+        if (opts.enable_fine_merge) {
+            fine_merge_pruned += aggregate_fine_lod_subtrees(
+                tr.root, tr.stem,
+                static_cast<size_t>(opts.fine_merge_max_sources),
+                fine_merge_max_bytes,
+                fine_merge_count, fine_merge_sources);
+        }
+    }
+    LOG_I("Tree pruning: max_lvl removed=%zu, single-child LOD removed=%zu (lod_step=%d)",
+          max_level_pruned, lod_chain_pruned, opts.lod_step);
+    LOG_I("Fine merge: aggregates=%zu, sources=%zu, removed tree nodes=%zu "
+          "(max_sources=%d, max_input_mb=%d)",
+          fine_merge_count, fine_merge_sources, fine_merge_pruned,
+          opts.fine_merge_max_sources, opts.fine_merge_max_input_mb);
 
     // ============================================================
     // Phase 2: Flatten all trees → tile conversion (parallel or serial)
@@ -748,6 +920,18 @@ int convert_osgb(const ConvertOptions& opts) {
                         return;
                     }
 
+                    // Large upper-level merges create GLBs with thousands of
+                    // textures. Keep those nodes as spatial indexes only.
+                    if (opts.hlod_max_source_tiles > 0
+                        && leaf_paths.size() > static_cast<size_t>(opts.hlod_max_source_tiles)) {
+                        LOG_I("HLOD index-only: level %d node at (%d,%d), %zu sources > limit %d",
+                              node.level, node.grid_x, node.grid_y, leaf_paths.size(),
+                              opts.hlod_max_source_tiles);
+                        node.has_content = false;
+                        node.glb_uri.clear();
+                        return;
+                    }
+
                     // Determine output file name
                     std::string glb_name;
                     if (node.level == root_level) {
@@ -777,6 +961,18 @@ int convert_osgb(const ConvertOptions& opts) {
                         opts.ktx2_quality);
 
                     if (ok && !glb_buf.empty()) {
+                        const size_t max_hlod_bytes =
+                            static_cast<size_t>(opts.hlod_max_output_mb) * 1024u * 1024u;
+                        if (opts.hlod_max_output_mb > 0
+                            && glb_buf.size() > max_hlod_bytes) {
+                            LOG_W("  HLOD index-only: generated content %.2f MB exceeds limit %d MB",
+                                  glb_buf.size() / (1024.0 * 1024.0),
+                                  opts.hlod_max_output_mb);
+                            node.has_content = false;
+                            node.glb_uri.clear();
+                            return;
+                        }
+
                         fs::path glb_path = hlod_dir / glb_name;
                         if (write_file(glb_path.string().c_str(),
                                        glb_buf.data(), (unsigned long)glb_buf.size())) {
@@ -952,7 +1148,7 @@ int convert_osgb(const ConvertOptions& opts) {
                 std::string stem = tr.stem;
                 fs::path sub_path = sub_dir / (stem + ".json");
                 std::ofstream sub_ofs(sub_path);
-                sub_ofs << sub_tileset.dump(2);
+                sub_ofs << sub_tileset.dump();
                 sub_ofs.close();
                 LOG_I("  Wrote sub-tileset: subtilesets/%s.json", stem.c_str());
 
@@ -986,7 +1182,7 @@ int convert_osgb(const ConvertOptions& opts) {
 
     fs::path root_json_path = out_dir / "tileset.json";
     std::ofstream root_ofs(root_json_path);
-    root_ofs << root_tileset.dump(2);
+    root_ofs << root_tileset.dump();
     root_ofs.close();
 
     // Cleanup

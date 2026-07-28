@@ -42,6 +42,9 @@ struct osg_tree {
     std::vector<osg_tree> sub_nodes;
     // type: 0=group, 1=PagedLOD nodes (default), 2=Other nodes
     int type = 1;
+    // Non-empty for a synthetic fine-detail tile that merges multiple leaf
+    // OSGB files into one GLB.
+    std::vector<std::string> aggregate_sources;
     // Cached node from Phase 1 — avoids redundant readNodeFiles in Phase 2
     osg::ref_ptr<osg::Node> cached_node;
 };
