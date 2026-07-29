@@ -170,3 +170,9 @@ endif()
 # Minimal dependency — only nlohmann_json
 # ============================================================
 add_subdirectory(tileset_hollow)
+
+# ============================================================
+# Target 4: tileset_json_optimizer
+# Safe JSON-only runtime optimization for existing 3D Tiles output
+# ============================================================
+add_subdirectory(tileset_json_optimizer)

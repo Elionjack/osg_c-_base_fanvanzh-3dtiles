@@ -826,8 +826,8 @@ int convert_osgb(const ConvertOptions& opts) {
 
     for (auto& tr : all_trees) {
         extend_tile_box(tr.root);
-        if (tr.root.bbox.max.empty() || tr.root.bbox.min.empty()) {
-            LOG_E("Empty bounding box for: %s", tr.stem.c_str());
+        if (!is_valid_tile_box(tr.root.bbox)) {
+            LOG_E("Invalid bounding box for: %s", tr.stem.c_str());
             continue;
         }
 
@@ -872,7 +872,7 @@ int convert_osgb(const ConvertOptions& opts) {
         std::vector<double> coarsest_ges;
 
         for (auto& tr : all_trees) {
-            if (tr.root.bbox.max.empty() || tr.root.bbox.min.empty()) continue;
+            if (!is_valid_tile_box(tr.root.bbox)) continue;
             tile_stems.push_back(tr.stem);
 
             double coarsest_ge = 0.0;
@@ -977,22 +977,28 @@ int convert_osgb(const ConvertOptions& opts) {
                             static_cast<size_t>(opts.hlod_max_output_mb) * 1024u * 1024u;
                         if (opts.hlod_max_output_mb > 0
                             && glb_buf.size() > max_hlod_bytes) {
-                            LOG_W("  HLOD content %.2f MB exceeds advisory limit %d MB; keeping drawable fallback",
+                            // Keep the intermediate for the direct parent, but
+                            // omit this oversized drawable.  The JSON encoder
+                            // turns the node into an index tile and forces
+                            // refinement to its spatial children.
+                            LOG_W("  HLOD content %.2f MB exceeds limit %d MB; using index-only node",
                                   glb_buf.size() / (1024.0 * 1024.0),
                                   opts.hlod_max_output_mb);
-                        }
-
-                        fs::path glb_path = hlod_dir / glb_name;
-                        if (write_file(glb_path.string().c_str(),
-                                       glb_buf.data(), (unsigned long)glb_buf.size())) {
-                            node.bbox = merged_bbox;
-                            node.glb_uri = "./Data/HLOD/" + glb_name;
-                            node.has_content = true;
-                            LOG_I("  written: %s (%zu bytes)", glb_path.string().c_str(), glb_buf.size());
-                        } else {
-                            LOG_E("  failed to write: %s", glb_path.string().c_str());
                             node.has_content = false;
                             node.glb_uri.clear();
+                        } else {
+                            fs::path glb_path = hlod_dir / glb_name;
+                            if (write_file(glb_path.string().c_str(),
+                                           glb_buf.data(), (unsigned long)glb_buf.size())) {
+                                node.bbox = merged_bbox;
+                                node.glb_uri = "./Data/HLOD/" + glb_name;
+                                node.has_content = true;
+                                LOG_I("  written: %s (%zu bytes)", glb_path.string().c_str(), glb_buf.size());
+                            } else {
+                                LOG_E("  failed to write: %s", glb_path.string().c_str());
+                                node.has_content = false;
+                                node.glb_uri.clear();
+                            }
                         }
                     } else {
                         LOG_W("  merge failed for level %d node at (%d,%d)",
@@ -1006,8 +1012,14 @@ int convert_osgb(const ConvertOptions& opts) {
                 merge_node(quadtree_root);
 
                 if (!quadtree_root.has_content || quadtree_root.glb_uri.empty()) {
-                    LOG_E("HLOD root coarse model generation failed; refusing to emit an empty-root tileset");
-                    return 1;
+                    const bool has_fallback_descendants =
+                        !quadtree_root.children.empty()
+                        || !quadtree_root.leaf_stems.empty();
+                    if (!has_fallback_descendants) {
+                        LOG_E("HLOD root has neither drawable content nor descendants");
+                        return 1;
+                    }
+                    LOG_W("HLOD root is index-only; Cesium will refine to spatial descendants");
                 }
 
                 LOG_I("Phase 4 complete: HLOD quadtree built (%d levels)", root_level);

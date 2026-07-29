@@ -1,0 +1,30 @@
+OSGB 转 Cesium 3D Tiles（Windows x64）
+======================================
+
+一、使用方法
+
+方法 1：双击“运行转换器.bat”，根据提示输入数据目录和输出目录。
+
+方法 2：在本目录打开 PowerShell，然后运行：
+
+.\osgb_converter_1_1.exe -i "D:\data\osgb" -o "D:\data\3dtiles"
+
+查看全部参数：
+
+.\osgb_converter_1_1.exe --help
+
+
+二、系统要求
+
+1. 64 位 Windows。
+2. 如果程序提示缺少 VCRUNTIME140.dll 或 MSVCP140.dll，请安装：
+   Microsoft Visual C++ 2015–2022 Redistributable (x64)
+3. 使用 --gpu-texture-compress 时，需要安装支持 OpenCL 的显卡驱动。
+
+
+三、注意事项
+
+1. 不要只复制 EXE；DLL、osgPlugins-3.6.5、gdal 和 proj 都是运行所需文件。
+2. 可以移动整个解压目录，但不要改变目录内部结构。
+3. 输入目录和输出目录可以包含空格，路径两侧需要使用英文双引号。
+

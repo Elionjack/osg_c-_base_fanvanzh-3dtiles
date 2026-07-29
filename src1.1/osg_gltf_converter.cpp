@@ -321,9 +321,31 @@ osg_tree get_all_tree(std::string& file_name) {
 // ============================================================
 // Bounding box helpers
 // ============================================================
+bool is_valid_tile_box(const TileBox& box) {
+    if (box.min.size() < 3 || box.max.size() < 3) return false;
+
+    // 1e38 is used internally as the uninitialized bbox sentinel.  Reject
+    // sentinel-like values here so they can never become effectively-global
+    // 3D Tiles bounding volumes and defeat Cesium's spatial culling.
+    constexpr double kMaxReasonableCoordinate = 1.0e30;
+    for (int i = 0; i < 3; ++i) {
+        if (!std::isfinite(box.min[i]) || !std::isfinite(box.max[i])
+            || std::abs(box.min[i]) >= kMaxReasonableCoordinate
+            || std::abs(box.max[i]) >= kMaxReasonableCoordinate
+            || box.min[i] > box.max[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
 void expend_box(TileBox& box, TileBox& box_new) {
-    if (box_new.max.empty() || box_new.min.empty()) return;
-    if (box.max.empty()) { box.max = box_new.max; box.min = box_new.min; return; }
+    if (!is_valid_tile_box(box_new)) return;
+    if (!is_valid_tile_box(box)) {
+        box.max = box_new.max;
+        box.min = box_new.min;
+        return;
+    }
     for (int i = 0; i < 3; i++) {
         if (box.min[i] > box_new.min[i]) box.min[i] = box_new.min[i];
         if (box.max[i] < box_new.max[i]) box.max[i] = box_new.max[i];
@@ -1116,6 +1138,13 @@ bool osgb2glb_buf_from_node(osg::Node* root, std::string parent_path,
 
     mesh_info.min = { (double)osgState.point_min.x(), (double)osgState.point_min.y(), (double)osgState.point_min.z() };
     mesh_info.max = { (double)osgState.point_max.x(), (double)osgState.point_max.y(), (double)osgState.point_max.z() };
+    TileBox generated_bbox;
+    generated_bbox.min = mesh_info.min;
+    generated_bbox.max = mesh_info.max;
+    if (!is_valid_tile_box(generated_bbox)) {
+        LOG_E("osgb2glb: generated geometry has no valid position bounds");
+        return false;
+    }
 
     // Process textures via mesh_processor (KTX2 if enabled, JPEG fallback)
     for (auto tex : infoVisitor.texture_array) {
@@ -2250,6 +2279,18 @@ bool build_merged_glb(
         return false;
     }
 
+    TileBox generated_bbox;
+    generated_bbox.min = {
+        (double)global_min.x(), (double)global_min.y(), (double)global_min.z()
+    };
+    generated_bbox.max = {
+        (double)global_max.x(), (double)global_max.y(), (double)global_max.z()
+    };
+    if (!is_valid_tile_box(generated_bbox)) {
+        LOG_E("build_merged_glb: generated geometry has no valid position bounds");
+        return false;
+    }
+
     for (auto& prim : model.meshes[0].primitives) {
         if (prim.material < 0) prim.material = 0;
     }
@@ -2394,8 +2435,7 @@ bool build_merged_glb(
 
     out_glb_buf = ss.str();
 
-    out_bbox.min = { (double)global_min.x(), (double)global_min.y(), (double)global_min.z() };
-    out_bbox.max = { (double)global_max.x(), (double)global_max.y(), (double)global_max.z() };
+    out_bbox = generated_bbox;
 
     if (out_intermediate) {
         auto intermediate = std::make_shared<HlodIntermediate>();

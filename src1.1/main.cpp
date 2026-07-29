@@ -337,7 +337,7 @@ static void print_usage(const char* prog) {
         "  --fine-merge-max-sources N  Max leaf files per fine aggregate (default: 16)\n"
         "  --fine-merge-max-input-mb N  Max source MB per fine aggregate (default: 64)\n"
         "  --hlod-max-source-tiles N  Compatibility option (progressive HLOD no longer drops by source count)\n"
-        "  --hlod-max-output-mb N  HLOD GLB size warning threshold (default: 8, 0=off)\n"
+        "  --hlod-max-output-mb N  Omit HLOD drawables above N MB (default: 8, 0=unlimited)\n"
         "  --max-lvl N             Maximum source LOD level to convert (default: 100)\n"
         "  --geoid <model>         Geoid model: none, egm84, egm96, egm2008\n"
         "  --geoid-path <path>     Path to geoid data files\n"

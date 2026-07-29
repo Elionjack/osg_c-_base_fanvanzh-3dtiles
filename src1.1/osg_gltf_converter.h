@@ -92,6 +92,7 @@ void do_tile_job(osg_tree& tree, std::string out_path, int max_lvl,
                  int draco_uv_bits = 12, int ktx2_quality = 128);
 
 // Bounding box operations
+bool is_valid_tile_box(const TileBox& box);
 void expend_box(TileBox& box, TileBox& box_new);
 TileBox extend_tile_box(osg_tree& tree);
 void calc_geometric_error(osg_tree& tree);

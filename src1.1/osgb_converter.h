@@ -40,7 +40,7 @@ struct ConvertOptions {
     bool enable_top_reconstruct = false;
     int  top_texture_max_size = 512;  // max texture dimension for root GLB (0=no limit)
     int  hlod_max_source_tiles = 16;  // max source tiles merged into one HLOD GLB (0=unlimited)
-    int  hlod_max_output_mb = 8;      // discard HLOD content above this size (0=unlimited)
+    int  hlod_max_output_mb = 8;      // omit HLOD drawables above this size (0=unlimited)
     double simplify_ratio = 0.5;       // meshopt target_ratio (1.0=no simplify)
     int  draco_pos_bits = 11;          // Draco position quantization bits
     int  draco_normal_bits = 10;       // Draco normal quantization bits

@@ -427,7 +427,7 @@ src/ 和 src1.1/ 现在共享完整的网格处理管线。核心差异仅在于
 | `--fine-merge-max-sources` | 单个细节聚合 GLB 最多包含的叶级源文件数 | 16 |
 | `--fine-merge-max-input-mb` | 单个细节聚合的源 OSGB 总大小上限（MB） | 64 |
 | `--hlod-max-source-tiles` | 兼容参数；逐级直接子粗模合并不再因源瓦片总数制造空 HLOD 节点 | 16 |
-| `--hlod-max-output-mb` | HLOD GLB 大小告警阈值（0=关闭告警），不会丢弃粗模 | 8 |
+| `--hlod-max-output-mb` | HLOD GLB 大小上限；超限节点改为纯索引并继续细化（0=不限） | 8 |
 | `--max-lvl` | 转换并写入 tileset 的最大源 LOD 层级 | 100 |
 | `--top-texture-max-size` | Root GLB 纹理最大尺寸（0=不限制） | 512 |
 | `--simplify-ratio` | Meshopt 简化目标比例（1.0=不简化） | 0.5 |
@@ -559,7 +559,8 @@ Step 5: encode_quadtree_json()
 **关键设计点：**
 - 叶子节点保留 PagedLOD 原始 GLB（不修改），作为 HLOD level-0 的 children
 - 无 content 的索引层会被压平，并使用高 geometricError 强制 Cesium 继续细化
-- HLOD 根节点必须成功生成可显示的 `root.glb`，否则转换直接报错而不输出空根 tileset
+- HLOD 根节点优先生成可显示的 `root.glb`；若粗模超过 `--hlod-max-output-mb`，
+  则输出纯索引根并强制 Cesium 继续细化到空间子节点
 - 合并后的 GLB 写入 `Data/HLOD/` 目录
 - tileset.json root 直接使用 quadtree 结构（替代 flat children 列表）
 - 单 tile 数据集的 2×2 区域不合并（保持原始质量）
