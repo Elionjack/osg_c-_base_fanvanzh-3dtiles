@@ -105,7 +105,11 @@ bool optimize_and_simplify_mesh(
     std::vector<unsigned int>& indices, size_t original_index_count,
     std::vector<unsigned int>& simplified_indices, size_t& simplified_index_count,
     const SimplificationParams& params) {
+    // meshoptimizer consumes triangle-list indices.  Never request an empty
+    // result for a small primitive and keep the target triangle-aligned.
     size_t target_index_count = static_cast<size_t>(original_index_count * params.target_ratio);
+    target_index_count = std::max<size_t>(3, target_index_count - target_index_count % 3);
+    target_index_count = std::min(target_index_count, original_index_count);
 
     bool hasNormals = false;
     if (params.preserve_normals && vertex_count > 0) {
@@ -147,6 +151,19 @@ bool optimize_and_simplify_mesh(
             target_index_count, params.target_error, 0, &result_error);
     }
     simplified_indices.resize(simplified_index_count);
+
+    if (simplified_index_count < 3) return false;
+
+    // Simplification removes triangles, but it does not compact the vertex
+    // streams.  Without this second vertex-fetch pass, Draco/meshopt still
+    // encode every original position, normal and UV even when most vertices
+    // are no longer referenced.  This was especially expensive for upper
+    // HLOD levels, where a nominal 1% mesh retained an almost full-size
+    // vertex payload.
+    vertex_count = meshopt_optimizeVertexFetch(
+        vertices.data(), simplified_indices.data(), simplified_index_count,
+        vertices.data(), vertex_count, sizeof(VertexData));
+    vertices.resize(vertex_count);
     return true;
 }
 
@@ -154,7 +171,7 @@ bool simplify_mesh_geometry(osg::Geometry* geometry, const SimplificationParams&
     if (!params.enable_simplification || !geometry) return false;
 
     osg::Vec3Array* vertexArray = dynamic_cast<osg::Vec3Array*>(geometry->getVertexArray());
-    if (!vertexArray || vertexArray->empty() || geometry->getNumPrimitiveSets() == 0) return false;
+    if (!vertexArray || vertexArray->empty() || geometry->getNumPrimitiveSets() != 1) return false;
 
     osg::PrimitiveSet* primitiveSet = geometry->getPrimitiveSet(0);
     if (!primitiveSet) return false;

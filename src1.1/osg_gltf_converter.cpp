@@ -379,10 +379,11 @@ void calc_geometric_error(osg_tree& tree) {
             for (auto& s : tree.sub_nodes)
                 max_sub = std::max(max_sub, get_geometric_error(s.bbox) * 0.1);
         } else {
-            //Upper parent: max child ge * 1.55
+            // Upper PagedLOD parent: max child GE * 2.5.
+            // HLOD quadtree nodes keep their separate 1.55 multiplier below.
             for (auto& s : tree.sub_nodes)
                 max_sub = std::max(max_sub, s.geometricError);
-            max_sub = max_sub * 1.55;
+            max_sub = max_sub * 2.5;
         }
         tree.geometricError = max_sub;
     }
