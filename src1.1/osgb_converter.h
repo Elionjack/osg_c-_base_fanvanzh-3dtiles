@@ -29,18 +29,12 @@ struct ConvertOptions {
 
     // Tileset JSON splitting (external tilesets)
     bool enable_split_json = false;    // split monolithic tileset.json into index + sub-tilesets
-    int  split_depth = 0;              // 0=auto, >0=fixed HLOD display depth
-    int  split_target_tiles = 256;     // auto mode target source tiles per HLOD shard
-    int  lod_step = 2;                 // keep every Nth node in single-child LOD chains
-    bool enable_fine_merge = true;     // merge small finest-LOD spatial subtrees
-    int  fine_merge_max_sources = 16;  // max leaf OSGB files in one fine aggregate
-    int  fine_merge_max_input_mb = 64; // max total source bytes in one fine aggregate
 
     // Root tile reconstruction (merge coarsest LODs into overview GLB)
     bool enable_top_reconstruct = false;
     int  top_texture_max_size = 512;  // max texture dimension for root GLB (0=no limit)
+    int  hlod_branching_factor = 16; // spatial children per HLOD node (perfect square, e.g. 4 or 16)
     int  hlod_max_source_tiles = 16;  // max source tiles merged into one HLOD GLB (0=unlimited)
-    int  hlod_max_output_mb = 8;      // omit HLOD drawables above this size (0=unlimited)
     double simplify_ratio = 0.5;       // meshopt target_ratio (1.0=no simplify)
     int  draco_pos_bits = 11;          // Draco position quantization bits
     int  draco_normal_bits = 10;       // Draco normal quantization bits

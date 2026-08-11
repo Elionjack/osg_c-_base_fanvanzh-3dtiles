@@ -43,11 +43,11 @@ struct osg_tree {
     std::vector<osg_tree> sub_nodes;
     // type: 0=group, 1=PagedLOD nodes (default), 2=Other nodes
     int type = 1;
-    // Non-empty for a synthetic fine-detail tile that merges multiple leaf
-    // OSGB files into one GLB.
-    std::vector<std::string> aggregate_sources;
     // Cached node from Phase 1 — avoids redundant readNodeFiles in Phase 2
     osg::ref_ptr<osg::Node> cached_node;
+    // Set only after the GLB buffer has been written successfully. JSON
+    // generation must never infer content availability from the source tree.
+    bool content_written = false;
 };
 
 // Get full OSGB tile tree starting from a root file
@@ -167,18 +167,19 @@ using SpatialGrid = std::map<int, std::map<int, GridCell>>;
 struct HlodIntermediate;
 using HlodIntermediatePtr = std::shared_ptr<HlodIntermediate>;
 
-// Quadtree node for HLOD hierarchy
+// Spatial N-tree node for HLOD hierarchy. The historical QuadNode name is
+// retained to avoid changing the public data model.
 struct QuadNode {
     int grid_x = 0;              // top-left grid coordinate
     int grid_y = 0;
-    int grid_size = 0;           // size in grid cells (1, 2, 4, 8, ...)
+    int grid_size = 0;           // square region side length in grid cells
     int level = 0;               // 0 = finest (leaf), higher = coarser
     std::string stem;            // tile stem (only for leaf nodes, e.g. "Tile_-001_+050")
     TileBox bbox;                // bounding box (union of children or from merge)
     double geometricError = 0.0;
     std::string glb_uri;         // output GLB URI (relative path)
     bool has_content = false;    // true = has geometry (content in tileset)
-    std::vector<QuadNode> children; // 0-4 sub-quadtree nodes
+    std::vector<QuadNode> children; // 0-N spatial child nodes
     std::vector<std::string> leaf_stems;           // level=0: tile stems under this node
     std::vector<std::string> leaf_coarsest_paths;  // level=0: coarsest OSGB paths under this node
     HlodIntermediatePtr intermediate; // uncompressed coarse model for direct parent merge
@@ -199,12 +200,13 @@ SpatialGrid build_spatial_grid(
     const std::vector<TileBox>& bboxes,
     const std::vector<double>& coarsest_ges);
 
-// Calculate simplification ratio for a given quadtree level
-double calc_level_ratio(int level, double base_ratio);
+// Calculate simplification ratio for a given hierarchy level.
+double calc_level_ratio(int level, double base_ratio, int branching_factor = 4);
 
-// Build quadtree bottom-up from spatial grid.
+// Build a square spatial N-tree bottom-up from the grid. branching_factor
+// must be a perfect square (4 => 2x2, 16 => 4x4).
 // Returns the root node (highest level).
-QuadNode build_quadtree(const SpatialGrid& grid);
+QuadNode build_quadtree(const SpatialGrid& grid, int branching_factor = 4);
 
 // Collect all leaf OSGB paths under a quadtree node (recursive).
 void collect_leaf_paths(const QuadNode& node, const SpatialGrid& grid,
@@ -226,21 +228,15 @@ bool build_merged_glb(
     int draco_pos_bits = 11, int draco_normal_bits = 10,
     int draco_uv_bits = 12, int ktx2_quality = 128,
     const std::vector<HlodIntermediatePtr>& child_intermediates = {},
-    HlodIntermediatePtr* out_intermediate = nullptr);
+    HlodIntermediatePtr* out_intermediate = nullptr,
+    int branching_factor = 4);
 
-// Generate tileset JSON for a quadtree node hierarchy.
-// Returns a nlohmann::json object representing the tile subtree.
-// tile_jsons maps stem→json for embedding PagedLOD subtrees at leaves.
-// When split_depth > 0, nodes at display_level == split_depth are
-// written as external sub-tilesets and replaced by reference tiles.
-// When externalize_pagedlod is true, level-0 PagedLOD subtrees are
-// always externalized (regardless of display_level/split_depth).
+// Generate tileset JSON for a spatial HLOD hierarchy. When
+// externalize_pagedlod is true, each source-tile LOD tree is written as an
+// external sub-tileset while every HLOD level remains in the main JSON.
 nlohmann::json encode_quadtree_json(
     const QuadNode& node,
     const std::map<std::string, nlohmann::json>& tile_jsons,
-    int current_display_level = 0,
-    int root_level = 0,
-    int split_depth = 0,
     const std::string& output_dir = "",
     bool externalize_pagedlod = false);
 

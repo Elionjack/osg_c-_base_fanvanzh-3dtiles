@@ -72,8 +72,14 @@ inline bool write_file(const char* filename, const char* buf, unsigned long buf_
         return false;
     }
     ofs.write(buf, buf_len);
+    ofs.flush();
     ofs.close();
-    return true;
+    const bool ok = !ofs.fail();
+    if (!ok) {
+        LOG_E("write_file: incomplete write for %s (%lu bytes requested)",
+              filename, buf_len);
+    }
+    return ok;
 }
 
 inline bool mkdirs(const char* path) {

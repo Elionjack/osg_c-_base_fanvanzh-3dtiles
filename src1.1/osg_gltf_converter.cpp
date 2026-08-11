@@ -385,7 +385,16 @@ void calc_geometric_error(osg_tree& tree) {
                 max_sub = std::max(max_sub, s.geometricError);
             max_sub = max_sub * 2.5;
         }
-        tree.geometricError = max_sub;
+        // Tree depth is not a physical error measure. Source PagedLOD trees
+        // can have different numbers of levels, and repeatedly multiplying by
+        // 2.5 previously made same-scale roots differ by orders of magnitude.
+        // Cap every source-tree node by its own spatial half-span. This keeps
+        // the hierarchy monotonic without allowing depth alone to inflate GE.
+        TileBox bbox = tree.bbox;
+        const double spatial_cap = get_geometric_error(bbox);
+        tree.geometricError = spatial_cap > 0.0
+            ? std::min(max_sub, spatial_cap)
+            : max_sub;
     }
 }
 
@@ -1500,6 +1509,8 @@ bool convert_one_tile(const FlatTile& tile, const osgb_converter::ConvertOptions
     std::string glb_buf;
     MeshInfo minfo;
 
+    if (tile.tree) tile.tree->content_written = false;
+
     bool ok = osgb2glb_buf(tile.file_name, glb_buf, minfo, tile.type,
                           opts.enable_texture_compress, opts.enable_meshopt,
                           opts.enable_draco, opts.enable_unlit,
@@ -1507,19 +1518,22 @@ bool convert_one_tile(const FlatTile& tile, const osgb_converter::ConvertOptions
                           opts.draco_pos_bits, opts.draco_normal_bits, opts.draco_uv_bits,
                           opts.ktx2_quality);
 
-    if (!ok) return false;
-
-    if (tile.tree) {
-        tile.tree->bbox.max = minfo.max;
-        tile.tree->bbox.min = minfo.min;
-    }
+    if (!ok || glb_buf.empty()) return false;
 
     std::string out_file = tile.out_dir + "/" +
         replace(get_file_name(tile.file_name), ".osgb",
                 tile.type != 2 ? ".glb" : "o.glb");
 
-    if (!glb_buf.empty())
-        write_file(out_file.c_str(), glb_buf.data(), (unsigned long)glb_buf.size());
+    if (!write_file(out_file.c_str(), glb_buf.data(),
+                    (unsigned long)glb_buf.size())) {
+        return false;
+    }
+
+    if (tile.tree) {
+        tile.tree->bbox.max = minfo.max;
+        tile.tree->bbox.min = minfo.min;
+        tile.tree->content_written = true;
+    }
 
     return true;
 }
@@ -1538,30 +1552,7 @@ bool compute_tile_output(const FlatTile& tile,
     bool ok = false;
     bool used_cache = false;
 
-    if (tile.tree && !tile.tree->aggregate_sources.empty()) {
-        TileBox aggregate_bbox;
-        ok = build_merged_glb(
-            tile.tree->aggregate_sources,
-            0,
-            glb_buf,
-            aggregate_bbox,
-            opts.enable_texture_compress,
-            opts.enable_meshopt,
-            opts.enable_draco,
-            opts.enable_unlit,
-            0, // preserve source texture dimensions for finest-detail aggregates
-            opts.simplify_ratio,
-            opts.draco_pos_bits,
-            opts.draco_normal_bits,
-            opts.draco_uv_bits,
-            opts.ktx2_quality);
-        if (ok) {
-            minfo.min = aggregate_bbox.min;
-            minfo.max = aggregate_bbox.max;
-        }
-        LOG_I("  compute_tile: fine aggregate (%zu sources)",
-              tile.tree->aggregate_sources.size());
-    } else if (tile.tree && tile.tree->cached_node.valid()) {
+    if (tile.tree && tile.tree->cached_node.valid()) {
         ok = osgb2glb_buf_from_node(
             tile.tree->cached_node.get(),
             get_parent(tile.file_name),
@@ -1609,16 +1600,23 @@ bool convert_one_tile_from_cached(const FlatTile& tile,
     MeshInfo minfo;
     std::string out_file;
 
-    if (!compute_tile_output(tile, opts, glb_buf, minfo, out_file))
+    if (tile.tree) tile.tree->content_written = false;
+
+    if (!compute_tile_output(tile, opts, glb_buf, minfo, out_file)
+        || glb_buf.empty()) {
         return false;
+    }
+
+    if (!write_file(out_file.c_str(), glb_buf.data(),
+                    (unsigned long)glb_buf.size())) {
+        return false;
+    }
 
     if (tile.tree) {
         tile.tree->bbox.max = minfo.max;
         tile.tree->bbox.min = minfo.min;
+        tile.tree->content_written = true;
     }
-
-    if (!glb_buf.empty())
-        write_file(out_file.c_str(), glb_buf.data(), (unsigned long)glb_buf.size());
 
     return true;
 }
@@ -1643,18 +1641,36 @@ void collect_flat_tiles(osg_tree& tree, const std::string& out_dir,
 std::string encode_tile_json_1_1(osg_tree& tree, double x, double y) {
     if (tree.bbox.max.empty() || tree.bbox.min.empty()) return "";
 
-    std::string file_name = get_file_name(tree.file_name);
-    std::string file_path = get_file_name(get_parent(tree.file_name));
+    // Encode children first so a failed drawable leaf can be removed entirely,
+    // while a failed parent remains as an index tile for successful children.
+    std::vector<std::string> encoded_children;
+    encoded_children.reserve(tree.sub_nodes.size());
+    for (auto& child_node : tree.sub_nodes) {
+        std::string child = encode_tile_json_1_1(child_node, x, y);
+        if (!child.empty()) encoded_children.push_back(std::move(child));
+    }
+    if (tree.type > 0 && !tree.content_written && encoded_children.empty()) {
+        return "";
+    }
+    if (tree.type == 0 && encoded_children.empty()) return "";
 
+    std::string file_name = get_file_name(tree.file_name);
+
+    // A parent whose own GLB failed must never be allowed to satisfy SSE with
+    // an empty REPLACE tile. Keep it as a traversal-only index for its valid
+    // descendants. (HLOD encoding applies the same policy.)
+    const double encoded_ge = !tree.content_written && !encoded_children.empty()
+        ? 1.0e12
+        : tree.geometricError;
     char buf[512];
-    sprintf(buf, "{ \"geometricError\":%.2f,", tree.geometricError);
+    sprintf(buf, "{ \"geometricError\":%.2f,", encoded_ge);
     std::string tile = buf;
     tile += " \"refine\":\"REPLACE\",";
 
     std::string bbox_str = get_boundingBox(tree.bbox);
     tile += bbox_str;
 
-    if (tree.type > 0) {
+    if (tree.type > 0 && tree.content_written) {
         tile += ", \"content\":{ \"uri\":";
         std::string uri = "./" + replace(file_name, ".osgb", tree.type != 2 ? ".glb" : "o.glb");
         tile += "\"" + uri + "\",";
@@ -1663,13 +1679,10 @@ std::string encode_tile_json_1_1(osg_tree& tree, double x, double y) {
         tile += "}";
     }
 
-    if (!tree.sub_nodes.empty()) {
+    if (!encoded_children.empty()) {
         tile += ",\"children\":[";
-        for (auto& i : tree.sub_nodes) {
-            std::string child = encode_tile_json_1_1(i, x, y);
-            if (!child.empty()) {
-                tile += child + ",";
-            }
+        for (const auto& child : encoded_children) {
+            tile += child + ",";
         }
         if (tile.back() == ',') tile.pop_back();
         tile += "]";
@@ -2074,9 +2087,12 @@ SpatialGrid build_spatial_grid(
     return grid;
 }
 
-double calc_level_ratio(int level, double base_ratio) {
-    // Each level covers 4x the area → keep 1/4 the detail
-    double r = base_ratio * std::pow(0.25, level);
+double calc_level_ratio(int level, double base_ratio, int branching_factor) {
+    // Each level covers branching_factor times the area, so retain the same
+    // fraction of detail. For the historical quadtree this is 1/4 per level;
+    // for a 16-tree it is 1/16.
+    const double per_level_ratio = 1.0 / std::max(1, branching_factor);
+    double r = base_ratio * std::pow(per_level_ratio, level);
     return std::max(0.01, r);
 }
 
@@ -2106,19 +2122,21 @@ bool build_merged_glb(
     int draco_pos_bits, int draco_normal_bits, int draco_uv_bits,
     int ktx2_quality,
     const std::vector<HlodIntermediatePtr>& child_intermediates,
-    HlodIntermediatePtr* out_intermediate)
+    HlodIntermediatePtr* out_intermediate,
+    int branching_factor)
 {
     if (osgb_paths.empty() && child_intermediates.empty()) return false;
 
     // Original OSGB inputs use the absolute level ratio. Direct-child HLOD
     // inputs have already been simplified, so each parent applies one further
-    // 4:1 reduction instead of reapplying an absolute ratio to original data.
+    // branching_factor:1 reduction instead of reapplying an absolute ratio.
     const bool uses_child_coarse_models = !child_intermediates.empty();
     double level_ratio = uses_child_coarse_models
-        ? 0.25
-        : calc_level_ratio(quadtree_level, simplify_ratio);
-    LOG_I("build_merged_glb: level=%d, ratio=%.4f (%zu OSGB, %zu child coarse models)",
-          quadtree_level, level_ratio, osgb_paths.size(), child_intermediates.size());
+        ? 1.0 / std::max(1, branching_factor)
+        : calc_level_ratio(quadtree_level, simplify_ratio, branching_factor);
+    LOG_I("build_merged_glb: level=%d, branching=%d, ratio=%.4f (%zu OSGB, %zu child coarse models)",
+          quadtree_level, branching_factor, level_ratio,
+          osgb_paths.size(), child_intermediates.size());
 
     tinygltf::TinyGLTF gltf;
     tinygltf::Model model;
@@ -2296,12 +2314,22 @@ bool build_merged_glb(
         if (prim.material < 0) prim.material = 0;
     }
 
-    // Phase 3: Process textures (with optional downsampling)
+    // Phase 3: Process textures (with optional downsampling). One 16-tree
+    // level spans the same width as two quadtree levels, so derive texture
+    // reduction from the equivalent quadtree depth rather than raw N-tree
+    // depth.
     int effective_texture_max_size = top_texture_max_size;
-    if (uses_child_coarse_models && effective_texture_max_size > 32) {
-        const int parent_steps = std::max(1, quadtree_level - 1);
-        for (int step = 0; step < parent_steps && effective_texture_max_size > 32; ++step)
+    const int branch_side = std::max(
+        2, static_cast<int>(std::sqrt(static_cast<double>(branching_factor))));
+    const int equivalent_quadtree_level = static_cast<int>(std::lround(
+        quadtree_level * std::log2(static_cast<double>(branch_side))));
+    const int texture_reduction_steps = std::max(0, equivalent_quadtree_level - 1);
+    if (effective_texture_max_size > 32) {
+        for (int step = 0;
+             step < texture_reduction_steps && effective_texture_max_size > 32;
+             ++step) {
             effective_texture_max_size = std::max(32, effective_texture_max_size / 2);
+        }
     }
 
     for (auto* tex : all_textures) {
@@ -2480,16 +2508,11 @@ void collect_leaf_paths(const QuadNode& node, const SpatialGrid& grid,
 // Recursive quadtree builder
 // ============================================================
 static QuadNode build_quadtree_impl(const SpatialGrid& grid,
-                                     int x, int y, int size, int level) {
-    // size=1 cells are NOT wrapped — instead, size=2 is the new base case
-    // that directly merges 4 grid cells into a level-0 quadtree node.
-    if (size == 1) {
-        return QuadNode{};  // Empty — grid cell content handled by size=2 parent
-    }
-
-    if (size == 2) {
-        // New base case: directly collect 4 grid cells (size=1 each) and build
-        // a level-0 quadtree node with PagedLOD roots as children.
+                                     int x, int y, int size, int level,
+                                     int branch_side, double base_cell_ge) {
+    if (size == branch_side) {
+        // Base case: directly collect branch_side² grid cells and build a
+        // level-0 HLOD node with the source PagedLOD roots as children.
         QuadNode node;
         node.grid_x = x;
         node.grid_y = y;
@@ -2497,46 +2520,37 @@ static QuadNode build_quadtree_impl(const SpatialGrid& grid,
         node.level = 0;
         node.has_content = false;
 
-        std::pair<int,int> cells[4] = {
-            {x,     y    },
-            {x+1,   y    },
-            {x,     y+1  },
-            {x+1,   y+1  }
-        };
+        for (int dy = 0; dy < branch_side; ++dy) {
+            for (int dx = 0; dx < branch_side; ++dx) {
+                const int cx = x + dx;
+                const int cy = y + dy;
+                auto it_x = grid.find(cx);
+                if (it_x == grid.end()) continue;
+                auto it_y = it_x->second.find(cy);
+                if (it_y == it_x->second.end()) continue;
 
-        double max_cell_ge = 0.0;
-        for (auto& [cx, cy] : cells) {
-            auto it_x = grid.find(cx);
-            if (it_x == grid.end()) continue;
-            auto it_y = it_x->second.find(cy);
-            if (it_y == it_x->second.end()) continue;
-
-            const auto& cell = it_y->second;
-            TileBox cell_bbox = cell.bbox;  // copy for non-const expend_box
-            expend_box(node.bbox, cell_bbox);
-            max_cell_ge = std::max(max_cell_ge, cell.geometricError);
-            node.leaf_stems.push_back(cell.stem);
-            node.leaf_coarsest_paths.push_back(cell.coarsest_path);
+                const auto& cell = it_y->second;
+                TileBox cell_bbox = cell.bbox;
+                expend_box(node.bbox, cell_bbox);
+                node.leaf_stems.push_back(cell.stem);
+                node.leaf_coarsest_paths.push_back(cell.coarsest_path);
+            }
         }
 
         if (node.leaf_stems.empty()) {
-            return QuadNode{};  // No cells in this 2×2 area
+            return QuadNode{};
         }
 
-        // Single cell in a 2×2 area: don't merge, just store as-is
-        // (multiple cells will be merged, GE x1.55)
-        if (node.leaf_stems.size() == 1) {
-            node.geometricError = max_cell_ge;
-        } else {
-            node.geometricError = max_cell_ge * 1.55;
-        }
+        // HLOD error is a property of this spatial level, not of the deepest
+        // source tree in the region. grid_size is identical for peers, so all
+        // nodes at one HLOD level receive the same conservative error.
+        node.geometricError = base_cell_ge * static_cast<double>(node.grid_size);
 
         node.has_content = true;  // Will be generated by merge phase
         return node;
     }
 
-    // size >= 4: recursive case, same as before
-    int half = size / 2;
+    const int child_size = size / branch_side;
 
     QuadNode node;
     node.grid_x = x;
@@ -2545,19 +2559,18 @@ static QuadNode build_quadtree_impl(const SpatialGrid& grid,
     node.level = level;
     node.has_content = false;
 
-    std::pair<int,int> origins[4] = {
-        {x,       y},
-        {x+half,  y},
-        {x,       y+half},
-        {x+half,  y+half}
-    };
-
     int child_level = level - 1;
-    for (auto& [cx, cy] : origins) {
-        QuadNode child = build_quadtree_impl(grid, cx, cy, half, child_level);
-        if (child.has_content || !child.children.empty()) {
-            expend_box(node.bbox, child.bbox);
-            node.children.push_back(std::move(child));
+    for (int child_y = 0; child_y < branch_side; ++child_y) {
+        for (int child_x = 0; child_x < branch_side; ++child_x) {
+            const int cx = x + child_x * child_size;
+            const int cy = y + child_y * child_size;
+            QuadNode child = build_quadtree_impl(
+                grid, cx, cy, child_size, child_level,
+                branch_side, base_cell_ge);
+            if (child.has_content || !child.children.empty()) {
+                expend_box(node.bbox, child.bbox);
+                node.children.push_back(std::move(child));
+            }
         }
     }
 
@@ -2565,19 +2578,14 @@ static QuadNode build_quadtree_impl(const SpatialGrid& grid,
         return QuadNode{};  // No content in this region
     }
 
-    // Compute geometric error bottom-up.
-    // Internal nodes multiply max child GE by 1.55 at each level up.
-    for (auto& child : node.children) {
-        node.geometricError = std::max(node.geometricError, child.geometricError);
-    }
-    node.geometricError *= 1.55;
+    node.geometricError = base_cell_ge * static_cast<double>(node.grid_size);
 
     node.has_content = true;  // Will be generated by merge phase
 
     return node;
 }
 
-QuadNode build_quadtree(const SpatialGrid& grid) {
+QuadNode build_quadtree(const SpatialGrid& grid, int branching_factor) {
     if (grid.empty()) {
         LOG_E("build_quadtree: empty grid");
         return QuadNode{};
@@ -2602,26 +2610,64 @@ QuadNode build_quadtree(const SpatialGrid& grid) {
     int h = max_y - min_y + 1;
     int max_dim = std::max(w, h);
 
-    // Compute padded power-of-2 size
-    int padded_size = 1;
-    while (padded_size < max_dim) padded_size <<= 1;
+    if (branching_factor < 4) {
+        LOG_E("build_quadtree: branching factor %d is not a perfect square >= 4",
+              branching_factor);
+        return QuadNode{};
+    }
+    const int branch_side = static_cast<int>(std::sqrt(branching_factor));
+    if (branch_side * branch_side != branching_factor) {
+        LOG_E("build_quadtree: branching factor %d is not a perfect square >= 4",
+              branching_factor);
+        return QuadNode{};
+    }
+
+    // A single source cell needs no reconstructed hierarchy.
+    if (max_dim <= 1) {
+        LOG_I("build_quadtree: one grid cell, no HLOD levels to build");
+        return QuadNode{};
+    }
+
+    // Pad to a power of the spatial side count: 2,4,8... for a quadtree;
+    // 4,16,64... for a 16-tree.
+    int padded_size = branch_side;
+    int max_level = 0;
+    while (padded_size < max_dim) {
+        if (padded_size > INT_MAX / branch_side) {
+            LOG_E("build_quadtree: padded grid size overflow");
+            return QuadNode{};
+        }
+        padded_size *= branch_side;
+        ++max_level;
+    }
 
     // Align origin to the padded grid
     int origin_x = min_x;
     int origin_y = min_y;
 
-    int max_level = (int)std::log2(padded_size) - 1;  // size=2 → level=0
+    LOG_I("build_quadtree: grid [%d..%d]x[%d..%d] (%dx%d), branching=%d (%dx%d), padded=%d, max_level=%d, cells=%d",
+          min_x, max_x, min_y, max_y, w, h, branching_factor,
+          branch_side, branch_side, padded_size, max_level, cell_count);
 
-    // Single cell or all cells in one 2×2 block — no HLOD tree needed
-    if (max_level < 0) {
-        LOG_I("build_quadtree: padded_size=%d, no HLOD levels to build", padded_size);
-        return QuadNode{};
+    // Use the largest source-cell half-span as a conservative common unit.
+    // Combined with grid_size this is deterministic and uniform per HLOD
+    // level, including sparse edge nodes.
+    double base_cell_ge = 0.0;
+    for (const auto& [grid_x, row] : grid) {
+        (void)grid_x;
+        for (const auto& [grid_y, cell] : row) {
+            (void)grid_y;
+            TileBox bbox = cell.bbox;
+            base_cell_ge = std::max(base_cell_ge, get_geometric_error(bbox));
+            base_cell_ge = std::max(base_cell_ge, cell.geometricError);
+        }
     }
-
-    LOG_I("build_quadtree: grid [%d..%d]x[%d..%d] (%dx%d), padded=%d, max_level=%d, cells=%d",
-          min_x, max_x, min_y, max_y, w, h, padded_size, max_level, cell_count);
-
-    QuadNode root = build_quadtree_impl(grid, origin_x, origin_y, padded_size, max_level);
+    if (!(base_cell_ge > 0.0) || !std::isfinite(base_cell_ge)) {
+        base_cell_ge = 1.0;
+    }
+    QuadNode root = build_quadtree_impl(
+        grid, origin_x, origin_y, padded_size, max_level,
+        branch_side, base_cell_ge);
 
     if (root.children.empty() && !root.has_content) {
         LOG_E("build_quadtree: failed to build tree");
@@ -2634,8 +2680,9 @@ QuadNode build_quadtree(const SpatialGrid& grid) {
         for (const auto& c : n.children) count_nodes(c, depth + 1);
     };
 
-    LOG_I("build_quadtree: root at (%d,%d) size=%d level=%d, children=%zu",
-          root.grid_x, root.grid_y, root.grid_size, root.level, root.children.size());
+    LOG_I("build_quadtree: root at (%d,%d) size=%d level=%d, children=%zu, base_cell_ge=%.3f",
+          root.grid_x, root.grid_y, root.grid_size, root.level,
+          root.children.size(), base_cell_ge);
 
     return root;
 }
@@ -2706,77 +2753,9 @@ void finalize_index_only_tile(nlohmann::json& tile) {
 nlohmann::json encode_quadtree_json(
     const QuadNode& node,
     const std::map<std::string, nlohmann::json>& tile_jsons,
-    int current_display_level,
-    int root_level,
-    int split_depth,
     const std::string& output_dir,
     bool externalize_pagedlod)
 {
-    // --- Split check: if this node is at the split display level,
-    //     write the full subtree as an external tileset and return a reference ---
-    if (split_depth > 0 && current_display_level == split_depth && !output_dir.empty()) {
-        // Build the full subtree JSON.
-        // Pass split_depth=0 to prevent this node from splitting itself again.
-        // PagedLOD trees are embedded in this spatial HLOD shard; writing one
-        // external JSON per source Tile recreated thousands of HTTP requests.
-        nlohmann::json full_subtree = encode_quadtree_json(
-            node, tile_jsons, current_display_level, root_level,
-            0, output_dir, false);
-        finalize_index_only_tile(full_subtree);
-
-        // Rewrite URIs for sub-tileset location (subtilesets/ is one level deep)
-        std::function<void(nlohmann::json&)> rewrite_uris;
-        rewrite_uris = [&rewrite_uris](nlohmann::json& tile) {
-            if (tile.contains("content") && tile["content"].is_object()
-                && tile["content"].contains("uri")) {
-                std::string uri = tile["content"]["uri"].get<std::string>();
-                if (uri.size() >= 2 && uri[0] == '.' && uri[1] == '/') {
-                    tile["content"]["uri"] = ".." + uri.substr(1);
-                }
-            }
-            if (tile.contains("children") && tile["children"].is_array()) {
-                for (auto& child : tile["children"])
-                    rewrite_uris(child);
-            }
-        };
-        rewrite_uris(full_subtree);
-
-        // Build sub-tileset file name from grid coordinates and display level
-        char fname_buf[128];
-        int display_level = current_display_level;
-        snprintf(fname_buf, sizeof(fname_buf),
-                 "HLOD_L%d_X%+04d_Y%+04d.json",
-                 display_level, node.grid_x, node.grid_y);
-        std::string sub_name = fname_buf;
-
-        // Build sub-tileset envelope
-        nlohmann::json sub_tileset;
-        sub_tileset["asset"]["version"] = "1.1";
-        sub_tileset["extensionsUsed"] = nlohmann::json::array({"3DTILES_content_gltf"});
-        sub_tileset["extensionsRequired"] = nlohmann::json::array({"3DTILES_content_gltf"});
-        sub_tileset["geometricError"] = full_subtree.value("geometricError", 0.0);
-        sub_tileset["root"] = full_subtree;
-
-        // Write to disk
-        fs::path sub_path = fs::path(output_dir) / "subtilesets" / sub_name;
-        fs::create_directories(sub_path.parent_path());
-        std::ofstream ofs(sub_path);
-        ofs << sub_tileset.dump();
-        ofs.close();
-
-        LOG_I("  Wrote HLOD sub-tileset: subtilesets/%s", sub_name.c_str());
-
-        // Build reference tile
-        nlohmann::json ref_tile;
-        ref_tile["boundingVolume"]["box"] = convert_bbox(node.bbox);
-        ref_tile["content"]["uri"] = "./subtilesets/" + sub_name;
-        ref_tile["geometricError"] = node.geometricError;
-        ref_tile["refine"] = "REPLACE";
-        return ref_tile;
-    }
-
-    // --- Normal encoding (no split at this level) ---
-
     // Level 0: first merge level — generate JSON with HLOD content and
     // PagedLOD root tiles as children (looked up from tile_jsons_map).
     if (node.level == 0) {
@@ -2868,11 +2847,9 @@ nlohmann::json encode_quadtree_json(
 
     if (!node.children.empty()) {
         tile["children"] = nlohmann::json::array();
-        int child_display_level = split_depth > 0 ? current_display_level + 1 : 0;
         for (const auto& child : node.children) {
             nlohmann::json child_json = encode_quadtree_json(
-                child, tile_jsons, child_display_level, root_level,
-                split_depth, output_dir, externalize_pagedlod);
+                child, tile_jsons, output_dir, externalize_pagedlod);
             if (!child_json.empty()) {
                 tile["children"].push_back(child_json);
             }

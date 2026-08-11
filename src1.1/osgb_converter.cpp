@@ -18,6 +18,7 @@
 #include <future>
 #include <functional>
 #include <memory>
+#include <cmath>
 #include <glm/gtc/type_ptr.hpp>
 
 namespace fs = std::filesystem;
@@ -328,123 +329,26 @@ static size_t prune_above_max_level(osg_tree& tree, int max_lvl) {
     return removed;
 }
 
-// PagedLOD datasets often contain long single-child chains. Keep branch
-// points and leaves, but skip intermediate levels according to lod_step.
-static size_t prune_single_child_lod_chains(osg_tree& tree, int lod_step) {
-    if (lod_step <= 1) return 0;
-
-    size_t removed = 0;
-    for (auto& child : tree.sub_nodes)
-        removed += prune_single_child_lod_chains(child, lod_step);
-
-    for (auto& child : tree.sub_nodes) {
-        while (child.type == 1 && child.sub_nodes.size() == 1) {
-            const int level = get_lvl_num(child.file_name);
-            if (level < 0 || level % lod_step == 0)
-                break;
-
-            osg_tree replacement = std::move(child.sub_nodes.front());
-            child = std::move(replacement);
-            ++removed;
-        }
-    }
-    return removed;
-}
-
-static bool collect_finest_leaf_sources(
-    const osg_tree& tree,
-    size_t max_sources,
-    uintmax_t max_input_bytes,
-    std::vector<std::string>& sources,
-    uintmax_t& input_bytes)
-{
-    // Do not merge group/other-geometry nodes into a PagedLOD aggregate.
-    if (tree.type != 1)
-        return false;
-
-    if (tree.sub_nodes.empty()) {
-        if (tree.file_name.empty() || !tree.aggregate_sources.empty())
-            return false;
-
-        std::error_code ec;
-        const uintmax_t bytes = fs::file_size(fs::path(tree.file_name), ec);
-        if (ec) return false;
-
-        if (sources.size() + 1 > max_sources
-            || bytes > max_input_bytes
-            || input_bytes > max_input_bytes - bytes)
-            return false;
-
-        sources.push_back(tree.file_name);
-        input_bytes += bytes;
-        return true;
-    }
-
-    for (const auto& child : tree.sub_nodes) {
-        if (!collect_finest_leaf_sources(
-                child, max_sources, max_input_bytes, sources, input_bytes))
-            return false;
-    }
-    return true;
-}
-
-// Replace the largest qualifying finest-LOD spatial subtree with one
-// synthetic aggregate leaf. The current node's coarse content is retained.
-static size_t aggregate_fine_lod_subtrees(
-    osg_tree& tree,
-    const std::string& tile_stem,
-    size_t max_sources,
-    uintmax_t max_input_bytes,
-    size_t& aggregate_counter,
-    size_t& aggregated_source_count)
-{
-    if (tree.type == 1 && !tree.sub_nodes.empty()) {
-        std::vector<std::string> sources;
-        uintmax_t input_bytes = 0;
-        bool eligible = true;
-        for (const auto& child : tree.sub_nodes) {
-            if (!collect_finest_leaf_sources(
-                    child, max_sources, max_input_bytes, sources, input_bytes)) {
-                eligible = false;
-                break;
-            }
-        }
-
-        if (eligible && sources.size() >= 2) {
-            size_t old_descendants = 0;
-            for (const auto& child : tree.sub_nodes)
-                old_descendants += count_tree_nodes(child);
-
-            char suffix[64];
-            std::snprintf(suffix, sizeof(suffix), "_FINE_MERGE_%05zu.osgb",
-                          aggregate_counter++);
-
-            osg_tree aggregate;
-            aggregate.type = 1;
-            aggregate.file_name =
-                (fs::path(get_parent(tree.file_name)) / (tile_stem + suffix)).string();
-            aggregate.aggregate_sources = std::move(sources);
-
-            aggregated_source_count += aggregate.aggregate_sources.size();
-            tree.sub_nodes.clear();
-            tree.sub_nodes.push_back(std::move(aggregate));
-            return old_descendants > 0 ? old_descendants - 1 : 0;
-        }
-    }
-
-    size_t removed = 0;
-    for (auto& child : tree.sub_nodes) {
-        removed += aggregate_fine_lod_subtrees(
-            child, tile_stem, max_sources, max_input_bytes,
-            aggregate_counter, aggregated_source_count);
-    }
-    return removed;
-}
-
 // ============================================================
 // Main conversion entry point
 // ============================================================
 int convert_osgb(const ConvertOptions& opts) {
+    if (opts.enable_top_reconstruct) {
+        if (opts.hlod_branching_factor < 4) {
+            LOG_E("--hlod-branching-factor must be a perfect square >= 4 (for example 4, 9, or 16); got %d",
+                  opts.hlod_branching_factor);
+            return 1;
+        }
+        const int branch_side = static_cast<int>(std::sqrt(opts.hlod_branching_factor));
+        if (branch_side * branch_side != opts.hlod_branching_factor) {
+            LOG_E("--hlod-branching-factor must be a perfect square >= 4 (for example 4, 9, or 16); got %d",
+                  opts.hlod_branching_factor);
+            return 1;
+        }
+        LOG_I("HLOD hierarchy: branching=%d (%dx%d spatial children per node)",
+              opts.hlod_branching_factor, branch_side, branch_side);
+    }
+
     if (opts.enable_texture_compress) {
         const bool gpu_active = initialize_ktx2_encoder(
             opts.enable_gpu_texture_compress, opts.gpu_texture_serialize);
@@ -664,32 +568,13 @@ int convert_osgb(const ConvertOptions& opts) {
         return 1;
     }
 
-    // Apply source-level filtering before flattening. Doing this here ensures
-    // Phase 2 conversion and Phase 3 JSON encoding see the exact same tree.
+    // Apply the source-level maximum before flattening. Doing this here keeps
+    // Phase 2 conversion and Phase 3 JSON encoding on the exact same tree.
     size_t max_level_pruned = 0;
-    size_t lod_chain_pruned = 0;
-    size_t fine_merge_pruned = 0;
-    size_t fine_merge_count = 0;
-    size_t fine_merge_sources = 0;
-    const uintmax_t fine_merge_max_bytes =
-        static_cast<uintmax_t>(opts.fine_merge_max_input_mb) * 1024u * 1024u;
     for (auto& tr : all_trees) {
         max_level_pruned += prune_above_max_level(tr.root, max_lvl);
-        lod_chain_pruned += prune_single_child_lod_chains(tr.root, opts.lod_step);
-        if (opts.enable_fine_merge) {
-            fine_merge_pruned += aggregate_fine_lod_subtrees(
-                tr.root, tr.stem,
-                static_cast<size_t>(opts.fine_merge_max_sources),
-                fine_merge_max_bytes,
-                fine_merge_count, fine_merge_sources);
-        }
     }
-    LOG_I("Tree pruning: max_lvl removed=%zu, single-child LOD removed=%zu (lod_step=%d)",
-          max_level_pruned, lod_chain_pruned, opts.lod_step);
-    LOG_I("Fine merge: aggregates=%zu, sources=%zu, removed tree nodes=%zu "
-          "(max_sources=%d, max_input_mb=%d)",
-          fine_merge_count, fine_merge_sources, fine_merge_pruned,
-          opts.fine_merge_max_sources, opts.fine_merge_max_input_mb);
+    LOG_I("Tree pruning: max_lvl removed=%zu", max_level_pruned);
 
     // ============================================================
     // Phase 2: Flatten all trees → tile conversion (parallel or serial)
@@ -720,6 +605,7 @@ int convert_osgb(const ConvertOptions& opts) {
         Semaphore sem(p2_threads);
         std::mutex write_mutex;
         std::atomic<size_t> tiles_done{0};
+        std::atomic<size_t> tiles_failed{0};
         std::atomic<size_t> active_chunks{0};
         std::vector<std::future<void>> futures;
         futures.reserve(num_chunks);
@@ -736,6 +622,7 @@ int convert_osgb(const ConvertOptions& opts) {
             auto task = [&sem, &opts, chunk_tiles, chunk_idx, num_chunks,
                          total_tiles = all_tiles.size(),
                          &write_mutex, &tiles_done,
+                         &tiles_failed,
                          &active_chunks,
                          first_flag = std::make_shared<std::atomic<bool>>(false)]() {
                 sem.acquire();
@@ -766,11 +653,8 @@ int convert_osgb(const ConvertOptions& opts) {
                 for (const auto& tile : *chunk_tiles) {
                     ChunkResult r;
                     r.tree = tile.tree;
+                    if (r.tree) r.tree->content_written = false;
                     r.ok = compute_tile_output(tile, opts, r.glb_buf, r.minfo, r.out_file);
-                    if (r.ok && r.tree) {
-                        r.tree->bbox.max = r.minfo.max;
-                        r.tree->bbox.min = r.minfo.min;
-                    }
                     results.push_back(std::move(r));
                 }
 
@@ -785,9 +669,21 @@ int convert_osgb(const ConvertOptions& opts) {
                 {
                     std::lock_guard<std::mutex> lock(write_mutex);
                     for (auto& r : results) {
-                        if (r.ok && !r.glb_buf.empty())
-                            write_file(r.out_file.c_str(), r.glb_buf.data(),
-                                       (unsigned long)r.glb_buf.size());
+                        const bool written = r.ok && !r.glb_buf.empty()
+                            && write_file(r.out_file.c_str(), r.glb_buf.data(),
+                                          (unsigned long)r.glb_buf.size());
+                        if (r.tree) {
+                            r.tree->content_written = written;
+                            if (written) {
+                                r.tree->bbox.max = r.minfo.max;
+                                r.tree->bbox.min = r.minfo.min;
+                            }
+                        }
+                        if (!written) {
+                            tiles_failed.fetch_add(1);
+                            LOG_E("  GLB conversion/write failed; JSON content will be omitted: %s",
+                                  r.out_file.empty() ? "<no output path>" : r.out_file.c_str());
+                        }
                     }
                 }
 
@@ -808,10 +704,19 @@ int convert_osgb(const ConvertOptions& opts) {
               futures.size(),
               std::chrono::duration<double, std::milli>(t_launch_end - t_launch_start).count());
         for (auto& f : futures) f.get();
+        LOG_I("Phase 2 write audit: success=%zu, failed=%zu",
+              all_tiles.size() - tiles_failed.load(), tiles_failed.load());
     } else {
+        size_t tiles_failed = 0;
         for (const auto& tile : all_tiles) {
-            convert_one_tile_from_cached(tile, opts);
+            if (!convert_one_tile_from_cached(tile, opts)) {
+                ++tiles_failed;
+                LOG_E("  GLB conversion/write failed; JSON content will be omitted: %s",
+                      tile.file_name.c_str());
+            }
         }
+        LOG_I("Phase 2 write audit: success=%zu, failed=%zu",
+              all_tiles.size() - tiles_failed, tiles_failed);
     }
 
     LOG_I("Phase 2 complete: %zu tiles converted", all_tiles.size());
@@ -834,7 +739,11 @@ int convert_osgb(const ConvertOptions& opts) {
         calc_geometric_error(tr.root);
 
         std::string json_str = encode_tile_json_1_1(tr.root, degree2rad(center_x), degree2rad(center_y));
-        json tile_tree = json::parse(json_str.empty() ? "{}" : json_str);
+        if (json_str.empty()) {
+            LOG_E("No successfully written GLB in tile tree: %s", tr.stem.c_str());
+            continue;
+        }
+        json tile_tree = json::parse(json_str);
 
         std::string uri_prefix = "/Data/" + tr.stem;
         fix_tile_uris(tile_tree, uri_prefix);
@@ -858,14 +767,12 @@ int convert_osgb(const ConvertOptions& opts) {
     }
 
     // ============================================================
-    // Phase 4: Quadtree HLOD construction (if enabled)
-    //           Builds spatial grid → quadtree → merged GLB per level
+    // Phase 4: Multi-level spatial HLOD construction (if enabled)
+    //           Builds spatial grid -> configurable N-tree -> merged GLB per level
     // ============================================================
     QuadNode quadtree_root;
     bool has_hlod = false;
-
     if (opts.enable_top_reconstruct) {
-        // Collect data for spatial grid from all_trees
         std::vector<std::string> tile_stems;
         std::vector<std::string> coarsest_paths;
         std::vector<TileBox> tile_bboxes;
@@ -876,10 +783,8 @@ int convert_osgb(const ConvertOptions& opts) {
             tile_stems.push_back(tr.stem);
 
             double coarsest_ge = 0.0;
-            std::string coarsest = find_coarsest_node(tr.root, &coarsest_ge);
-            coarsest_paths.push_back(coarsest);
+            coarsest_paths.push_back(find_coarsest_node(tr.root, &coarsest_ge));
             coarsest_ges.push_back(coarsest_ge);
-
             TileBox bbox;
             bbox.max = tr.root.bbox.max;
             bbox.min = tr.root.bbox.min;
@@ -887,32 +792,23 @@ int convert_osgb(const ConvertOptions& opts) {
         }
 
         if (!tile_stems.empty()) {
-            // Step 4.1: Build spatial grid
-            SpatialGrid grid = build_spatial_grid(tile_stems, coarsest_paths, tile_bboxes, coarsest_ges);
-
-            // Step 4.2: Build quadtree bottom-up
-            quadtree_root = build_quadtree(grid);
+            SpatialGrid grid = build_spatial_grid(
+                tile_stems, coarsest_paths, tile_bboxes, coarsest_ges);
+            quadtree_root = build_quadtree(grid, opts.hlod_branching_factor);
             has_hlod = quadtree_root.has_content || !quadtree_root.children.empty();
 
             if (has_hlod) {
-                // Create HLOD output directory
                 fs::path hlod_dir = out_dir / "Data" / "HLOD";
                 std::error_code ec;
                 fs::create_directories(hlod_dir, ec);
 
-                // Step 4.3: Bottom-up merge at each quadtree level.
-                // Use a recursive lambda to process children first.
                 std::function<void(QuadNode&)> merge_node;
-                int root_level = quadtree_root.level;
+                const int root_level = quadtree_root.level;
                 merge_node = [&](QuadNode& node) {
-                    // Process children first (bottom-up)
                     for (auto& child : node.children) {
                         merge_node(child);
                     }
 
-                    // Level 0 is seeded from at most four coarsest source
-                    // OSGBs. Every upper level consumes only the uncompressed
-                    // coarse intermediates produced by its direct children.
                     std::vector<std::string> source_paths;
                     std::vector<HlodIntermediatePtr> child_intermediates;
                     if (node.level == 0) {
@@ -922,9 +818,6 @@ int convert_osgb(const ConvertOptions& opts) {
                             if (child.intermediate) {
                                 child_intermediates.push_back(child.intermediate);
                             } else {
-                                // A failed child must not leave a hole in its
-                                // parent overview. Fall back only for that
-                                // child's source region.
                                 collect_leaf_paths(child, grid, source_paths);
                             }
                         }
@@ -937,23 +830,20 @@ int convert_osgb(const ConvertOptions& opts) {
                         return;
                     }
 
-                    // Determine output file name
                     std::string glb_name;
                     if (node.level == root_level) {
                         glb_name = "root.glb";
                     } else {
                         char buf[128];
-                        int display_level = root_level - 1 - node.level;
+                        const int display_level = root_level - 1 - node.level;
                         snprintf(buf, sizeof(buf), "L%d_X%+04d_Y%+04d.glb",
                                  display_level, node.grid_x, node.grid_y);
                         glb_name = buf;
                     }
 
-                    // Pass node.level + 1 to preserve calc_level_ratio semantics:
-                    // level 0 (first merge) → ratio = 0.25, level 1 → 0.0625, etc.
-                    LOG_I("HLOD merge: %s (level=%d, %zu OSGB fallbacks, %zu direct child models, grid=(%d,%d) size=%d)",
-                          glb_name.c_str(), node.level, source_paths.size(),
-                          child_intermediates.size(),
+                    LOG_I("HLOD merge: %s (level=%d, branching=%d, %zu OSGB fallbacks, %zu direct child models, grid=(%d,%d) size=%d)",
+                          glb_name.c_str(), node.level, opts.hlod_branching_factor,
+                          source_paths.size(), child_intermediates.size(),
                           node.grid_x, node.grid_y, node.grid_size);
 
                     std::string glb_buf;
@@ -964,41 +854,26 @@ int convert_osgb(const ConvertOptions& opts) {
                         opts.enable_draco, opts.enable_unlit,
                         opts.top_texture_max_size, opts.simplify_ratio,
                         opts.draco_pos_bits, opts.draco_normal_bits, opts.draco_uv_bits,
-                        opts.ktx2_quality, child_intermediates, &node.intermediate);
+                        opts.ktx2_quality, child_intermediates, &node.intermediate,
+                        opts.hlod_branching_factor);
 
-                    // The parent now owns deep copies of the direct-child
-                    // intermediates. Release child levels immediately to keep
-                    // peak memory bounded during the bottom-up build.
-                    for (auto& child : node.children)
+                    for (auto& child : node.children) {
                         child.intermediate.reset();
+                    }
 
                     if (ok && !glb_buf.empty()) {
-                        const size_t max_hlod_bytes =
-                            static_cast<size_t>(opts.hlod_max_output_mb) * 1024u * 1024u;
-                        if (opts.hlod_max_output_mb > 0
-                            && glb_buf.size() > max_hlod_bytes) {
-                            // Keep the intermediate for the direct parent, but
-                            // omit this oversized drawable.  The JSON encoder
-                            // turns the node into an index tile and forces
-                            // refinement to its spatial children.
-                            LOG_W("  HLOD content %.2f MB exceeds limit %d MB; using index-only node",
-                                  glb_buf.size() / (1024.0 * 1024.0),
-                                  opts.hlod_max_output_mb);
+                        fs::path glb_path = hlod_dir / glb_name;
+                        if (write_file(glb_path.string().c_str(), glb_buf.data(),
+                                       (unsigned long)glb_buf.size())) {
+                            node.bbox = merged_bbox;
+                            node.glb_uri = "./Data/HLOD/" + glb_name;
+                            node.has_content = true;
+                            LOG_I("  written: %s (%zu bytes)",
+                                  glb_path.string().c_str(), glb_buf.size());
+                        } else {
+                            LOG_E("  failed to write: %s", glb_path.string().c_str());
                             node.has_content = false;
                             node.glb_uri.clear();
-                        } else {
-                            fs::path glb_path = hlod_dir / glb_name;
-                            if (write_file(glb_path.string().c_str(),
-                                           glb_buf.data(), (unsigned long)glb_buf.size())) {
-                                node.bbox = merged_bbox;
-                                node.glb_uri = "./Data/HLOD/" + glb_name;
-                                node.has_content = true;
-                                LOG_I("  written: %s (%zu bytes)", glb_path.string().c_str(), glb_buf.size());
-                            } else {
-                                LOG_E("  failed to write: %s", glb_path.string().c_str());
-                                node.has_content = false;
-                                node.glb_uri.clear();
-                            }
                         }
                     } else {
                         LOG_W("  merge failed for level %d node at (%d,%d)",
@@ -1013,8 +888,7 @@ int convert_osgb(const ConvertOptions& opts) {
 
                 if (!quadtree_root.has_content || quadtree_root.glb_uri.empty()) {
                     const bool has_fallback_descendants =
-                        !quadtree_root.children.empty()
-                        || !quadtree_root.leaf_stems.empty();
+                        !quadtree_root.children.empty() || !quadtree_root.leaf_stems.empty();
                     if (!has_fallback_descendants) {
                         LOG_E("HLOD root has neither drawable content nor descendants");
                         return 1;
@@ -1022,9 +896,10 @@ int convert_osgb(const ConvertOptions& opts) {
                     LOG_W("HLOD root is index-only; Cesium will refine to spatial descendants");
                 }
 
-                LOG_I("Phase 4 complete: HLOD quadtree built (%d levels)", root_level);
+                LOG_I("Phase 4 complete: %d-ary HLOD tree built (%d levels)",
+                      opts.hlod_branching_factor, root_level + 1);
             } else {
-                LOG_W("Quadtree build returned empty root, falling back to flat tileset");
+                LOG_W("Spatial HLOD build returned empty root, falling back to flat tileset");
             }
         } else {
             LOG_W("No tile stems collected, skipping HLOD build");
@@ -1121,47 +996,16 @@ int convert_osgb(const ConvertOptions& opts) {
     root_tileset["extensionsRequired"] = json::array({"3DTILES_content_gltf"});
 
     if (has_hlod) {
-        // HLOD mode: root tile is the quadtree root.
-        // When split_json is enabled, writes sub-tilesets at the specified
-        // display level and returns reference tiles instead of full subtrees.
-        int split_d = 0;
-        if (opts.enable_split_json) {
-            if (opts.split_depth > 0) {
-                split_d = std::min(opts.split_depth, quadtree_root.level);
-            } else {
-                // Select a uniform spatial split depth so each external HLOD
-                // JSON contains roughly split_target_tiles source tile trees.
-                // Keep at least one lightweight root-index level.
-                split_d = 1;
-                size_t shard_count = 4;
-                while (split_d < quadtree_root.level
-                       && (tile_results.size() + shard_count - 1) / shard_count
-                            > static_cast<size_t>(opts.split_target_tiles)) {
-                    ++split_d;
-                    shard_count *= 4;
-                }
-                LOG_I("split-json auto depth=%d, target=%d source tiles/shard, estimated shards=%zu",
-                      split_d, opts.split_target_tiles, shard_count);
-            }
-        }
-        bool do_split = opts.enable_split_json && split_d > 0;
-        std::string out_dir_str = do_split ? out_dir.string() : "";
+        const std::string out_dir_str =
+            opts.enable_split_json ? out_dir.string() : "";
         json quadtree_json = encode_quadtree_json(
             quadtree_root, tile_jsons_map,
-            0,                       // current_display_level (root = 0)
-            quadtree_root.level,     // root_level of quadtree
-            split_d,
             out_dir_str,
-            false);                  // embed PagedLOD trees inside spatial HLOD shards
+            opts.enable_split_json);
 
         // Add ECEF transform to root
         quadtree_json["transform"] = trans_vec;
         quadtree_json["boundingVolume"]["box"] = box_to_tileset_box(root_box);
-
-        // encode_quadtree_json raises the GE of an index-only root so Cesium
-        // cannot stop refinement at a tile that has no drawable content.
-        // Preserve that effective value instead of overwriting it with the
-        // finite quadtree approximation error.
         const double encoded_root_ge =
             quadtree_json.value("geometricError", root_ge);
         root_tileset["geometricError"] = encoded_root_ge;

@@ -417,17 +417,11 @@ src/ 和 src1.1/ 现在共享完整的网格处理管线。核心差异仅在于
 | `--enable-draco` | 启用 Draco 网格压缩 | off |
 | `--enable-simplify` | 启用 meshoptimizer 网格简化 | off |
 | `--enable-unlit` | 启用 KHR_materials_unlit 扩展 | on |
-| `--enable-top-reconstruct` | 构建四叉树 HLOD（逐级合并生成简化 GLB） | off |
+| `--enable-top-reconstruct` | 构建多级空间 HLOD（逐级合并生成简化 GLB） | off |
+| `--hlod-branching-factor` | 每个 HLOD 节点的最大子节点数，须为不小于 4 的完全平方数（4=2×2，16=4×4） | 16 |
 | `--no-parallel` | 禁用多线程 tile 转换（默认开启并行） | off（即默认并行） |
-| `--split-json` | 将 tileset.json 分割为根索引 + `subtilesets/` 外部子瓦片集 | off |
-| `--split-depth` | HLOD 四叉树分割显示层级（0=按目标瓦片数自动选择） | 0 |
-| `--split-target-tiles` | 自动分割时每个 HLOD 外部 JSON 的目标源瓦片数 | 256 |
-| `--lod-step` | 单子节点 LOD 链每隔 N 级保留一级（1=不裁剪） | 2 |
-| `--no-fine-merge` | 禁用最细层空间子树聚合 | off |
-| `--fine-merge-max-sources` | 单个细节聚合 GLB 最多包含的叶级源文件数 | 16 |
-| `--fine-merge-max-input-mb` | 单个细节聚合的源 OSGB 总大小上限（MB） | 64 |
-| `--hlod-max-source-tiles` | 兼容参数；逐级直接子粗模合并不再因源瓦片总数制造空 HLOD 节点 | 16 |
-| `--hlod-max-output-mb` | HLOD GLB 大小上限；超限节点改为纯索引并继续细化（0=不限） | 8 |
+| `--split-json` | 主 JSON 保留 HLOD 索引，每个源瓦片 LOD 树写入独立 `subtilesets/<stem>.json` | off |
+| `--hlod-max-source-tiles` | 单个可绘制 HLOD 最多独立合并的源粗模数量；超过后作为纯索引节点（0=无限制） | 256 |
 | `--max-lvl` | 转换并写入 tileset 的最大源 LOD 层级 | 100 |
 | `--top-texture-max-size` | Root GLB 纹理最大尺寸（0=不限制） | 512 |
 | `--simplify-ratio` | Meshopt 简化目标比例（1.0=不简化） | 0.5 |
@@ -460,11 +454,10 @@ src/ 和 src1.1/ 现在共享完整的网格处理管线。核心差异仅在于
 ### 转换器提交历史
 
 ```
-(最新)  feat(src1.1): 内置 tileset.json 分割 (--split-json/--split-depth)，新增 x64-Release 配置
+(最新)  feat(src1.1): 内置 tileset.json 分割（--split-json），新增 x64-Release 配置
         - --split-json: 转换时直接生成「根索引 + subtilesets/ 外部子瓦片集」结构
         - Flat 模式: 每个顶层 Tile 树写为 subtilesets/<stem>.json，根 tileset 仅保留轻量引用
-        - HLOD 模式: encode_quadtree_json() 按 --split-depth 显示层级切割四叉树为外部子瓦片集
-        - HLOD 模式: level-0 PagedLOD 子树外置（JSON 体积过大的主要来源）
+        - HLOD 模式: 主 tileset 保留完整 HLOD 层级，源瓦片 PagedLOD 树分别外置
         - URI 重写: ./Data/... → ../Data/...（子瓦片集位于 subtilesets/ 下一级）
         - CMakeSettings.json 新增 x64-Release (Ninja) 配置
 93bbec7 feat(src1.1): 四叉树HLOD、KTX2质量控制、线程数可配、tileset分割工具
@@ -518,9 +511,11 @@ src/ 和 src1.1/ 现在共享完整的网格处理管线。核心差异仅在于
 
 `--no-parallel` 现在完全禁用 Phase 1 + Phase 2 的并行，Phase 3 始终串行。
 
-### 四叉树 HLOD（--enable-top-reconstruct）
+### 可配置空间 N 叉树 HLOD（--enable-top-reconstruct）
 
-当启用 `--enable-top-reconstruct` 时，Phase 4 会构建一个四叉树 HLOD（Hierarchical Level of Detail）层级结构：
+启用 `--enable-top-reconstruct` 后，Phase 4 构建多级 HLOD。默认
+`--hlod-branching-factor 16`，即每层按 4×4 空间区域合并；传入 4 可恢复
+传统的 2×2 四叉树。
 
 **处理流程：**
 
@@ -535,19 +530,19 @@ Step 4.1: build_spatial_grid()
        │
        ▼
 Step 4.2: build_quadtree()
-  ├── 计算网格边界，padding 到 2 的幂
-  ├── 从 size=2 开始自底向上递归构建 QuadNode
-  │   - Level 0 (size=2): 合并 4 个 GridCell → 1 个 quadtree 节点
-  │   - Level N (size=2^(N+2)): 合并 4 个 Level N-1 节点
-  └── geometricError 逐级递增（每个父级 = max(子级) × 1.55）
+  ├── N 的平方根为每个空间轴的分组宽度
+  ├── N=16 时 padding 到 4 的幂，每个节点最多包含 4×4 个子区域
+  ├── N=4 时 padding 到 2 的幂，行为与传统四叉树一致
+  └── geometricError 按等效空间跨度逐级递增
        │
        ▼
 Step 4.3: 逐级合并生成 GLB
   ├── Level 0 从本区域 coarsest OSGB 生成粗模
-  ├── Level 1+ 只合并直接子节点已经生成的粗模
+  ├── Level 1+ 合并直接子节点的未压缩中间粗模
+  │   - N=16 时每升一级继续按 1/16 简化
+  │   - N=4 时每升一级继续按 1/4 简化
   │   - 纹理去重（hash 采样）
-  │   - 每升一级继续按 0.25 简化并逐级降低纹理尺寸
-  │   - 子节点失败时仅回退收集该子区域原始 OSGB，避免区域缺失
+  │   - 子节点失败时回退到该子区域的原始 OSGB，避免区域缺失
   └── 输出: Data/HLOD/root.glb, L0_X+0000_Y+0000.glb, ...
        │
        ▼
@@ -559,13 +554,13 @@ Step 5: encode_quadtree_json()
 **关键设计点：**
 - 叶子节点保留 PagedLOD 原始 GLB（不修改），作为 HLOD level-0 的 children
 - 无 content 的索引层会被压平，并使用高 geometricError 强制 Cesium 继续细化
-- HLOD 根节点优先生成可显示的 `root.glb`；若粗模超过 `--hlod-max-output-mb`，
-  则输出纯索引根并强制 Cesium 继续细化到空间子节点
+- 可绘制 HLOD 独立合并的源粗模数量由 `--hlod-max-source-tiles` 控制；更高层为纯索引
+- tile 包围盒始终覆盖其可绘制内容和全部后代，避免精细子瓦片被父节点错误裁剪
 - 合并后的 GLB 写入 `Data/HLOD/` 目录
 - tileset.json root 直接使用 quadtree 结构（替代 flat children 列表）
 - 单 tile 数据集的 2×2 区域不合并（保持原始质量）
 
-### 内置 tileset.json 分割（--split-json / --split-depth）
+### 内置 tileset.json 分割（--split-json）
 
 当数据集很大时，单体 tileset.json 可达数十 MB，Cesium 首次加载需要完整解析整个 JSON，明显卡顿。1.1 版新增**转换时内置分割**，一步到位生成「根索引 + 外部子瓦片集」结构，无需后处理：
 
@@ -573,21 +568,18 @@ Step 5: encode_quadtree_json()
 # Flat 模式：每个顶层 Tile 树一个子瓦片集
 ./osgb_converter_1_1 -i input -o output --split-json
 
-# HLOD 模式：自动选择分割深度，使每个外部 JSON 约含 256 个源 Tile
+# HLOD 模式：主 JSON 保留完整 HLOD，每个源瓦片 LOD 树单独外置
 ./osgb_converter_1_1 -i input -o output --enable-top-reconstruct --split-json
-
-# 也可手动固定分割深度
-./osgb_converter_1_1 -i input -o output --enable-top-reconstruct --split-json --split-depth 2
 ```
 
 **输出结构：**
 
 ```
 output_dir/
-├── tileset.json                       ← 根索引（仅轻量引用瓦片）
+├── tileset.json                       ← 完整 HLOD 索引 + 源瓦片 JSON 引用
 ├── subtilesets/
 │   ├── Tile_-051_+050.json            ← Flat 模式外置子树
-│   ├── HLOD_L1_X+000_Y+000.json       ← HLOD 模式：按 --split-depth 切割的四叉树子树
+│   ├── Tile_-050_+050.json            ← 每个文件保留对应瓦片的完整 LOD 层级
 │   └── ...
 └── Data/...
 ```
@@ -595,7 +587,7 @@ output_dir/
 **分割行为：**
 
 - **Flat 模式**（未开 HLOD）：每个顶层 Tile 树写为独立的 `subtilesets/<stem>.json`，根 tileset.json 只保留轻量引用瓦片（boundingVolume + content.uri + geometricError）
-- **HLOD 模式**：默认依据 `--split-target-tiles` 自动选择分割深度，也可通过 `--split-depth` 固定；每个空间 HLOD 分片内部直接嵌入 PagedLOD 树，不再为每个源 Tile 额外生成一个 JSON，从而把原先数千个 HTTP 请求压缩为少量空间分片请求
+- **HLOD 模式**：主 tileset.json 保留完整的多级空间 HLOD；到源瓦片层后，每个瓦片的 PagedLOD/LOD 树写入独立的 `subtilesets/<stem>.json`
 - Web 服务建议启用 HTTP/2 和长期静态缓存，进一步降低并发调度与重复传输成本
 - **URI 重写**：子瓦片集位于 `subtilesets/`（比根低一级），内部所有 `./Data/...` URI 自动改写为 `../Data/...`
 - 每个子瓦片集是完整合法的 3D Tiles 1.1 tileset（含 `asset.version` 和 `3DTILES_content_gltf` 声明）

@@ -56,14 +56,8 @@ struct HardcodedConfig {
     bool enable_parallel;
     int  num_threads;
     bool enable_split_json;
-    int  split_depth;
-    int  split_target_tiles;
-    int  lod_step;
-    bool enable_fine_merge;
-    int  fine_merge_max_sources;
-    int  fine_merge_max_input_mb;
+    int  hlod_branching_factor;
     int  hlod_max_source_tiles;
-    int  hlod_max_output_mb;
     double override_lon;
     double override_lat;
     double override_alt;
@@ -92,14 +86,8 @@ static const HardcodedConfig g_config = {
     /* enable_parallel */ true,
     /* num_threads     */ 0,
     /* enable_split_json */ false,
-    /* split_depth     */ 0,
-    /* split_target_tiles */ 256,
-    /* lod_step        */ 2,
-    /* enable_fine_merge */ true,
-    /* fine_merge_max_sources */ 16,
-    /* fine_merge_max_input_mb */ 64,
+    /* hlod_branching_factor */ 16,
     /* hlod_max_source_tiles */ 16,
-    /* hlod_max_output_mb */ 8,
     /* override_lon */ 0.0,
     /* override_lat */ 0.0,
     /* override_alt */ 0.0,
@@ -318,8 +306,9 @@ static void print_usage(const char* prog) {
         "  --enable-texture-compress  Enable KTX2 texture compression\n"
         "  --enable-lod            Enable Level of Detail\n"
         "  --enable-unlit          Enable KHR_materials_unlit (default: on for OSGB)\n"
-        "  --enable-top-reconstruct  Merge coarsest LOD tiles into a root overview GLB\n"
+        "  --enable-top-reconstruct  Build a multi-level spatial HLOD hierarchy\n"
         "  --top-texture-max-size N  Max texture dim for root GLB (default: 512, 0=no limit)\n"
+        "  --hlod-branching-factor N  Children per HLOD node (default: 16; perfect square >= 4)\n"
         "  --simplify-ratio R      Meshopt target_ratio (default: 0.5, 1.0=no simplify)\n"
         "  --draco-pos-bits N      Draco position quant bits (default: 11)\n"
         "  --draco-normal-bits N   Draco normal quant bits (default: 10)\n"
@@ -330,14 +319,7 @@ static void print_usage(const char* prog) {
         "  --no-parallel           Disable all multi-threading (Phase 1 + Phase 2)\n"
         "  --threads N             Number of worker threads (default: auto=CPU cores)\n"
         "  --split-json            Split tileset.json into root index + sub-tilesets\n"
-        "  --split-depth N         HLOD split depth (default: 0=auto)\n"
-        "  --split-target-tiles N  Auto split target source tiles/shard (default: 256)\n"
-        "  --lod-step N            Keep every Nth single-child LOD node (default: 2, 1=off)\n"
-        "  --no-fine-merge         Disable finest-LOD subtree aggregation\n"
-        "  --fine-merge-max-sources N  Max leaf files per fine aggregate (default: 16)\n"
-        "  --fine-merge-max-input-mb N  Max source MB per fine aggregate (default: 64)\n"
         "  --hlod-max-source-tiles N  Compatibility option (progressive HLOD no longer drops by source count)\n"
-        "  --hlod-max-output-mb N  Omit HLOD drawables above N MB (default: 8, 0=unlimited)\n"
         "  --max-lvl N             Maximum source LOD level to convert (default: 100)\n"
         "  --geoid <model>         Geoid model: none, egm84, egm96, egm2008\n"
         "  --geoid-path <path>     Path to geoid data files\n"
@@ -386,14 +368,8 @@ int main(int argc, char* argv[]) {
     opts.enable_parallel         = g_config.enable_parallel;
     opts.num_threads             = g_config.num_threads;
     opts.enable_split_json       = g_config.enable_split_json;
-    opts.split_depth             = g_config.split_depth;
-    opts.split_target_tiles      = g_config.split_target_tiles;
-    opts.lod_step                = g_config.lod_step;
-    opts.enable_fine_merge       = g_config.enable_fine_merge;
-    opts.fine_merge_max_sources  = g_config.fine_merge_max_sources;
-    opts.fine_merge_max_input_mb = g_config.fine_merge_max_input_mb;
+    opts.hlod_branching_factor   = g_config.hlod_branching_factor;
     opts.hlod_max_source_tiles   = g_config.hlod_max_source_tiles;
-    opts.hlod_max_output_mb      = g_config.hlod_max_output_mb;
 
     if (g_config.override_lon != 0.0) opts.center_x = g_config.override_lon;
     if (g_config.override_lat != 0.0) opts.center_y = g_config.override_lat;
@@ -441,22 +417,10 @@ int main(int argc, char* argv[]) {
             opts.num_threads = std::stoi(argv[++i]);
         } else if (arg == "--split-json") {
             opts.enable_split_json = true;
-        } else if (arg == "--split-depth" && i + 1 < argc) {
-            opts.split_depth = std::stoi(argv[++i]);
-        } else if (arg == "--split-target-tiles" && i + 1 < argc) {
-            opts.split_target_tiles = std::max(1, std::stoi(argv[++i]));
-        } else if (arg == "--lod-step" && i + 1 < argc) {
-            opts.lod_step = std::max(1, std::stoi(argv[++i]));
-        } else if (arg == "--no-fine-merge") {
-            opts.enable_fine_merge = false;
-        } else if (arg == "--fine-merge-max-sources" && i + 1 < argc) {
-            opts.fine_merge_max_sources = std::max(2, std::stoi(argv[++i]));
-        } else if (arg == "--fine-merge-max-input-mb" && i + 1 < argc) {
-            opts.fine_merge_max_input_mb = std::max(1, std::stoi(argv[++i]));
+        } else if (arg == "--hlod-branching-factor" && i + 1 < argc) {
+            opts.hlod_branching_factor = std::stoi(argv[++i]);
         } else if (arg == "--hlod-max-source-tiles" && i + 1 < argc) {
             opts.hlod_max_source_tiles = std::max(0, std::stoi(argv[++i]));
-        } else if (arg == "--hlod-max-output-mb" && i + 1 < argc) {
-            opts.hlod_max_output_mb = std::max(0, std::stoi(argv[++i]));
         } else if (arg == "--max-lvl" && i + 1 < argc) {
             opts.max_lvl = std::stoi(argv[++i]);
         } else if (arg == "--enable-top-reconstruct" || arg == "--enable-top_reconstruct") {
