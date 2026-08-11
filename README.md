@@ -533,7 +533,7 @@ Step 4.2: build_quadtree()
   ├── N 的平方根为每个空间轴的分组宽度
   ├── N=16 时 padding 到 4 的幂，每个节点最多包含 4×4 个子区域
   ├── N=4 时 padding 到 2 的幂，行为与传统四叉树一致
-  └── geometricError 按等效空间跨度逐级递增
+  └── geometricError 以全局源瓦片基准逐级乘以 1.55
        │
        ▼
 Step 4.3: 逐级合并生成 GLB
