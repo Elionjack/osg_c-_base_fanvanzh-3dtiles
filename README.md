@@ -242,7 +242,7 @@ input_dir/
 ./osgb_converter_1_1 -i E:\learning\data\1 -o E:\learning\data\output\all_on \
     --enable-simplify --enable-draco --enable-texture-compress \
     --enable-top-reconstruct --simplify-ratio 0.5 \
-    --draco-pos-bits 11 --draco-normal-bits 10 --draco-uv-bits 12 \
+    --draco-pos-bits 20 --draco-normal-bits 10 --draco-uv-bits 12 \
     --ktx2-quality 128 --threads 8
 ```
 
@@ -264,7 +264,7 @@ static const HardcodedConfig g_config = {
     /* top_reconstruct     */ false,
     /* top_texture_max_size */ 512,
     /* simplify_ratio      */ 0.5,
-    /* draco_pos_bits      */ 11,
+    /* draco_pos_bits      */ 20,
     /* draco_normal_bits   */ 10,
     /* draco_uv_bits       */ 12,
     /* enable_parallel     */ true,
@@ -425,7 +425,7 @@ src/ 和 src1.1/ 现在共享完整的网格处理管线。核心差异仅在于
 | `--max-lvl` | 转换并写入 tileset 的最大源 LOD 层级 | 100 |
 | `--top-texture-max-size` | Root GLB 纹理最大尺寸（0=不限制） | 512 |
 | `--simplify-ratio` | Meshopt 简化目标比例（1.0=不简化） | 0.5 |
-| `--draco-pos-bits` | Draco 位置量化位数 | 11 |
+| `--draco-pos-bits` | Draco 位置量化位数 | 20 |
 | `--draco-normal-bits` | Draco 法向量化位数 | 10 |
 | `--draco-uv-bits` | Draco UV 量化位数 | 12 |
 | `--ktx2-quality` | KTX2 编码质量 (1-255，越低越快) | 128 |
@@ -434,6 +434,51 @@ src/ 和 src1.1/ 现在共享完整的网格处理管线。核心差异仅在于
 | `--threads` | 工作线程数（0=自动=CPU 核心数） | 0 |
 | `--geoid` | 大地水准面模型：`none`/`egm84`/`egm96`/`egm2008` | none |
 | `--geoid-path` | 大地水准面数据文件路径 | 自动 |
+
+### src1.1 HLOD 单 primitive 二阶段压缩
+
+启用 `--enable-top-reconstruct` 后，`src1.1` 对每个 HLOD GLB 执行二阶段处理：
+
+1. 先走原有转换流程，按 `--simplify-ratio` 对各 OSG geometry 分别简化，按
+   `--top-texture-max-size` 缩放纹理，并按命令行选项生成 Draco/KTX2 中间 GLB。
+2. 写盘前调用共享 HLOD 优化内核，解码中间 GLB，将该 GLB 内的所有纹理合并
+   为一张 JPEG atlas、将所有 primitive 合并为一个 primitive，再执行带法线和
+   UV 属性的整体简化，锁定拓扑外边界，最后以 20-bit POSITION Draco 重编码。
+
+普通细节 GLB 不执行第二阶段。HLOD 第二阶段参数固定如下：
+
+| HLOD 层 | 几何目标 | 最大绝对误差 | JPEG atlas |
+|---------|----------|--------------|------------|
+| root | 65% | 0.50 | 1024×1024 |
+| L0 | 70% | 0.25 | 512×512 |
+| L1 及更深层 | 75% | 0.15 | 256×256 |
+
+JPEG atlas 质量为 80。简化器受误差和拓扑约束，可能提前停止，不会为强行达到
+目标比例而破坏边界。每个成功写出的 HLOD GLB 均恰好包含一个 primitive；若
+最终优化失败，则不会静默写出旧的多 primitive HLOD。
+
+复现 v8 后处理效果的 Linux 示例：
+
+```bash
+nohup ./run.sh \
+  -i /absolute/path/to/input \
+  -o /absolute/path/to/output \
+  --enable-simplify \
+  --simplify-ratio 0.5 \
+  --enable-draco \
+  --draco-pos-bits 20 \
+  --enable-top-reconstruct \
+  --hlod-branching-factor 64 \
+  --top-texture-max-size 128 \
+  --enable-texture-compress \
+  --ktx2-quality 64 \
+  --threads 16 \
+  --split-json \
+  > run.log 2>&1 &
+```
+
+Linux 上必须重新编译 `osgb_converter_1_1` 或更新运行包中的二进制；仅修改参数
+不能让旧二进制获得单 primitive HLOD 流程。
 
 > GPU 纹理压缩要求 BasisU 以 `BASISU_OPENCL=ON` 编译。vcpkg 默认端口通常关闭此选项；
 > 如果启动日志出现 `OpenCL requested but unavailable`，需要用开启该 CMake 选项的

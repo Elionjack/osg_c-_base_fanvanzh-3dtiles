@@ -65,6 +65,7 @@ target_include_directories(osgb_converter_deps INTERFACE
     ${OPENSCENEGRAPH_INCLUDE_DIRS}
     ${TINYGLTF_INCLUDE_DIRS}
     ${EIGEN3_INCLUDE_DIRS}
+    ${Stb_INCLUDE_DIR}
 )
 target_link_libraries(osgb_converter_deps INTERFACE
     nlohmann_json::nlohmann_json
@@ -135,6 +136,7 @@ set(SOURCES_1_1
     src1.1/coordinate_transformer.cpp
     src1.1/geoid_height.cpp
     src1.1/mesh_processor.cpp
+    root_glb_optimizer/main.cpp
 )
 set(HEADERS_1_1
     src1.1/utils.h
@@ -147,6 +149,10 @@ set(HEADERS_1_1
 )
 add_executable(osgb_converter_1_1 ${SOURCES_1_1} ${HEADERS_1_1})
 configure_osgb_target(osgb_converter_1_1 src1.1)
+target_include_directories(osgb_converter_1_1 PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/root_glb_optimizer)
+set_source_files_properties(root_glb_optimizer/main.cpp PROPERTIES
+    COMPILE_DEFINITIONS HLOD_OPTIMIZER_LIBRARY)
 
 # OpenCL-enabled BasisU is still a static library. BasisU 2.1 does not export
 # its OpenCL loader dependency, so link it explicitly when the overlay package

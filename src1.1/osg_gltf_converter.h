@@ -62,7 +62,7 @@ bool osgb2glb_buf_from_node(osg::Node* root, std::string parent_path,
                             bool enable_meshopt = false, bool enable_draco = false,
                             bool enable_unlit = true,
                             double simplify_ratio = 0.5,
-                            int draco_pos_bits = 11, int draco_normal_bits = 10,
+                            int draco_pos_bits = 20, int draco_normal_bits = 10,
                             int draco_uv_bits = 12, int ktx2_quality = 128);
 
 // Convert OSGB file to GLB buffer (reads from disk via osgDB::readNodeFiles)
@@ -71,7 +71,7 @@ bool osgb2glb_buf(std::string path, std::string& glb_buff, MeshInfo& mesh_info,
                   bool enable_meshopt = false, bool enable_draco = false,
                   bool enable_unlit = true,
                   double simplify_ratio = 0.5,
-                  int draco_pos_bits = 11, int draco_normal_bits = 10,
+                  int draco_pos_bits = 20, int draco_normal_bits = 10,
                   int draco_uv_bits = 12, int ktx2_quality = 128);
 
 // Convert OSGB file to B3DM buffer (includes GLB inside)
@@ -80,7 +80,7 @@ bool osgb2b3dm_buf(std::string path, std::string& b3dm_buf, TileBox& tile_box,
                    bool enable_meshopt = false, bool enable_draco = false,
                    bool enable_unlit = true,
                    double simplify_ratio = 0.5,
-                   int draco_pos_bits = 11, int draco_normal_bits = 10,
+                   int draco_pos_bits = 20, int draco_normal_bits = 10,
                    int draco_uv_bits = 12, int ktx2_quality = 128);
 
 // Process all tiles recursively
@@ -88,7 +88,7 @@ void do_tile_job(osg_tree& tree, std::string out_path, int max_lvl,
                  bool enable_texture_compress = false, bool enable_meshopt = false,
                  bool enable_draco = false, bool enable_unlit = true,
                  double simplify_ratio = 0.5,
-                 int draco_pos_bits = 11, int draco_normal_bits = 10,
+                 int draco_pos_bits = 20, int draco_normal_bits = 10,
                  int draco_uv_bits = 12, int ktx2_quality = 128);
 
 // Bounding box operations
@@ -110,7 +110,7 @@ void do_tile_job_1_1(osg_tree& tree, std::string out_path, int max_lvl,
                      bool enable_texture_compress = false, bool enable_meshopt = false,
                      bool enable_draco = false, bool enable_unlit = true,
                      double simplify_ratio = 0.5,
-                     int draco_pos_bits = 11, int draco_normal_bits = 10,
+                     int draco_pos_bits = 20, int draco_normal_bits = 10,
                      int draco_uv_bits = 12, int ktx2_quality = 128);
 
 // JSON generation for tile trees (3D Tiles 1.1 compatible)
@@ -225,7 +225,7 @@ bool build_merged_glb(
     bool enable_unlit,
     int top_texture_max_size = 512,
     double simplify_ratio = 0.5,
-    int draco_pos_bits = 11, int draco_normal_bits = 10,
+    int draco_pos_bits = 20, int draco_normal_bits = 10,
     int draco_uv_bits = 12, int ktx2_quality = 128,
     const std::vector<HlodIntermediatePtr>& child_intermediates = {},
     HlodIntermediatePtr* out_intermediate = nullptr,
@@ -258,5 +258,5 @@ bool build_merged_root_glb(
     bool enable_unlit,
     int top_texture_max_size = 512,
     double simplify_ratio = 0.5,
-    int draco_pos_bits = 11, int draco_normal_bits = 10,
+    int draco_pos_bits = 20, int draco_normal_bits = 10,
     int draco_uv_bits = 12, int ktx2_quality = 128);

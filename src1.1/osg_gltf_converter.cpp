@@ -2,6 +2,7 @@
 #include "osgb_converter.h"
 #include "coordinate_transformer.h"
 #include "mesh_processor.h"
+#include "hlod_optimizer.h"
 
 #include <osg/Material>
 #include <osg/PagedLOD>
@@ -24,6 +25,7 @@
 #include <cmath>
 #include <climits>
 
+#define TINYGLTF_ENABLE_DRACO
 #define TINYGLTF_IMPLEMENTATION
 #include <tiny_gltf.h>
 
@@ -939,7 +941,7 @@ static tinygltf::Material make_default_material(double r = 1.0, double g = 1.0, 
 static void write_osgGeometry(osg::Geometry* g, OsgBuildState* osgState,
                               bool enable_simplify, bool enable_draco,
                               double simplify_ratio = 0.5,
-                              int draco_pos_bits = 11, int draco_normal_bits = 10,
+                              int draco_pos_bits = 20, int draco_normal_bits = 10,
                               int draco_uv_bits = 12) {
     // ================================================================
     // Step 1: Mesh simplification (meshoptimizer)

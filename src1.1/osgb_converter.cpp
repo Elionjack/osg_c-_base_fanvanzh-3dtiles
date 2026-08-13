@@ -1,5 +1,6 @@
 #include "osgb_converter.h"
 #include "osg_gltf_converter.h"
+#include "hlod_optimizer.h"
 #include "coordinate_system.h"
 #include "coordinate_transformer.h"
 #include "geoid_height.h"
@@ -856,6 +857,35 @@ int convert_osgb(const ConvertOptions& opts) {
                         opts.draco_pos_bits, opts.draco_normal_bits, opts.draco_uv_bits,
                         opts.ktx2_quality, child_intermediates, &node.intermediate,
                         opts.hlod_branching_factor);
+
+                    // Finalize each HLOD exactly as the validated standalone
+                    // workflow does: one JPEG atlas, one merged primitive,
+                    // attribute-aware simplification with locked topological
+                    // borders, and 20-bit Draco positions.  The intermediate
+                    // OSG geometry remains available for constructing the
+                    // next HLOD level; only the emitted GLB is repacked.
+                    if (ok && !glb_buf.empty()) {
+                        const bool is_root = glb_name == "root.glb";
+                        const bool is_l0 = glb_name.rfind("L0_", 0) == 0;
+                        const int atlas_size = is_root ? 1024 : (is_l0 ? 512 : 256);
+                        const double target_ratio = is_root ? 0.65 : (is_l0 ? 0.70 : 0.75);
+                        const double max_error = is_root ? 0.50 : (is_l0 ? 0.25 : 0.15);
+                        std::string optimized_glb;
+                        std::string optimize_error;
+                        if (!optimize_hlod_glb_buffer(
+                                glb_buf, optimized_glb, atlas_size, target_ratio,
+                                max_error, 80, &optimize_error)) {
+                            LOG_E("HLOD one-primitive optimization failed for %s: %s",
+                                  glb_name.c_str(), optimize_error.c_str());
+                            ok = false;
+                            glb_buf.clear();
+                        } else {
+                            LOG_I("HLOD finalized: %s, one primitive, atlas=%d, ratio=%.2f, max_error=%.2f, %zu -> %zu bytes",
+                                  glb_name.c_str(), atlas_size, target_ratio,
+                                  max_error, glb_buf.size(), optimized_glb.size());
+                            glb_buf.swap(optimized_glb);
+                        }
+                    }
 
                     for (auto& child : node.children) {
                         child.intermediate.reset();

@@ -77,7 +77,7 @@ static const HardcodedConfig g_config = {
     /* top_reconstruct */ false,
     /* top_texture_max_size */ 512,
     /* simplify_ratio */ 0.5,
-    /* draco_pos_bits */ 11,
+    /* draco_pos_bits */ 20,
     /* draco_normal_bits */ 10,
     /* draco_uv_bits */ 12,
     /* ktx2_quality */ 128,
@@ -310,7 +310,7 @@ static void print_usage(const char* prog) {
         "  --top-texture-max-size N  Max texture dim for root GLB (default: 512, 0=no limit)\n"
         "  --hlod-branching-factor N  Children per HLOD node (default: 16; perfect square >= 4)\n"
         "  --simplify-ratio R      Meshopt target_ratio (default: 0.5, 1.0=no simplify)\n"
-        "  --draco-pos-bits N      Draco position quant bits (default: 11)\n"
+        "  --draco-pos-bits N      Draco position quant bits (default: 20)\n"
         "  --draco-normal-bits N   Draco normal quant bits (default: 10)\n"
         "  --draco-uv-bits N       Draco UV quant bits (default: 12)\n"
         "  --ktx2-quality N      KTX2 encode quality (1-255, lower=faster, default: 128)\n"
