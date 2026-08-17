@@ -19,3 +19,7 @@ cmake_install.cmake
 
 # Temp files
 _tmp_*.txt
+
+# Local Node dependencies/cache for the GLB compression tool
+压缩/node_modules/
+压缩/.npm-cache/

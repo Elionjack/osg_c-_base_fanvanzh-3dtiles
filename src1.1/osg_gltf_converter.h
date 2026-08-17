@@ -43,6 +43,9 @@ struct osg_tree {
     std::vector<osg_tree> sub_nodes;
     // type: 0=group, 1=PagedLOD nodes (default), 2=Other nodes
     int type = 1;
+    // Non-empty for a synthetic fine-detail tile that merges multiple leaf
+    // OSGB files into one GLB.
+    std::vector<std::string> aggregate_sources;
     // Cached node from Phase 1 — avoids redundant readNodeFiles in Phase 2
     osg::ref_ptr<osg::Node> cached_node;
     // Set only after the GLB buffer has been written successfully. JSON
@@ -62,7 +65,7 @@ bool osgb2glb_buf_from_node(osg::Node* root, std::string parent_path,
                             bool enable_meshopt = false, bool enable_draco = false,
                             bool enable_unlit = true,
                             double simplify_ratio = 0.5,
-                            int draco_pos_bits = 20, int draco_normal_bits = 10,
+                            int draco_pos_bits = 11, int draco_normal_bits = 10,
                             int draco_uv_bits = 12, int ktx2_quality = 128);
 
 // Convert OSGB file to GLB buffer (reads from disk via osgDB::readNodeFiles)
@@ -71,7 +74,7 @@ bool osgb2glb_buf(std::string path, std::string& glb_buff, MeshInfo& mesh_info,
                   bool enable_meshopt = false, bool enable_draco = false,
                   bool enable_unlit = true,
                   double simplify_ratio = 0.5,
-                  int draco_pos_bits = 20, int draco_normal_bits = 10,
+                  int draco_pos_bits = 11, int draco_normal_bits = 10,
                   int draco_uv_bits = 12, int ktx2_quality = 128);
 
 // Convert OSGB file to B3DM buffer (includes GLB inside)
@@ -80,7 +83,7 @@ bool osgb2b3dm_buf(std::string path, std::string& b3dm_buf, TileBox& tile_box,
                    bool enable_meshopt = false, bool enable_draco = false,
                    bool enable_unlit = true,
                    double simplify_ratio = 0.5,
-                   int draco_pos_bits = 20, int draco_normal_bits = 10,
+                   int draco_pos_bits = 11, int draco_normal_bits = 10,
                    int draco_uv_bits = 12, int ktx2_quality = 128);
 
 // Process all tiles recursively
@@ -88,7 +91,7 @@ void do_tile_job(osg_tree& tree, std::string out_path, int max_lvl,
                  bool enable_texture_compress = false, bool enable_meshopt = false,
                  bool enable_draco = false, bool enable_unlit = true,
                  double simplify_ratio = 0.5,
-                 int draco_pos_bits = 20, int draco_normal_bits = 10,
+                 int draco_pos_bits = 11, int draco_normal_bits = 10,
                  int draco_uv_bits = 12, int ktx2_quality = 128);
 
 // Bounding box operations
@@ -110,7 +113,7 @@ void do_tile_job_1_1(osg_tree& tree, std::string out_path, int max_lvl,
                      bool enable_texture_compress = false, bool enable_meshopt = false,
                      bool enable_draco = false, bool enable_unlit = true,
                      double simplify_ratio = 0.5,
-                     int draco_pos_bits = 20, int draco_normal_bits = 10,
+                     int draco_pos_bits = 11, int draco_normal_bits = 10,
                      int draco_uv_bits = 12, int ktx2_quality = 128);
 
 // JSON generation for tile trees (3D Tiles 1.1 compatible)
@@ -202,6 +205,8 @@ SpatialGrid build_spatial_grid(
 
 // Calculate simplification ratio for a given hierarchy level.
 double calc_level_ratio(int level, double base_ratio, int branching_factor = 4);
+int calc_hlod_texture_max_size(int level, int top_texture_max_size,
+                               int branching_factor = 4);
 
 // Build a square spatial N-tree bottom-up from the grid. branching_factor
 // must be a perfect square (4 => 2x2, 16 => 4x4).
@@ -225,11 +230,12 @@ bool build_merged_glb(
     bool enable_unlit,
     int top_texture_max_size = 512,
     double simplify_ratio = 0.5,
-    int draco_pos_bits = 20, int draco_normal_bits = 10,
+    int draco_pos_bits = 11, int draco_normal_bits = 10,
     int draco_uv_bits = 12, int ktx2_quality = 128,
     const std::vector<HlodIntermediatePtr>& child_intermediates = {},
     HlodIntermediatePtr* out_intermediate = nullptr,
-    int branching_factor = 4);
+    int branching_factor = 4,
+    bool finalize_direct = false);
 
 // Generate tileset JSON for a spatial HLOD hierarchy. When
 // externalize_pagedlod is true, each source-tile LOD tree is written as an
@@ -258,5 +264,5 @@ bool build_merged_root_glb(
     bool enable_unlit,
     int top_texture_max_size = 512,
     double simplify_ratio = 0.5,
-    int draco_pos_bits = 20, int draco_normal_bits = 10,
+    int draco_pos_bits = 11, int draco_normal_bits = 10,
     int draco_uv_bits = 12, int ktx2_quality = 128);

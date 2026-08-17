@@ -941,7 +941,7 @@ static tinygltf::Material make_default_material(double r = 1.0, double g = 1.0, 
 static void write_osgGeometry(osg::Geometry* g, OsgBuildState* osgState,
                               bool enable_simplify, bool enable_draco,
                               double simplify_ratio = 0.5,
-                              int draco_pos_bits = 20, int draco_normal_bits = 10,
+                              int draco_pos_bits = 11, int draco_normal_bits = 10,
                               int draco_uv_bits = 12) {
     // ================================================================
     // Step 1: Mesh simplification (meshoptimizer)
@@ -1540,6 +1540,40 @@ bool convert_one_tile(const FlatTile& tile, const osgb_converter::ConvertOptions
     return true;
 }
 
+static void append_image_bytes(void* context, void* data, int size) {
+    auto* bytes = static_cast<std::vector<unsigned char>*>(context);
+    const auto* begin = static_cast<unsigned char*>(data);
+    bytes->insert(bytes->end(), begin, begin + size);
+}
+
+static bool encode_texture_png(osg::Texture* texture,
+                               std::vector<unsigned char>& encoded) {
+    if (!texture || texture->getNumImages() == 0) return false;
+    osg::Image* image = texture->getImage(0);
+    if (!image || !image->data() || image->s() <= 0 || image->t() <= 0) return false;
+    const int width = image->s(), height = image->t();
+    const GLenum format = image->getPixelFormat();
+    const int source_channels = format == GL_RGB ? 3 : 4;
+    std::vector<unsigned char> rgba(static_cast<size_t>(width) * height * 4, 255);
+    for (int y = 0; y < height; ++y) {
+        const unsigned char* row = image->data() + y * image->getRowStepInBytes();
+        for (int x = 0; x < width; ++x) {
+            const unsigned char* source = row + x * source_channels;
+            unsigned char* target = rgba.data() + (static_cast<size_t>(y) * width + x) * 4;
+            if (format == GL_BGRA) {
+                target[0] = source[2]; target[1] = source[1]; target[2] = source[0];
+                target[3] = source[3];
+            } else {
+                target[0] = source[0]; target[1] = source[1]; target[2] = source[2];
+                if (source_channels == 4) target[3] = source[3];
+            }
+        }
+    }
+    encoded.clear();
+    return stbi_write_png_to_func(append_image_bytes, &encoded, width, height, 4,
+                                  rgba.data(), width * 4) != 0;
+}
+
 // ============================================================
 // Compute GLB buffer and output path for a single tile.
 // Pure CPU work — no file I/O. Caller handles bbox write-back
@@ -1554,7 +1588,32 @@ bool compute_tile_output(const FlatTile& tile,
     bool ok = false;
     bool used_cache = false;
 
-    if (tile.tree && tile.tree->cached_node.valid()) {
+    if (tile.tree && !tile.tree->aggregate_sources.empty()) {
+        TileBox aggregate_bbox;
+        ok = build_merged_glb(
+            tile.tree->aggregate_sources,
+            0,
+            glb_buf,
+            aggregate_bbox,
+            opts.enable_texture_compress,
+            opts.enable_meshopt,
+            opts.enable_draco,
+            opts.enable_unlit,
+            0, // preserve source texture dimensions for finest-detail aggregates
+            opts.simplify_ratio,
+            opts.draco_pos_bits,
+            opts.draco_normal_bits,
+            opts.draco_uv_bits,
+            opts.ktx2_quality,
+            {}, nullptr, 4,
+            true);
+        if (ok) {
+            minfo.min = aggregate_bbox.min;
+            minfo.max = aggregate_bbox.max;
+        }
+        LOG_I("  compute_tile: fine aggregate (%zu sources)",
+              tile.tree->aggregate_sources.size());
+    } else if (tile.tree && tile.tree->cached_node.valid()) {
         ok = osgb2glb_buf_from_node(
             tile.tree->cached_node.get(),
             get_parent(tile.file_name),
@@ -2098,6 +2157,21 @@ double calc_level_ratio(int level, double base_ratio, int branching_factor) {
     return std::max(0.01, r);
 }
 
+int calc_hlod_texture_max_size(int level, int top_texture_max_size,
+                               int branching_factor) {
+    int result = top_texture_max_size;
+    const int branch_side = std::max(
+        2, static_cast<int>(std::sqrt(static_cast<double>(branching_factor))));
+    const int equivalent_quadtree_level = static_cast<int>(std::lround(
+        level * std::log2(static_cast<double>(branch_side))));
+    const int steps = std::max(0, equivalent_quadtree_level - 1);
+    if (result > 32) {
+        for (int step = 0; step < steps && result > 32; ++step)
+            result = std::max(32, result / 2);
+    }
+    return result;
+}
+
 struct HlodIntermediateEntry {
     osg::ref_ptr<osg::Geometry> geometry;
     osg::ref_ptr<osg::Texture> texture;
@@ -2125,17 +2199,15 @@ bool build_merged_glb(
     int ktx2_quality,
     const std::vector<HlodIntermediatePtr>& child_intermediates,
     HlodIntermediatePtr* out_intermediate,
-    int branching_factor)
+    int branching_factor,
+    bool finalize_direct)
 {
     if (osgb_paths.empty() && child_intermediates.empty()) return false;
 
-    // Original OSGB inputs use the absolute level ratio. Direct-child HLOD
-    // inputs have already been simplified, so each parent applies one further
-    // branching_factor:1 reduction instead of reapplying an absolute ratio.
-    const bool uses_child_coarse_models = !child_intermediates.empty();
-    double level_ratio = uses_child_coarse_models
-        ? 1.0 / std::max(1, branching_factor)
-        : calc_level_ratio(quadtree_level, simplify_ratio, branching_factor);
+    // Every emitted HLOD is simplified once from its unsimplified source
+    // geometry using the original absolute level ratio.
+    double level_ratio = calc_level_ratio(
+        quadtree_level, simplify_ratio, branching_factor);
     LOG_I("build_merged_glb: level=%d, branching=%d, ratio=%.4f (%zu OSGB, %zu child coarse models)",
           quadtree_level, branching_factor, level_ratio,
           osgb_paths.size(), child_intermediates.size());
@@ -2275,8 +2347,21 @@ bool build_merged_glb(
         if (!g->getVertexArray() || g->getVertexArray()->getDataSize() == 0)
             continue;
 
-        write_osgGeometry(g, &osgState, enable_meshopt, enable_draco,
-                          level_ratio, draco_pos_bits, draco_normal_bits, draco_uv_bits);
+        if (finalize_direct) {
+            // Fine Merge is a final drawable, not an HLOD carrier. Preserve
+            // the historical multi-primitive output and apply the requested
+            // simplification/Draco settings now.
+            write_osgGeometry(g, &osgState, enable_meshopt, enable_draco,
+                              level_ratio, draco_pos_bits, draco_normal_bits,
+                              draco_uv_bits);
+        } else {
+            // Uncompressed and unsimplified in-memory carrier. The final HLOD
+            // merges every primitive first, then simplifies and Draco-encodes
+            // it exactly once.
+            write_osgGeometry(g, &osgState, false, false,
+                              1.0, draco_pos_bits, draco_normal_bits,
+                              draco_uv_bits);
+        }
 
         auto* tex = geom_to_tex[g];
         int matIdx = tex ? tex_to_mat[tex] : 0;
@@ -2320,21 +2405,14 @@ bool build_merged_glb(
     // level spans the same width as two quadtree levels, so derive texture
     // reduction from the equivalent quadtree depth rather than raw N-tree
     // depth.
-    int effective_texture_max_size = top_texture_max_size;
-    const int branch_side = std::max(
-        2, static_cast<int>(std::sqrt(static_cast<double>(branching_factor))));
-    const int equivalent_quadtree_level = static_cast<int>(std::lround(
-        quadtree_level * std::log2(static_cast<double>(branch_side))));
-    const int texture_reduction_steps = std::max(0, equivalent_quadtree_level - 1);
-    if (effective_texture_max_size > 32) {
-        for (int step = 0;
-             step < texture_reduction_steps && effective_texture_max_size > 32;
-             ++step) {
-            effective_texture_max_size = std::max(32, effective_texture_max_size / 2);
-        }
-    }
+    int effective_texture_max_size = calc_hlod_texture_max_size(
+        quadtree_level, top_texture_max_size, branching_factor);
 
-    for (auto* tex : all_textures) {
+    for (auto* source_tex : all_textures) {
+        osg::ref_ptr<osg::Texture> carrier_tex = source_tex
+            ? dynamic_cast<osg::Texture*>(source_tex->clone(osg::CopyOp::DEEP_COPY_ALL))
+            : nullptr;
+        osg::Texture* tex = carrier_tex.get();
         if (effective_texture_max_size > 0 && tex && tex->getNumImages() > 0) {
             osg::Image* img = tex->getImage(0);
             if (img && img->data()) {
@@ -2368,7 +2446,15 @@ bool build_merged_glb(
         std::vector<unsigned char> imgData;
         std::string mimeType;
 
-        if (::process_texture(tex, imgData, mimeType, enable_texture_compress, ktx2_quality)) {
+        // HLOD carriers use lossless PNG because a later stage builds the
+        // final atlas. Fine Merge is already final and uses the normal output
+        // texture path (including optional KTX2 compression).
+        const bool texture_ok = finalize_direct
+            ? ::process_texture(tex, imgData, mimeType,
+                                enable_texture_compress, ktx2_quality)
+            : encode_texture_png(tex, imgData);
+        if (!finalize_direct && texture_ok) mimeType = "image/png";
+        if (texture_ok) {
             buffer.data.insert(buffer.data.end(), imgData.begin(), imgData.end());
 
             tinygltf::Image imgObj;
@@ -2404,16 +2490,16 @@ bool build_merged_glb(
         model.extensionsRequired.push_back("KHR_materials_unlit");
         model.extensionsUsed.push_back("KHR_materials_unlit");
     }
-    if (enable_texture_compress) {
+    if (finalize_direct && enable_texture_compress) {
         model.extensionsRequired.push_back("KHR_texture_basisu");
         model.extensionsUsed.push_back("KHR_texture_basisu");
     }
-    bool has_draco = enable_draco;
+    bool has_draco = finalize_direct && enable_draco;
     if (has_draco) {
         model.extensionsRequired.push_back("KHR_draco_mesh_compression");
         model.extensionsUsed.push_back("KHR_draco_mesh_compression");
     }
-    if (enable_meshopt && !has_draco) {
+    if (finalize_direct && enable_meshopt && !has_draco) {
         model.extensionsRequired.push_back("EXT_meshopt_compression");
         model.extensionsUsed.push_back("EXT_meshopt_compression");
     }
@@ -2441,7 +2527,7 @@ bool build_merged_glb(
         for (size_t i = 0; i < model.images.size(); i++) {
             tinygltf::Texture tex;
             tex.sampler = 0;
-            if (enable_texture_compress) {
+            if (finalize_direct && enable_texture_compress) {
                 tinygltf::Value::Object basisu;
                 basisu["source"] = tinygltf::Value((int)i);
                 tex.extensions["KHR_texture_basisu"] = tinygltf::Value(basisu);

@@ -45,6 +45,7 @@ struct HardcodedConfig {
     bool enable_draco;
     bool enable_unlit;
     bool enable_top_reconstruct;
+    bool hlod_only;
     int  top_texture_max_size;
     double simplify_ratio;
     int  draco_pos_bits;
@@ -56,6 +57,9 @@ struct HardcodedConfig {
     bool enable_parallel;
     int  num_threads;
     bool enable_split_json;
+    bool enable_fine_merge;
+    int  fine_merge_max_sources;
+    int  fine_merge_max_input_mb;
     int  hlod_branching_factor;
     int  hlod_max_source_tiles;
     double override_lon;
@@ -75,9 +79,10 @@ static const HardcodedConfig g_config = {
     /* draco        */ true,
     /* unlit        */ true,
     /* top_reconstruct */ false,
+    /* hlod_only     */ false,
     /* top_texture_max_size */ 512,
     /* simplify_ratio */ 0.5,
-    /* draco_pos_bits */ 20,
+    /* draco_pos_bits */ 11,
     /* draco_normal_bits */ 10,
     /* draco_uv_bits */ 12,
     /* ktx2_quality */ 128,
@@ -86,6 +91,9 @@ static const HardcodedConfig g_config = {
     /* enable_parallel */ true,
     /* num_threads     */ 0,
     /* enable_split_json */ false,
+    /* enable_fine_merge */ true,
+    /* fine_merge_max_sources */ 16,
+    /* fine_merge_max_input_mb */ 64,
     /* hlod_branching_factor */ 16,
     /* hlod_max_source_tiles */ 16,
     /* override_lon */ 0.0,
@@ -307,10 +315,11 @@ static void print_usage(const char* prog) {
         "  --enable-lod            Enable Level of Detail\n"
         "  --enable-unlit          Enable KHR_materials_unlit (default: on for OSGB)\n"
         "  --enable-top-reconstruct  Build a multi-level spatial HLOD hierarchy\n"
+        "  --hlod-only            Generate only HLOD GLBs and an HLOD-only tileset.json\n"
         "  --top-texture-max-size N  Max texture dim for root GLB (default: 512, 0=no limit)\n"
         "  --hlod-branching-factor N  Children per HLOD node (default: 16; perfect square >= 4)\n"
         "  --simplify-ratio R      Meshopt target_ratio (default: 0.5, 1.0=no simplify)\n"
-        "  --draco-pos-bits N      Draco position quant bits (default: 20)\n"
+        "  --draco-pos-bits N      Draco position quant bits (default: 11)\n"
         "  --draco-normal-bits N   Draco normal quant bits (default: 10)\n"
         "  --draco-uv-bits N       Draco UV quant bits (default: 12)\n"
         "  --ktx2-quality N      KTX2 encode quality (1-255, lower=faster, default: 128)\n"
@@ -319,6 +328,9 @@ static void print_usage(const char* prog) {
         "  --no-parallel           Disable all multi-threading (Phase 1 + Phase 2)\n"
         "  --threads N             Number of worker threads (default: auto=CPU cores)\n"
         "  --split-json            Split tileset.json into root index + sub-tilesets\n"
+        "  --no-fine-merge         Disable finest-LOD subtree aggregation (enabled by default)\n"
+        "  --fine-merge-max-sources N  Max leaf files per fine aggregate (default: 16)\n"
+        "  --fine-merge-max-input-mb N  Max source MB per fine aggregate (default: 64)\n"
         "  --hlod-max-source-tiles N  Compatibility option (progressive HLOD no longer drops by source count)\n"
         "  --max-lvl N             Maximum source LOD level to convert (default: 100)\n"
         "  --geoid <model>         Geoid model: none, egm84, egm96, egm2008\n"
@@ -356,7 +368,8 @@ int main(int argc, char* argv[]) {
     opts.enable_meshopt          = g_config.enable_meshopt;
     opts.enable_draco            = g_config.enable_draco;
     opts.enable_unlit            = g_config.enable_unlit;
-    opts.enable_top_reconstruct  = g_config.enable_top_reconstruct;
+    opts.enable_top_reconstruct  = g_config.enable_top_reconstruct || g_config.hlod_only;
+    opts.hlod_only               = g_config.hlod_only;
     opts.top_texture_max_size    = g_config.top_texture_max_size;
     opts.simplify_ratio          = g_config.simplify_ratio;
     opts.draco_pos_bits          = g_config.draco_pos_bits;
@@ -368,6 +381,9 @@ int main(int argc, char* argv[]) {
     opts.enable_parallel         = g_config.enable_parallel;
     opts.num_threads             = g_config.num_threads;
     opts.enable_split_json       = g_config.enable_split_json;
+    opts.enable_fine_merge       = g_config.enable_fine_merge;
+    opts.fine_merge_max_sources  = g_config.fine_merge_max_sources;
+    opts.fine_merge_max_input_mb = g_config.fine_merge_max_input_mb;
     opts.hlod_branching_factor   = g_config.hlod_branching_factor;
     opts.hlod_max_source_tiles   = g_config.hlod_max_source_tiles;
 
@@ -417,6 +433,12 @@ int main(int argc, char* argv[]) {
             opts.num_threads = std::stoi(argv[++i]);
         } else if (arg == "--split-json") {
             opts.enable_split_json = true;
+        } else if (arg == "--no-fine-merge") {
+            opts.enable_fine_merge = false;
+        } else if (arg == "--fine-merge-max-sources" && i + 1 < argc) {
+            opts.fine_merge_max_sources = std::max(2, std::stoi(argv[++i]));
+        } else if (arg == "--fine-merge-max-input-mb" && i + 1 < argc) {
+            opts.fine_merge_max_input_mb = std::max(1, std::stoi(argv[++i]));
         } else if (arg == "--hlod-branching-factor" && i + 1 < argc) {
             opts.hlod_branching_factor = std::stoi(argv[++i]);
         } else if (arg == "--hlod-max-source-tiles" && i + 1 < argc) {
@@ -424,6 +446,9 @@ int main(int argc, char* argv[]) {
         } else if (arg == "--max-lvl" && i + 1 < argc) {
             opts.max_lvl = std::stoi(argv[++i]);
         } else if (arg == "--enable-top-reconstruct" || arg == "--enable-top_reconstruct") {
+            opts.enable_top_reconstruct = true;
+        } else if (arg == "--hlod-only") {
+            opts.hlod_only = true;
             opts.enable_top_reconstruct = true;
         } else if (arg == "--top-texture-max-size" && i + 1 < argc) {
             opts.top_texture_max_size = std::stoi(argv[++i]);

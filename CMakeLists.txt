@@ -136,7 +136,7 @@ set(SOURCES_1_1
     src1.1/coordinate_transformer.cpp
     src1.1/geoid_height.cpp
     src1.1/mesh_processor.cpp
-    root_glb_optimizer/main.cpp
+    src1.1/hlod_optimizer.cpp
 )
 set(HEADERS_1_1
     src1.1/utils.h
@@ -146,12 +146,11 @@ set(HEADERS_1_1
     src1.1/coordinate_transformer.h
     src1.1/geoid_height.h
     src1.1/mesh_processor.h
+    src1.1/hlod_optimizer.h
 )
 add_executable(osgb_converter_1_1 ${SOURCES_1_1} ${HEADERS_1_1})
 configure_osgb_target(osgb_converter_1_1 src1.1)
-target_include_directories(osgb_converter_1_1 PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/root_glb_optimizer)
-set_source_files_properties(root_glb_optimizer/main.cpp PROPERTIES
+set_source_files_properties(src1.1/hlod_optimizer.cpp PROPERTIES
     COMPILE_DEFINITIONS HLOD_OPTIMIZER_LIBRARY)
 
 # OpenCL-enabled BasisU is still a static library. BasisU 2.1 does not export

@@ -23,6 +23,12 @@
 #include <glm/gtc/type_ptr.hpp>
 
 namespace fs = std::filesystem;
+
+// Cesium 1.134 performs a tileset-wide SSE early exit using the top-level
+// tileset geometricError before it traverses the root tile.  Keep this outer
+// gate deliberately large so zooming out cannot skip the whole tileset; the
+// root tile's own geometricError still controls normal refinement.
+constexpr double kTopLevelTilesetGeometricError = 1.0e9;
 using json = nlohmann::json;
 
 namespace osgb_converter {
@@ -330,10 +336,102 @@ static size_t prune_above_max_level(osg_tree& tree, int max_lvl) {
     return removed;
 }
 
+static bool collect_finest_leaf_sources(
+    const osg_tree& tree,
+    size_t max_sources,
+    uintmax_t max_input_bytes,
+    std::vector<std::string>& sources,
+    uintmax_t& input_bytes)
+{
+    // Keep group/other-geometry nodes out of a PagedLOD aggregate.
+    if (tree.type != 1)
+        return false;
+
+    if (tree.sub_nodes.empty()) {
+        if (tree.file_name.empty() || !tree.aggregate_sources.empty())
+            return false;
+
+        std::error_code ec;
+        const uintmax_t bytes = fs::file_size(fs::path(tree.file_name), ec);
+        if (ec || bytes > max_input_bytes
+            || sources.size() + 1 > max_sources
+            || input_bytes > max_input_bytes - bytes)
+            return false;
+
+        sources.push_back(tree.file_name);
+        input_bytes += bytes;
+        return true;
+    }
+
+    for (const auto& child : tree.sub_nodes) {
+        if (!collect_finest_leaf_sources(
+                child, max_sources, max_input_bytes, sources, input_bytes))
+            return false;
+    }
+    return true;
+}
+
+// Replace the largest qualifying finest-LOD spatial subtree with one
+// synthetic aggregate leaf. The current node's coarse content is retained.
+static size_t aggregate_fine_lod_subtrees(
+    osg_tree& tree,
+    const std::string& tile_stem,
+    size_t max_sources,
+    uintmax_t max_input_bytes,
+    size_t& aggregate_counter,
+    size_t& aggregated_source_count)
+{
+    if (tree.type == 1 && !tree.sub_nodes.empty()) {
+        std::vector<std::string> sources;
+        uintmax_t input_bytes = 0;
+        bool eligible = true;
+        for (const auto& child : tree.sub_nodes) {
+            if (!collect_finest_leaf_sources(
+                    child, max_sources, max_input_bytes, sources, input_bytes)) {
+                eligible = false;
+                break;
+            }
+        }
+
+        if (eligible && sources.size() >= 2) {
+            size_t old_descendants = 0;
+            for (const auto& child : tree.sub_nodes)
+                old_descendants += count_tree_nodes(child);
+
+            char suffix[64];
+            std::snprintf(suffix, sizeof(suffix), "_FINE_MERGE_%05zu.osgb",
+                          aggregate_counter++);
+
+            osg_tree aggregate;
+            aggregate.type = 1;
+            aggregate.file_name =
+                (fs::path(get_parent(tree.file_name)) / (tile_stem + suffix)).string();
+            aggregate.aggregate_sources = std::move(sources);
+
+            aggregated_source_count += aggregate.aggregate_sources.size();
+            tree.sub_nodes.clear();
+            tree.sub_nodes.push_back(std::move(aggregate));
+            return old_descendants > 0 ? old_descendants - 1 : 0;
+        }
+    }
+
+    size_t removed = 0;
+    for (auto& child : tree.sub_nodes) {
+        removed += aggregate_fine_lod_subtrees(
+            child, tile_stem, max_sources, max_input_bytes,
+            aggregate_counter, aggregated_source_count);
+    }
+    return removed;
+}
+
 // ============================================================
 // Main conversion entry point
 // ============================================================
 int convert_osgb(const ConvertOptions& opts) {
+    if (opts.hlod_only && !opts.enable_top_reconstruct) {
+        LOG_E("hlod_only requires enable_top_reconstruct");
+        return 1;
+    }
     if (opts.enable_top_reconstruct) {
         if (opts.hlod_branching_factor < 4) {
             LOG_E("--hlod-branching-factor must be a perfect square >= 4 (for example 4, 9, or 16); got %d",
@@ -427,9 +525,9 @@ int convert_osgb(const ConvertOptions& opts) {
     int max_lvl = (opts.max_lvl != 100) ? opts.max_lvl : cfg_max_lvl;
 
     LOG_I("Conversion parameters: center=(%.10f, %.10f), max_lvl=%d", center_x, center_y, max_lvl);
-    LOG_I("Features: texture_compress=%d, meshopt=%d, draco=%d, unlit=%d, top_reconstruct=%d",
+    LOG_I("Features: texture_compress=%d, meshopt=%d, draco=%d, unlit=%d, top_reconstruct=%d, hlod_only=%d, fine_merge=%d",
           opts.enable_texture_compress, opts.enable_meshopt, opts.enable_draco, opts.enable_unlit,
-          opts.enable_top_reconstruct);
+          opts.enable_top_reconstruct, opts.hlod_only, opts.enable_fine_merge);
 
     // ============================================================
     // 4. Find and convert all tiles
@@ -518,15 +616,43 @@ int convert_osgb(const ConvertOptions& opts) {
         }
 
         fs::path out_tile_dir = out_dir / "Data" / stem;
-        fs::create_directories(out_tile_dir);
+        if (!opts.hlod_only) fs::create_directories(out_tile_dir);
 
-        phase1_tasks.push_back([&trees_mutex, &all_trees,
+        phase1_tasks.push_back([&trees_mutex, &all_trees, &opts,
                                 osgb_path = osgb_file.string(),
                                 stem,
                                 out_path = out_tile_dir.string()]() {
-            LOG_I("Phase 1 - Building tree: %s", osgb_path.c_str());
-            std::string path_copy = osgb_path;
-            osg_tree root = get_all_tree(path_copy);
+            osg_tree root;
+            if (opts.hlod_only) {
+                // HLOD consumes only the coarsest root OSGB for each spatial
+                // source tile. Avoid discovering/loading its PagedLOD children.
+                // Use the existing GLB conversion path once to preserve the
+                // exact corrected geometry bounds used by the normal pipeline;
+                // discard the buffer and retain only the bounds for the grid.
+                LOG_I("Phase 1 HLOD-only - Loading coarsest source: %s",
+                      osgb_path.c_str());
+                std::string probe_glb;
+                MeshInfo minfo;
+                const bool ok = osgb2glb_buf(
+                    osgb_path, probe_glb, minfo, 1,
+                    false, false, false, opts.enable_unlit,
+                    1.0, opts.draco_pos_bits, opts.draco_normal_bits,
+                    opts.draco_uv_bits, opts.ktx2_quality);
+                TileBox bbox;
+                bbox.min = minfo.min;
+                bbox.max = minfo.max;
+                if (!ok || !is_valid_tile_box(bbox)) {
+                    LOG_E("Failed to load HLOD source bounds: %s", osgb_path.c_str());
+                    return;
+                }
+                root.file_name = osgb_path;
+                root.type = 1;
+                root.bbox = std::move(bbox);
+            } else {
+                LOG_I("Phase 1 - Building tree: %s", osgb_path.c_str());
+                std::string path_copy = osgb_path;
+                root = get_all_tree(path_copy);
+            }
             if (root.file_name.empty()) {
                 LOG_E("Failed to read: %s", osgb_path.c_str());
                 return;
@@ -557,11 +683,16 @@ int convert_osgb(const ConvertOptions& opts) {
             futures.push_back(std::async(std::launch::async, std::move(wrapper)));
         }
         for (auto& f : futures) f.get();
-        LOG_I("Phase 1 complete: %zu tile trees built (parallel, %u I/O threads)",
+        LOG_I(opts.hlod_only
+                  ? "Phase 1 HLOD-only complete: %zu coarsest sources loaded (parallel, %u I/O threads)"
+                  : "Phase 1 complete: %zu tile trees built (parallel, %u I/O threads)",
               all_trees.size(), p1_threads);
     } else {
         for (auto& task : phase1_tasks) task();
-        LOG_I("Phase 1 complete: %zu tile trees built (serial)", all_trees.size());
+        LOG_I(opts.hlod_only
+                  ? "Phase 1 HLOD-only complete: %zu coarsest sources loaded (serial)"
+                  : "Phase 1 complete: %zu tile trees built (serial)",
+              all_trees.size());
     }
 
     if (all_trees.empty()) {
@@ -577,6 +708,24 @@ int convert_osgb(const ConvertOptions& opts) {
     }
     LOG_I("Tree pruning: max_lvl removed=%zu", max_level_pruned);
 
+    size_t fine_merge_pruned = 0;
+    size_t fine_merge_count = 0;
+    size_t fine_merge_sources = 0;
+    if (opts.enable_fine_merge && !opts.hlod_only) {
+        const uintmax_t max_bytes =
+            static_cast<uintmax_t>(opts.fine_merge_max_input_mb) * 1024u * 1024u;
+        for (auto& tr : all_trees) {
+            fine_merge_pruned += aggregate_fine_lod_subtrees(
+                tr.root, tr.stem,
+                static_cast<size_t>(opts.fine_merge_max_sources), max_bytes,
+                fine_merge_count, fine_merge_sources);
+        }
+    }
+    LOG_I("Fine merge: aggregates=%zu, sources=%zu, removed tree nodes=%zu (max_sources=%d, max_input_mb=%d, enabled=%d)",
+          fine_merge_count, fine_merge_sources, fine_merge_pruned,
+          opts.fine_merge_max_sources, opts.fine_merge_max_input_mb,
+          opts.enable_fine_merge && !opts.hlod_only);
+
     // ============================================================
     // Phase 2: Flatten all trees → tile conversion (parallel or serial)
     //           Uses cached_node from Phase 1 to avoid redundant
@@ -587,8 +736,10 @@ int convert_osgb(const ConvertOptions& opts) {
     std::vector<FlatTile> all_tiles;
     {
         auto t0 = std::chrono::steady_clock::now();
-        for (auto& tr : all_trees) {
-            collect_flat_tiles(tr.root, tr.out_tile_dir, all_tiles);
+        if (!opts.hlod_only) {
+            for (auto& tr : all_trees) {
+                collect_flat_tiles(tr.root, tr.out_tile_dir, all_tiles);
+            }
         }
         auto t1 = std::chrono::steady_clock::now();
         LOG_I("Phase 2: Flattened %zu tiles in %.0fms (%s)", all_tiles.size(),
@@ -596,7 +747,9 @@ int convert_osgb(const ConvertOptions& opts) {
               opts.enable_parallel ? "parallel (chunked, serial write)" : "serial");
     }
 
-    if (opts.enable_parallel) {
+    if (opts.hlod_only) {
+        LOG_I("Phase 2 HLOD-only: bounds already loaded; no detail tree scan or detail GLB writes");
+    } else if (opts.enable_parallel) {
         const size_t CHUNK_SIZE = 16;
         size_t num_chunks = (all_tiles.size() + CHUNK_SIZE - 1) / CHUNK_SIZE;
 
@@ -720,7 +873,8 @@ int convert_osgb(const ConvertOptions& opts) {
               all_tiles.size() - tiles_failed, tiles_failed);
     }
 
-    LOG_I("Phase 2 complete: %zu tiles converted", all_tiles.size());
+    if (!opts.hlod_only)
+        LOG_I("Phase 2 complete: %zu tiles converted", all_tiles.size());
 
     // ============================================================
     // Phase 3: Serial aggregation — bbox, geometricError, tile JSON
@@ -738,6 +892,14 @@ int convert_osgb(const ConvertOptions& opts) {
         }
 
         calc_geometric_error(tr.root);
+
+        if (opts.hlod_only) {
+            std::vector<double> box_full;
+            box_full.insert(box_full.end(), tr.root.bbox.max.begin(), tr.root.bbox.max.end());
+            box_full.insert(box_full.end(), tr.root.bbox.min.begin(), tr.root.bbox.min.end());
+            tile_results.push_back({tr.stem, json(), box_full, find_coarsest_node(tr.root)});
+            continue;
+        }
 
         std::string json_str = encode_tile_json_1_1(tr.root, degree2rad(center_x), degree2rad(center_y));
         if (json_str.empty()) {
@@ -763,7 +925,7 @@ int convert_osgb(const ConvertOptions& opts) {
     LOG_I("Phase 3 complete: %zu tile trees aggregated", tile_results.size());
 
     if (tile_results.empty()) {
-        LOG_E("No tiles were converted");
+        LOG_E(opts.hlod_only ? "No source tiles were usable for HLOD" : "No tiles were converted");
         return 1;
     }
 
@@ -858,31 +1020,36 @@ int convert_osgb(const ConvertOptions& opts) {
                         opts.ktx2_quality, child_intermediates, &node.intermediate,
                         opts.hlod_branching_factor);
 
-                    // Finalize each HLOD exactly as the validated standalone
-                    // workflow does: one JPEG atlas, one merged primitive,
-                    // attribute-aware simplification with locked topological
-                    // borders, and 20-bit Draco positions.  The intermediate
-                    // OSG geometry remains available for constructing the
-                    // next HLOD level; only the emitted GLB is repacked.
+                    // The carrier GLB above is deliberately unsimplified and
+                    // uncompressed. Merge all of its primitives and textures
+                    // first, then run the original level simplification,
+                    // texture compression and Draco exactly once.
                     if (ok && !glb_buf.empty()) {
-                        const bool is_root = glb_name == "root.glb";
-                        const bool is_l0 = glb_name.rfind("L0_", 0) == 0;
-                        const int atlas_size = is_root ? 1024 : (is_l0 ? 512 : 256);
-                        const double target_ratio = is_root ? 0.65 : (is_l0 ? 0.70 : 0.75);
-                        const double max_error = is_root ? 0.50 : (is_l0 ? 0.25 : 0.15);
+                        const int hlod_level = node.level + 1;
+                        const double target_ratio = opts.enable_meshopt
+                            ? calc_level_ratio(hlod_level, opts.simplify_ratio,
+                                               opts.hlod_branching_factor)
+                            : 1.0;
+                        const int atlas_cell_size = calc_hlod_texture_max_size(
+                            hlod_level, opts.top_texture_max_size,
+                            opts.hlod_branching_factor);
                         std::string optimized_glb;
                         std::string optimize_error;
                         if (!optimize_hlod_glb_buffer(
-                                glb_buf, optimized_glb, atlas_size, target_ratio,
-                                max_error, 80, &optimize_error)) {
+                                glb_buf, optimized_glb, atlas_cell_size,
+                                target_ratio, opts.enable_texture_compress,
+                                opts.ktx2_quality, opts.draco_pos_bits,
+                                opts.draco_normal_bits, opts.draco_uv_bits,
+                                &optimize_error)) {
                             LOG_E("HLOD one-primitive optimization failed for %s: %s",
                                   glb_name.c_str(), optimize_error.c_str());
                             ok = false;
                             glb_buf.clear();
                         } else {
-                            LOG_I("HLOD finalized: %s, one primitive, atlas=%d, ratio=%.2f, max_error=%.2f, %zu -> %zu bytes",
-                                  glb_name.c_str(), atlas_size, target_ratio,
-                                  max_error, glb_buf.size(), optimized_glb.size());
+                            LOG_I("HLOD finalized once: %s, one primitive, atlas-cell=%d, ratio=%.4f, Draco=%d/%d/%d, %zu -> %zu bytes",
+                                  glb_name.c_str(), atlas_cell_size, target_ratio,
+                                  opts.draco_pos_bits, opts.draco_normal_bits,
+                                  opts.draco_uv_bits, glb_buf.size(), optimized_glb.size());
                             glb_buf.swap(optimized_glb);
                         }
                     }
@@ -934,6 +1101,11 @@ int convert_osgb(const ConvertOptions& opts) {
         } else {
             LOG_W("No tile stems collected, skipping HLOD build");
         }
+    }
+
+    if (opts.hlod_only && !has_hlod) {
+        LOG_E("HLOD-only mode did not produce an HLOD hierarchy (at least two spatial source tiles are required)");
+        return 1;
     }
 
     // ============================================================
@@ -1024,22 +1196,19 @@ int convert_osgb(const ConvertOptions& opts) {
     root_tileset["asset"]["gltfUpAxis"] = "Z";
     root_tileset["extensionsUsed"] = json::array({"3DTILES_content_gltf"});
     root_tileset["extensionsRequired"] = json::array({"3DTILES_content_gltf"});
+    root_tileset["geometricError"] = kTopLevelTilesetGeometricError;
 
     if (has_hlod) {
         const std::string out_dir_str =
             opts.enable_split_json ? out_dir.string() : "";
         json quadtree_json = encode_quadtree_json(
-            quadtree_root, tile_jsons_map,
+            quadtree_root, opts.hlod_only ? std::map<std::string, json>{} : tile_jsons_map,
             out_dir_str,
             opts.enable_split_json);
 
         // Add ECEF transform to root
         quadtree_json["transform"] = trans_vec;
         quadtree_json["boundingVolume"]["box"] = box_to_tileset_box(root_box);
-        const double encoded_root_ge =
-            quadtree_json.value("geometricError", root_ge);
-        root_tileset["geometricError"] = encoded_root_ge;
-
         root_tileset["root"] = quadtree_json;
     } else {
         // Flat mode (no HLOD)
@@ -1053,7 +1222,6 @@ int convert_osgb(const ConvertOptions& opts) {
             root_tile["boundingVolume"]["box"] = box_to_tileset_box(root_box);
             root_tile["refine"] = "REPLACE";
             root_tile["geometricError"] = std::min(root_ge, 2000.0);
-            root_tileset["geometricError"] = std::min(root_ge, 2000.0);
             root_tile["children"] = json::array();
 
             for (auto& tr : tile_results) {
@@ -1095,7 +1263,6 @@ int convert_osgb(const ConvertOptions& opts) {
             root_tile["boundingVolume"]["box"] = box_to_tileset_box(root_box);
             root_tile["refine"] = "REPLACE";
             root_tile["geometricError"] = std::min(root_ge, 2000.0);
-            root_tileset["geometricError"] = std::min(root_ge, 2000.0);
             root_tile["children"] = json::array();
 
             for (auto& tr : tile_results) {

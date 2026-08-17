@@ -8,20 +8,18 @@ It decodes Draco geometry and KTX2 textures, bakes material colors into a
 small number of JPEG atlases, merges geometry by atlas, simplifies the merged
 geometry, and encodes it with Draco again.
 
-`src1.1` calls the same implementation in memory for every generated HLOD
-before writing it. This is intentionally a two-stage pipeline: the original
-per-geometry conversion and simplification runs first, then HLOD textures and
-primitives are merged and safely simplified as a whole. Ordinary detail GLBs
-are not finalized this way.
+`src1.1` calls the shared implementation in memory for every generated HLOD.
+Its carrier GLB is uncompressed and unsimplified: all textures and primitives
+are merged first, then the final mesh is simplified and encoded exactly once.
+Ordinary detail GLBs keep their original conversion path.
 
 Integrated HLOD policy:
 
-- `root.glb`: one 1024px JPEG atlas, 65% target, 0.50 absolute error;
-- `L0_*.glb`: one 512px JPEG atlas, 70% target, 0.25 absolute error;
-- `L1_*.glb` and deeper: one 256px JPEG atlas, 75% target, 0.15 absolute error;
-- JPEG quality 80 and Draco POSITION quantization at 20 bits;
-- locked topological borders and attribute-aware absolute-error simplification;
-- exactly one primitive per emitted HLOD GLB.
+- exactly one texture atlas, material, and primitive per emitted HLOD GLB;
+- original level ratio derived from `--simplify-ratio` and branching factor;
+- original simplifier error target (`0.01`), applied once after merging;
+- KTX2 atlas encoded once using `--ktx2-quality` when enabled;
+- Draco encoded once using the command-line 11/10/12 defaults.
 
 The shared decoder accepts KTX2, JPEG, and PNG input textures, so integrated
 HLOD finalization does not require `--enable-texture-compress`.
