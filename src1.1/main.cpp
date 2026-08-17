@@ -57,6 +57,7 @@ struct HardcodedConfig {
     bool enable_parallel;
     int  num_threads;
     bool enable_split_json;
+    bool skip_bad_tiles;
     bool enable_fine_merge;
     int  fine_merge_max_sources;
     int  fine_merge_max_input_mb;
@@ -91,6 +92,7 @@ static const HardcodedConfig g_config = {
     /* enable_parallel */ true,
     /* num_threads     */ 0,
     /* enable_split_json */ false,
+    /* skip_bad_tiles */ false,
     /* enable_fine_merge */ true,
     /* fine_merge_max_sources */ 16,
     /* fine_merge_max_input_mb */ 64,
@@ -328,6 +330,7 @@ static void print_usage(const char* prog) {
         "  --no-parallel           Disable all multi-threading (Phase 1 + Phase 2)\n"
         "  --threads N             Number of worker threads (default: auto=CPU cores)\n"
         "  --split-json            Split tileset.json into root index + sub-tilesets\n"
+        "  --skip-bad-tiles        Skip malformed OSGB nodes/grids and write failed_tiles.txt\n"
         "  --no-fine-merge         Disable finest-LOD subtree aggregation (enabled by default)\n"
         "  --fine-merge-max-sources N  Max leaf files per fine aggregate (default: 16)\n"
         "  --fine-merge-max-input-mb N  Max source MB per fine aggregate (default: 64)\n"
@@ -381,6 +384,7 @@ int main(int argc, char* argv[]) {
     opts.enable_parallel         = g_config.enable_parallel;
     opts.num_threads             = g_config.num_threads;
     opts.enable_split_json       = g_config.enable_split_json;
+    opts.skip_bad_tiles          = g_config.skip_bad_tiles;
     opts.enable_fine_merge       = g_config.enable_fine_merge;
     opts.fine_merge_max_sources  = g_config.fine_merge_max_sources;
     opts.fine_merge_max_input_mb = g_config.fine_merge_max_input_mb;
@@ -433,6 +437,8 @@ int main(int argc, char* argv[]) {
             opts.num_threads = std::stoi(argv[++i]);
         } else if (arg == "--split-json") {
             opts.enable_split_json = true;
+        } else if (arg == "--skip-bad-tiles") {
+            opts.skip_bad_tiles = true;
         } else if (arg == "--no-fine-merge") {
             opts.enable_fine_merge = false;
         } else if (arg == "--fine-merge-max-sources" && i + 1 < argc) {

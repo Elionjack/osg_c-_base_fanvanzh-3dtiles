@@ -525,9 +525,10 @@ int convert_osgb(const ConvertOptions& opts) {
     int max_lvl = (opts.max_lvl != 100) ? opts.max_lvl : cfg_max_lvl;
 
     LOG_I("Conversion parameters: center=(%.10f, %.10f), max_lvl=%d", center_x, center_y, max_lvl);
-    LOG_I("Features: texture_compress=%d, meshopt=%d, draco=%d, unlit=%d, top_reconstruct=%d, hlod_only=%d, fine_merge=%d",
+    LOG_I("Features: texture_compress=%d, meshopt=%d, draco=%d, unlit=%d, top_reconstruct=%d, hlod_only=%d, fine_merge=%d, skip_bad_tiles=%d",
           opts.enable_texture_compress, opts.enable_meshopt, opts.enable_draco, opts.enable_unlit,
-          opts.enable_top_reconstruct, opts.hlod_only, opts.enable_fine_merge);
+          opts.enable_top_reconstruct, opts.hlod_only, opts.enable_fine_merge,
+          opts.skip_bad_tiles);
 
     // ============================================================
     // 4. Find and convert all tiles
@@ -598,6 +599,19 @@ int convert_osgb(const ConvertOptions& opts) {
     std::mutex trees_mutex;
     std::vector<TreeResult> all_trees;
 
+    struct BadInput {
+        std::string path;
+        std::string reason;
+    };
+    std::mutex bad_inputs_mutex;
+    std::vector<BadInput> bad_inputs;
+    TreeFailureCallback record_bad_input =
+        [&bad_inputs_mutex, &bad_inputs](const std::string& path,
+                                        const std::string& reason) {
+            std::lock_guard<std::mutex> lock(bad_inputs_mutex);
+            bad_inputs.push_back({path, reason});
+        };
+
     // Collect tasks first, then dispatch (parallel or serial).
     // Phase 1 is I/O-bound: osgDB::readNodeFiles() has a global mutex,
     // so we cap I/O concurrency to 4 threads even in parallel mode.
@@ -619,47 +633,65 @@ int convert_osgb(const ConvertOptions& opts) {
         if (!opts.hlod_only) fs::create_directories(out_tile_dir);
 
         phase1_tasks.push_back([&trees_mutex, &all_trees, &opts,
+                                record_bad_input,
                                 osgb_path = osgb_file.string(),
                                 stem,
                                 out_path = out_tile_dir.string()]() {
-            osg_tree root;
-            if (opts.hlod_only) {
-                // HLOD consumes only the coarsest root OSGB for each spatial
-                // source tile. Avoid discovering/loading its PagedLOD children.
-                // Use the existing GLB conversion path once to preserve the
-                // exact corrected geometry bounds used by the normal pipeline;
-                // discard the buffer and retain only the bounds for the grid.
-                LOG_I("Phase 1 HLOD-only - Loading coarsest source: %s",
-                      osgb_path.c_str());
-                std::string probe_glb;
-                MeshInfo minfo;
-                const bool ok = osgb2glb_buf(
-                    osgb_path, probe_glb, minfo, 1,
-                    false, false, false, opts.enable_unlit,
-                    1.0, opts.draco_pos_bits, opts.draco_normal_bits,
-                    opts.draco_uv_bits, opts.ktx2_quality);
-                TileBox bbox;
-                bbox.min = minfo.min;
-                bbox.max = minfo.max;
-                if (!ok || !is_valid_tile_box(bbox)) {
-                    LOG_E("Failed to load HLOD source bounds: %s", osgb_path.c_str());
+            try {
+                osg_tree root;
+                if (opts.hlod_only) {
+                    // HLOD consumes only the coarsest root OSGB for each spatial
+                    // source tile. Avoid discovering/loading its PagedLOD children.
+                    // Use the existing GLB conversion path once to preserve the
+                    // exact corrected geometry bounds used by the normal pipeline;
+                    // discard the buffer and retain only the bounds for the grid.
+                    LOG_I("Phase 1 HLOD-only - Loading coarsest source: %s",
+                          osgb_path.c_str());
+                    std::string probe_glb;
+                    MeshInfo minfo;
+                    const bool ok = osgb2glb_buf(
+                        osgb_path, probe_glb, minfo, 1,
+                        false, false, false, opts.enable_unlit,
+                        1.0, opts.draco_pos_bits, opts.draco_normal_bits,
+                        opts.draco_uv_bits, opts.ktx2_quality);
+                    TileBox bbox;
+                    bbox.min = minfo.min;
+                    bbox.max = minfo.max;
+                    if (!ok || !is_valid_tile_box(bbox)) {
+                        LOG_E("Failed to load HLOD source bounds: %s", osgb_path.c_str());
+                        if (opts.skip_bad_tiles)
+                            record_bad_input(osgb_path, "failed to load HLOD source bounds");
+                        return;
+                    }
+                    root.file_name = osgb_path;
+                    root.type = 1;
+                    root.bbox = std::move(bbox);
+                } else {
+                    LOG_I("Phase 1 - Building tree: %s", osgb_path.c_str());
+                    std::string path_copy = osgb_path;
+                    root = get_all_tree(
+                        path_copy, opts.skip_bad_tiles, record_bad_input);
+                }
+                if (root.file_name.empty()) {
+                    LOG_E("Failed to read: %s", osgb_path.c_str());
                     return;
                 }
-                root.file_name = osgb_path;
-                root.type = 1;
-                root.bbox = std::move(bbox);
-            } else {
-                LOG_I("Phase 1 - Building tree: %s", osgb_path.c_str());
-                std::string path_copy = osgb_path;
-                root = get_all_tree(path_copy);
-            }
-            if (root.file_name.empty()) {
-                LOG_E("Failed to read: %s", osgb_path.c_str());
+                {
+                    std::lock_guard<std::mutex> lock(trees_mutex);
+                    all_trees.push_back({std::move(root), stem, out_path});
+                }
+            } catch (const std::bad_alloc&) {
+                throw;
+            } catch (const std::exception& e) {
+                if (!opts.skip_bad_tiles) throw;
+                LOG_E("Skipping top-level grid [%s]: %s", osgb_path.c_str(), e.what());
+                record_bad_input(osgb_path, e.what());
                 return;
-            }
-            {
-                std::lock_guard<std::mutex> lock(trees_mutex);
-                all_trees.push_back({std::move(root), stem, out_path});
+            } catch (...) {
+                if (!opts.skip_bad_tiles) throw;
+                LOG_E("Skipping top-level grid [%s]: unknown exception", osgb_path.c_str());
+                record_bad_input(osgb_path, "unknown exception");
+                return;
             }
         });
     }
@@ -677,7 +709,12 @@ int convert_osgb(const ConvertOptions& opts) {
             // sem.acquire() INSIDE the lambda — non-blocking submission (Fix #4)
             auto wrapper = [&sem, task = std::move(task)]() {
                 sem.acquire();
-                task();
+                try {
+                    task();
+                } catch (...) {
+                    sem.release();
+                    throw;
+                }
                 sem.release();
             };
             futures.push_back(std::async(std::launch::async, std::move(wrapper)));
@@ -693,6 +730,38 @@ int convert_osgb(const ConvertOptions& opts) {
                   ? "Phase 1 HLOD-only complete: %zu coarsest sources loaded (serial)"
                   : "Phase 1 complete: %zu tile trees built (serial)",
               all_trees.size());
+    }
+
+    if (opts.skip_bad_tiles) {
+        std::sort(bad_inputs.begin(), bad_inputs.end(),
+                  [](const BadInput& a, const BadInput& b) {
+                      return a.path < b.path
+                          || (a.path == b.path && a.reason < b.reason);
+                  });
+        bad_inputs.erase(
+            std::unique(bad_inputs.begin(), bad_inputs.end(),
+                        [](const BadInput& a, const BadInput& b) {
+                            return a.path == b.path && a.reason == b.reason;
+                        }),
+            bad_inputs.end());
+
+        const fs::path report_path = out_dir / "failed_tiles.txt";
+        if (bad_inputs.empty()) {
+            std::error_code ec;
+            fs::remove(report_path, ec);
+        } else {
+            std::ofstream report(report_path);
+            report << "# Skipped malformed or missing OSGB inputs\n";
+            for (const auto& failure : bad_inputs) {
+                std::string reason = failure.reason;
+                std::replace(reason.begin(), reason.end(), '\n', ' ');
+                std::replace(reason.begin(), reason.end(), '\r', ' ');
+                report << failure.path << '\t' << reason << '\n';
+            }
+            report.close();
+            LOG_W("Skipped %zu malformed/missing OSGB inputs; report: %s",
+                  bad_inputs.size(), report_path.string().c_str());
+        }
     }
 
     if (all_trees.empty()) {

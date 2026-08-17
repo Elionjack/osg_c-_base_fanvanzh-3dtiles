@@ -30,6 +30,7 @@ struct ConvertOptions {
 
     // Tileset JSON splitting (external tilesets)
     bool enable_split_json = false;    // split monolithic tileset.json into index + sub-tilesets
+    bool skip_bad_tiles = false;       // skip malformed OSGB nodes/grids and write failed_tiles.txt
 
     // Finest-LOD subtree aggregation
     bool enable_fine_merge = true;     // merge small finest-LOD spatial subtrees

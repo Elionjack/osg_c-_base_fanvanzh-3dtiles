@@ -270,54 +270,74 @@ public:
 // ============================================================
 // Tree traversal
 // ============================================================
-osg_tree get_all_tree(std::string& file_name) {
-    osg_tree root_tile;
-    vector<string> fileNames = { file_name };
+osg_tree get_all_tree(
+    std::string& file_name,
+    bool skip_bad_nodes,
+    const TreeFailureCallback& on_failure) {
+    try {
+        osg_tree root_tile;
+        vector<string> fileNames = { file_name };
 
-    static bool logged = false;
-    if (!logged) { log_osg_plugin_info(); logged = true; }
+        static bool logged = false;
+        if (!logged) { log_osg_plugin_info(); logged = true; }
 
-    InfoVisitor infoVisitor(get_parent(file_name), false, /*skip_correction=*/true);
-    {
-        osg::ref_ptr<osg::Node> root = osgDB::readNodeFiles(fileNames);
-        if (!root) {
-            std::string name = utf8_string(file_name.c_str());
-            LOG_E("read node files [%s] fail!", name.c_str());
-            return root_tile;
+        InfoVisitor infoVisitor(get_parent(file_name), false, /*skip_correction=*/true);
+        {
+            osg::ref_ptr<osg::Node> root = osgDB::readNodeFiles(fileNames);
+            if (!root) {
+                std::string name = utf8_string(file_name.c_str());
+                LOG_E("read node files [%s] fail!", name.c_str());
+                if (skip_bad_nodes && on_failure)
+                    on_failure(file_name, "read node files failed");
+                return root_tile;
+            }
+            root_tile.file_name = file_name;
+            root_tile.type = 1;
+            root->accept(infoVisitor);
         }
-        root_tile.file_name = file_name;
-        root_tile.type = 1;
-        root->accept(infoVisitor);
-    }
     // NOTE: cached_node is NOT set here. Phase 1 only builds the file tree
     // structure (sub_node_names).  Phase 2 loads each tile from disk on demand
     // and frees it after conversion, keeping memory bounded.
 
-    for (auto& i : infoVisitor.sub_node_names) {
-        osg_tree tree = get_all_tree(i);
-        if (!tree.file_name.empty()) {
-            if (tree.type == 0) {
-                for (auto& node : tree.sub_nodes)
-                    root_tile.sub_nodes.push_back(node);
-            } else {
-                root_tile.sub_nodes.push_back(tree);
+        for (auto& i : infoVisitor.sub_node_names) {
+            osg_tree tree = get_all_tree(i, skip_bad_nodes, on_failure);
+            if (!tree.file_name.empty()) {
+                if (tree.type == 0) {
+                    for (auto& node : tree.sub_nodes)
+                        root_tile.sub_nodes.push_back(node);
+                } else {
+                    root_tile.sub_nodes.push_back(tree);
+                }
             }
         }
-    }
 
     // If node has both PagedLOD and Other geometry, wrap in a group node
-    if (!infoVisitor.other_geometry_array.empty() && !infoVisitor.geometry_array.empty()) {
-        osg_tree new_root_tile;
-        new_root_tile.type = 0;
-        new_root_tile.file_name = file_name;
-        osg_tree tile;
-        tile.type = 2;
-        tile.file_name = file_name;
-        new_root_tile.sub_nodes.push_back(root_tile);
-        new_root_tile.sub_nodes.push_back(tile);
-        root_tile = new_root_tile;
+        if (!infoVisitor.other_geometry_array.empty() && !infoVisitor.geometry_array.empty()) {
+            osg_tree new_root_tile;
+            new_root_tile.type = 0;
+            new_root_tile.file_name = file_name;
+            osg_tree tile;
+            tile.type = 2;
+            tile.file_name = file_name;
+            new_root_tile.sub_nodes.push_back(root_tile);
+            new_root_tile.sub_nodes.push_back(tile);
+            root_tile = new_root_tile;
+        }
+        return root_tile;
+    } catch (const std::bad_alloc&) {
+        // Memory exhaustion is not a recoverable bad-input condition.
+        throw;
+    } catch (const std::exception& e) {
+        if (!skip_bad_nodes) throw;
+        LOG_E("Skipping malformed OSGB node [%s]: %s", file_name.c_str(), e.what());
+        if (on_failure) on_failure(file_name, e.what());
+        return {};
+    } catch (...) {
+        if (!skip_bad_nodes) throw;
+        LOG_E("Skipping malformed OSGB node [%s]: unknown exception", file_name.c_str());
+        if (on_failure) on_failure(file_name, "unknown exception");
+        return {};
     }
-    return root_tile;
 }
 
 // ============================================================

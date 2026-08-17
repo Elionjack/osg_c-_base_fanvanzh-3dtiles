@@ -422,6 +422,7 @@ src/ 和 src1.1/ 现在共享完整的网格处理管线。核心差异仅在于
 | `--no-parallel` | 禁用多线程 tile 转换（默认开启并行） | off（即默认并行） |
 | `--hlod-only` | 仅生成 `Data/HLOD/*.glb` 和只引用 HLOD 的 `tileset.json`；自动启用顶部重建，用于快速验证 | off |
 | `--split-json` | 主 JSON 保留 HLOD 索引，每个源瓦片 LOD 树写入独立 `subtilesets/<stem>.json` | off |
+| `--skip-bad-tiles` | 跳过损坏的 OSGB 子节点或顶层格网，继续转换并写出 `failed_tiles.txt` | off |
 | `--no-fine-merge` | 禁用最细层小子树聚合；Fine Merge 默认开启 | off |
 | `--fine-merge-max-sources` | 单个 Fine Merge 最多合并的叶 OSGB 数量 | 16 |
 | `--fine-merge-max-input-mb` | 单个 Fine Merge 允许的源文件总体积上限（MB） | 64 |

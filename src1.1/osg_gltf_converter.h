@@ -4,6 +4,7 @@
 #include <vector>
 #include <map>
 #include <memory>
+#include <functional>
 #include <osg/Node>
 #include <osg/Geometry>
 #include <nlohmann/json.hpp>
@@ -53,8 +54,13 @@ struct osg_tree {
     bool content_written = false;
 };
 
-// Get full OSGB tile tree starting from a root file
-osg_tree get_all_tree(std::string& file_name);
+// Get full OSGB tile tree starting from a root file. In tolerant mode,
+// malformed descendants are omitted and reported through on_failure.
+using TreeFailureCallback = std::function<void(const std::string&, const std::string&)>;
+osg_tree get_all_tree(
+    std::string& file_name,
+    bool skip_bad_nodes = false,
+    const TreeFailureCallback& on_failure = {});
 
 // Core: convert a pre-loaded OSG Node to GLB buffer.
 // Unlike osgb2glb_buf(), this does NOT call osgDB::readNodeFiles() —
