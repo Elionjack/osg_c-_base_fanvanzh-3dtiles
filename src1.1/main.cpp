@@ -58,6 +58,8 @@ struct HardcodedConfig {
     int  num_threads;
     bool enable_split_json;
     bool skip_bad_tiles;
+    int  tile_read_timeout;
+    int  tile_reader_processes;
     bool enable_fine_merge;
     int  fine_merge_max_sources;
     int  fine_merge_max_input_mb;
@@ -93,6 +95,8 @@ static const HardcodedConfig g_config = {
     /* num_threads     */ 0,
     /* enable_split_json */ false,
     /* skip_bad_tiles */ false,
+    /* tile_read_timeout */ 0,
+    /* tile_reader_processes */ 4,
     /* enable_fine_merge */ true,
     /* fine_merge_max_sources */ 16,
     /* fine_merge_max_input_mb */ 64,
@@ -331,6 +335,8 @@ static void print_usage(const char* prog) {
         "  --threads N             Number of worker threads (default: auto=CPU cores)\n"
         "  --split-json            Split tileset.json into root index + sub-tilesets\n"
         "  --skip-bad-tiles        Skip malformed OSGB nodes/grids and write failed_tiles.txt\n"
+        "  --tile-read-timeout N   Skip a top-level grid if Phase 1 exceeds N seconds (Linux; 0=off)\n"
+        "  --tile-reader-processes N  Persistent Phase 1 reader processes (default: 4)\n"
         "  --no-fine-merge         Disable finest-LOD subtree aggregation (enabled by default)\n"
         "  --fine-merge-max-sources N  Max leaf files per fine aggregate (default: 16)\n"
         "  --fine-merge-max-input-mb N  Max source MB per fine aggregate (default: 64)\n"
@@ -354,6 +360,10 @@ static void print_usage(const char* prog) {
 int main(int argc, char* argv[]) {
     // Setup environment
     setup_environment(argv[0]);
+
+    // Private entry point used after exec() by the Linux Phase 1 process pool.
+    if (argc == 2 && std::string(argv[1]) == "--phase1-reader-worker")
+        return osgb_converter::run_phase1_reader_worker();
 
     // Parse arguments
     osgb_converter::ConvertOptions opts;
@@ -385,6 +395,8 @@ int main(int argc, char* argv[]) {
     opts.num_threads             = g_config.num_threads;
     opts.enable_split_json       = g_config.enable_split_json;
     opts.skip_bad_tiles          = g_config.skip_bad_tiles;
+    opts.tile_read_timeout       = g_config.tile_read_timeout;
+    opts.tile_reader_processes   = g_config.tile_reader_processes;
     opts.enable_fine_merge       = g_config.enable_fine_merge;
     opts.fine_merge_max_sources  = g_config.fine_merge_max_sources;
     opts.fine_merge_max_input_mb = g_config.fine_merge_max_input_mb;
@@ -439,6 +451,10 @@ int main(int argc, char* argv[]) {
             opts.enable_split_json = true;
         } else if (arg == "--skip-bad-tiles") {
             opts.skip_bad_tiles = true;
+        } else if (arg == "--tile-read-timeout" && i + 1 < argc) {
+            opts.tile_read_timeout = std::max(0, std::stoi(argv[++i]));
+        } else if (arg == "--tile-reader-processes" && i + 1 < argc) {
+            opts.tile_reader_processes = std::max(1, std::stoi(argv[++i]));
         } else if (arg == "--no-fine-merge") {
             opts.enable_fine_merge = false;
         } else if (arg == "--fine-merge-max-sources" && i + 1 < argc) {

@@ -31,6 +31,8 @@ struct ConvertOptions {
     // Tileset JSON splitting (external tilesets)
     bool enable_split_json = false;    // split monolithic tileset.json into index + sub-tilesets
     bool skip_bad_tiles = false;       // skip malformed OSGB nodes/grids and write failed_tiles.txt
+    int tile_read_timeout = 0;         // seconds per top-level grid (0=legacy thread mode)
+    int tile_reader_processes = 4;     // persistent Linux Phase 1 reader processes
 
     // Finest-LOD subtree aggregation
     bool enable_fine_merge = true;     // merge small finest-LOD spatial subtrees
@@ -57,5 +59,9 @@ struct ConvertOptions {
 // Main entry point: convert an OSGB tileset directory to 3D Tiles
 // Returns 0 on success, non-zero on failure.
 int convert_osgb(const ConvertOptions& opts);
+
+// Internal Linux worker entry point used by the persistent Phase 1 process pool.
+// It is intentionally not part of the public command-line interface.
+int run_phase1_reader_worker();
 
 } // namespace osgb_converter

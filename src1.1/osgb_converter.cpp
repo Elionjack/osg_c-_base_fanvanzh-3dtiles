@@ -20,7 +20,21 @@
 #include <functional>
 #include <memory>
 #include <cmath>
+#include <cstdint>
+#include <cerrno>
+#include <cstdio>
 #include <glm/gtc/type_ptr.hpp>
+
+#ifndef _WIN32
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <sys/poll.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <limits.h>
+#endif
 
 namespace fs = std::filesystem;
 
@@ -35,6 +49,489 @@ namespace osgb_converter {
 
 // Forward declaration
 static std::vector<std::string> split_string(const std::string& s, char delim);
+
+struct Phase1Job {
+    std::string osgb_path;
+    std::string stem;
+    std::string out_tile_dir;
+};
+
+struct Phase1TreeResult {
+    osg_tree root;
+    std::string stem;
+    std::string out_tile_dir;
+};
+
+struct BadInput {
+    std::string path;
+    std::string reason;
+};
+
+static json tree_to_worker_json(const osg_tree& tree) {
+    json value = {
+        {"file", tree.file_name},
+        {"type", tree.type},
+        {"children", json::array()}
+    };
+    if (!tree.bbox.min.empty()) value["bbox_min"] = tree.bbox.min;
+    if (!tree.bbox.max.empty()) value["bbox_max"] = tree.bbox.max;
+    for (const auto& child : tree.sub_nodes)
+        value["children"].push_back(tree_to_worker_json(child));
+    return value;
+}
+
+static osg_tree tree_from_worker_json(const json& value) {
+    osg_tree tree;
+    tree.file_name = value.at("file").get<std::string>();
+    tree.type = value.value("type", 1);
+    if (value.contains("bbox_min"))
+        tree.bbox.min = value.at("bbox_min").get<std::vector<double>>();
+    if (value.contains("bbox_max"))
+        tree.bbox.max = value.at("bbox_max").get<std::vector<double>>();
+    if (value.contains("children")) {
+        for (const auto& child : value.at("children"))
+            tree.sub_nodes.push_back(tree_from_worker_json(child));
+    }
+    return tree;
+}
+
+#ifndef _WIN32
+static bool read_exact_fd(int fd, void* data, size_t size) {
+    char* out = static_cast<char*>(data);
+    size_t done = 0;
+    while (done < size) {
+        const ssize_t n = ::read(fd, out + done, size - done);
+        if (n == 0) return false;
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        done += static_cast<size_t>(n);
+    }
+    return true;
+}
+
+static bool write_exact_fd(int fd, const void* data, size_t size) {
+    const char* in = static_cast<const char*>(data);
+    size_t done = 0;
+    while (done < size) {
+        const ssize_t n = ::write(fd, in + done, size - done);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        done += static_cast<size_t>(n);
+    }
+    return true;
+}
+
+static bool read_worker_frame(int fd, std::string& payload) {
+    uint64_t length = 0;
+    if (!read_exact_fd(fd, &length, sizeof(length))) return false;
+    constexpr uint64_t kMaxFrameBytes = 1024ull * 1024ull * 1024ull;
+    if (length > kMaxFrameBytes) return false;
+    payload.resize(static_cast<size_t>(length));
+    return length == 0 || read_exact_fd(fd, payload.data(), payload.size());
+}
+
+static bool write_worker_frame(int fd, const std::string& payload) {
+    const uint64_t length = static_cast<uint64_t>(payload.size());
+    return write_exact_fd(fd, &length, sizeof(length))
+        && (payload.empty() || write_exact_fd(fd, payload.data(), payload.size()));
+}
+#endif
+
+int run_phase1_reader_worker() {
+#ifdef _WIN32
+    return 2;
+#else
+    constexpr int kResultFd = 3;
+    std::string request_text;
+    while (read_worker_frame(STDIN_FILENO, request_text)) {
+        if (request_text.empty()) break;
+
+        json response;
+        std::vector<BadInput> failures;
+        try {
+            const json request = json::parse(request_text);
+            std::string path = request.at("path").get<std::string>();
+            TreeFailureCallback on_failure = [&failures](
+                const std::string& failed_path, const std::string& reason) {
+                failures.push_back({failed_path, reason});
+            };
+
+            LOG_I("Phase 1 worker - Building tree: %s", path.c_str());
+            osg_tree root = get_all_tree(path, true, on_failure);
+            if (root.file_name.empty()) {
+                response = {{"ok", false}, {"reason", "failed to build tile tree"}};
+            } else {
+                response = {{"ok", true}, {"tree", tree_to_worker_json(root)}};
+            }
+        } catch (const std::exception& e) {
+            response = {{"ok", false}, {"reason", e.what()}};
+        } catch (...) {
+            response = {{"ok", false}, {"reason", "unknown worker exception"}};
+        }
+
+        response["failures"] = json::array();
+        for (const auto& failure : failures) {
+            response["failures"].push_back({
+                {"path", failure.path}, {"reason", failure.reason}});
+        }
+        if (!write_worker_frame(kResultFd, response.dump())) return 3;
+    }
+    return 0;
+#endif
+}
+
+#ifndef _WIN32
+static bool run_phase1_process_pool(
+    const std::vector<Phase1Job>& jobs,
+    const ConvertOptions& opts,
+    std::vector<Phase1TreeResult>& results,
+    std::vector<BadInput>& bad_inputs) {
+    if (jobs.empty()) return true;
+
+    using Clock = std::chrono::steady_clock;
+    constexpr size_t kLogLimitPerTile = 64u * 1024u;
+    constexpr size_t kMaxDrainPerPass = 256u * 1024u;
+    constexpr uint64_t kMaxFrameBytes = 1024ull * 1024ull * 1024ull;
+
+    struct Worker {
+        pid_t pid = -1;
+        int command_fd = -1;
+        int result_fd = -1;
+        int log_fd = -1;
+        bool busy = false;
+        size_t job_index = 0;
+        Clock::time_point started;
+        std::vector<char> result_buffer;
+        uint64_t expected_bytes = UINT64_MAX;
+        size_t log_forwarded = 0;
+        size_t log_dropped = 0;
+    };
+
+    auto close_fd = [](int& fd) {
+        if (fd >= 0) ::close(fd);
+        fd = -1;
+    };
+    auto set_nonblocking = [](int fd) {
+        const int flags = ::fcntl(fd, F_GETFL, 0);
+        if (flags >= 0) ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    };
+    auto spawn_worker = [&](Worker& worker) -> bool {
+        int command_pipe[2] = {-1, -1};
+        int result_pipe[2] = {-1, -1};
+        int log_pipe[2] = {-1, -1};
+        if (::pipe(command_pipe) != 0
+            || ::pipe(result_pipe) != 0
+            || ::pipe(log_pipe) != 0) {
+            LOG_E("Failed to create Phase 1 worker pipes: %s", std::strerror(errno));
+            for (int fd : command_pipe) if (fd >= 0) ::close(fd);
+            for (int fd : result_pipe) if (fd >= 0) ::close(fd);
+            for (int fd : log_pipe) if (fd >= 0) ::close(fd);
+            return false;
+        }
+
+        const pid_t pid = ::fork();
+        if (pid < 0) {
+            LOG_E("Failed to fork Phase 1 worker: %s", std::strerror(errno));
+            for (int fd : command_pipe) ::close(fd);
+            for (int fd : result_pipe) ::close(fd);
+            for (int fd : log_pipe) ::close(fd);
+            return false;
+        }
+        if (pid == 0) {
+            char executable_path[PATH_MAX + 1] = {};
+            const ssize_t executable_length = ::readlink(
+                "/proc/self/exe", executable_path, PATH_MAX);
+            if (executable_length > 0)
+                executable_path[executable_length] = '\0';
+            if (::dup2(command_pipe[0], STDIN_FILENO) < 0
+                || ::dup2(log_pipe[1], STDOUT_FILENO) < 0
+                || ::dup2(log_pipe[1], STDERR_FILENO) < 0
+                || ::dup2(result_pipe[1], 3) < 0) {
+                _exit(126);
+            }
+            for (int fd : command_pipe) if (fd > 3) ::close(fd);
+            for (int fd : result_pipe) if (fd > 3) ::close(fd);
+            for (int fd : log_pipe) if (fd > 3) ::close(fd);
+            ::execl("/proc/self/exe",
+                    executable_length > 0 ? executable_path : "/proc/self/exe",
+                    "--phase1-reader-worker", static_cast<char*>(nullptr));
+            _exit(127);
+        }
+
+        ::close(command_pipe[0]);
+        ::close(result_pipe[1]);
+        ::close(log_pipe[1]);
+        worker = Worker{};
+        worker.pid = pid;
+        worker.command_fd = command_pipe[1];
+        worker.result_fd = result_pipe[0];
+        worker.log_fd = log_pipe[0];
+        set_nonblocking(worker.result_fd);
+        set_nonblocking(worker.log_fd);
+        return true;
+    };
+
+    auto stop_worker = [&](Worker& worker, bool force) {
+        close_fd(worker.command_fd);
+        if (worker.pid > 0) {
+            int status = 0;
+            if (force) ::kill(worker.pid, SIGTERM);
+            bool exited = false;
+            for (int i = 0; i < 25; ++i) {
+                const pid_t waited = ::waitpid(worker.pid, &status, WNOHANG);
+                if (waited == worker.pid || (waited < 0 && errno == ECHILD)) {
+                    exited = true;
+                    break;
+                }
+                ::usleep(20000);
+            }
+            if (!exited) {
+                ::kill(worker.pid, SIGKILL);
+                while (::waitpid(worker.pid, &status, 0) < 0 && errno == EINTR) {}
+            }
+        }
+        close_fd(worker.result_fd);
+        close_fd(worker.log_fd);
+        worker.pid = -1;
+        worker.busy = false;
+    };
+
+    auto assign_job = [&](Worker& worker, size_t job_index) -> bool {
+        const json request = {{"path", jobs[job_index].osgb_path}};
+        if (!write_worker_frame(worker.command_fd, request.dump())) return false;
+        worker.busy = true;
+        worker.job_index = job_index;
+        worker.started = Clock::now();
+        worker.result_buffer.clear();
+        worker.expected_bytes = UINT64_MAX;
+        worker.log_forwarded = 0;
+        worker.log_dropped = 0;
+        LOG_I("Phase 1 - Assigned grid to reader pid=%d: %s",
+              static_cast<int>(worker.pid), jobs[job_index].osgb_path.c_str());
+        return true;
+    };
+
+    auto drain_log = [&](Worker& worker) {
+        char buffer[8192];
+        size_t drained = 0;
+        for (;;) {
+            const ssize_t n = ::read(worker.log_fd, buffer, sizeof(buffer));
+            if (n > 0) {
+                drained += static_cast<size_t>(n);
+                const size_t available = worker.log_forwarded < kLogLimitPerTile
+                    ? kLogLimitPerTile - worker.log_forwarded : 0;
+                const size_t forward = std::min(available, static_cast<size_t>(n));
+                if (forward > 0) {
+                    std::fwrite(buffer, 1, forward, stderr);
+                    std::fflush(stderr);
+                    worker.log_forwarded += forward;
+                }
+                worker.log_dropped += static_cast<size_t>(n) - forward;
+                if (drained >= kMaxDrainPerPass) break;
+                continue;
+            }
+            if (n < 0 && errno == EINTR) continue;
+            break;
+        }
+    };
+
+    auto take_response = [&](Worker& worker, std::string& payload) -> int {
+        char buffer[65536];
+        for (;;) {
+            const ssize_t n = ::read(worker.result_fd, buffer, sizeof(buffer));
+            if (n > 0) {
+                worker.result_buffer.insert(
+                    worker.result_buffer.end(), buffer, buffer + n);
+                continue;
+            }
+            if (n < 0 && errno == EINTR) continue;
+            break;
+        }
+        if (worker.expected_bytes == UINT64_MAX
+            && worker.result_buffer.size() >= sizeof(uint64_t)) {
+            std::memcpy(&worker.expected_bytes,
+                        worker.result_buffer.data(), sizeof(uint64_t));
+            worker.result_buffer.erase(
+                worker.result_buffer.begin(),
+                worker.result_buffer.begin() + sizeof(uint64_t));
+            if (worker.expected_bytes > kMaxFrameBytes) return -1;
+        }
+        if (worker.expected_bytes != UINT64_MAX
+            && worker.result_buffer.size() >= worker.expected_bytes) {
+            payload.assign(worker.result_buffer.data(),
+                           static_cast<size_t>(worker.expected_bytes));
+            return 1;
+        }
+        return 0;
+    };
+
+    // A dead reader must cause write() to fail instead of terminating the parent.
+    ::signal(SIGPIPE, SIG_IGN);
+
+    const size_t worker_count = std::min(
+        jobs.size(), static_cast<size_t>(std::max(1, opts.tile_reader_processes)));
+    std::vector<Worker> workers(worker_count);
+    for (auto& worker : workers) {
+        if (!spawn_worker(worker)) {
+            for (auto& started : workers)
+                if (started.pid > 0) stop_worker(started, true);
+            return false;
+        }
+    }
+
+    size_t next_job = 0;
+    size_t completed = 0;
+    for (auto& worker : workers) {
+        if (next_job < jobs.size() && !assign_job(worker, next_job++)) {
+            LOG_E("Failed to send initial job to Phase 1 worker");
+            for (auto& started : workers) stop_worker(started, true);
+            return false;
+        }
+    }
+
+    auto record_job_failure = [&](const Worker& worker, const std::string& reason) {
+        const auto& job = jobs[worker.job_index];
+        bad_inputs.push_back({job.osgb_path, reason});
+        LOG_E("Skipping top-level grid [%s]: %s",
+              job.osgb_path.c_str(), reason.c_str());
+    };
+
+    while (completed < jobs.size()) {
+        std::vector<pollfd> poll_fds;
+        std::vector<std::pair<size_t, bool>> owners;
+        for (size_t i = 0; i < workers.size(); ++i) {
+            if (workers[i].pid <= 0) continue;
+            poll_fds.push_back({workers[i].result_fd, POLLIN | POLLHUP | POLLERR, 0});
+            owners.push_back({i, false});
+            poll_fds.push_back({workers[i].log_fd, POLLIN | POLLHUP | POLLERR, 0});
+            owners.push_back({i, true});
+        }
+        if (!poll_fds.empty()) {
+            int rc;
+            do { rc = ::poll(poll_fds.data(), poll_fds.size(), 100); }
+            while (rc < 0 && errno == EINTR);
+            if (rc < 0) {
+                LOG_E("Phase 1 worker poll failed: %s", std::strerror(errno));
+                for (auto& worker : workers) stop_worker(worker, true);
+                return false;
+            }
+            for (size_t p = 0; p < poll_fds.size(); ++p) {
+                if (poll_fds[p].revents == 0) continue;
+                Worker& worker = workers[owners[p].first];
+                if (owners[p].second) drain_log(worker);
+            }
+        }
+
+        for (auto& worker : workers) {
+            if (worker.pid <= 0 || !worker.busy) continue;
+            std::string payload;
+            const int response_state = take_response(worker, payload);
+            if (response_state != 0) {
+                drain_log(worker);
+                if (worker.log_dropped > 0) {
+                    LOG_W("Suppressed %zu bytes of reader output for grid: %s",
+                          worker.log_dropped, jobs[worker.job_index].osgb_path.c_str());
+                }
+                if (response_state < 0) {
+                    record_job_failure(worker, "invalid oversized worker response");
+                } else {
+                    try {
+                        const json response = json::parse(payload);
+                        if (response.contains("failures")) {
+                            for (const auto& failure : response.at("failures")) {
+                                bad_inputs.push_back({
+                                    failure.value("path", jobs[worker.job_index].osgb_path),
+                                    failure.value("reason", "reader failure")});
+                            }
+                        }
+                        if (response.value("ok", false)) {
+                            results.push_back({
+                                tree_from_worker_json(response.at("tree")),
+                                jobs[worker.job_index].stem,
+                                jobs[worker.job_index].out_tile_dir});
+                        } else {
+                            record_job_failure(
+                                worker, response.value("reason", "reader failed"));
+                        }
+                    } catch (const std::exception& e) {
+                        record_job_failure(worker,
+                            std::string("invalid worker response: ") + e.what());
+                    }
+                }
+                worker.busy = false;
+                ++completed;
+                if (next_job < jobs.size()) {
+                    if (!assign_job(worker, next_job++)) {
+                        stop_worker(worker, true);
+                        if (!spawn_worker(worker)
+                            || !assign_job(worker, next_job - 1)) {
+                            LOG_E("Failed to replace Phase 1 reader process");
+                            for (auto& other : workers) stop_worker(other, true);
+                            return false;
+                        }
+                    }
+                }
+                continue;
+            }
+
+            const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                Clock::now() - worker.started).count();
+            if (elapsed >= opts.tile_read_timeout) {
+                record_job_failure(worker,
+                    "Phase 1 read timeout after " +
+                    std::to_string(opts.tile_read_timeout) + " seconds");
+                drain_log(worker);
+                if (worker.log_dropped > 0) {
+                    LOG_W("Suppressed %zu bytes of reader output for timed-out grid: %s",
+                          worker.log_dropped, jobs[worker.job_index].osgb_path.c_str());
+                }
+                stop_worker(worker, true);
+                ++completed;
+                if (next_job < jobs.size()) {
+                    if (!spawn_worker(worker) || !assign_job(worker, next_job++)) {
+                        LOG_E("Failed to replace timed-out Phase 1 reader process");
+                        for (auto& other : workers) stop_worker(other, true);
+                        return false;
+                    }
+                }
+                continue;
+            }
+
+            int status = 0;
+            const pid_t waited = ::waitpid(worker.pid, &status, WNOHANG);
+            if (waited == worker.pid) {
+                const std::string reason = WIFSIGNALED(status)
+                    ? "reader process crashed with signal " + std::to_string(WTERMSIG(status))
+                    : "reader process exited with code " +
+                      std::to_string(WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+                record_job_failure(worker, reason);
+                close_fd(worker.command_fd);
+                close_fd(worker.result_fd);
+                close_fd(worker.log_fd);
+                worker.pid = -1;
+                worker.busy = false;
+                ++completed;
+                if (next_job < jobs.size()) {
+                    if (!spawn_worker(worker) || !assign_job(worker, next_job++)) {
+                        LOG_E("Failed to replace crashed Phase 1 reader process");
+                        for (auto& other : workers) stop_worker(other, true);
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+
+    for (auto& worker : workers) stop_worker(worker, false);
+    LOG_I("Phase 1 complete: %zu tile trees built (%zu persistent reader processes, %d-second timeout)",
+          results.size(), worker_count, opts.tile_read_timeout);
+    return true;
+}
+#endif
 
 // ============================================================
 // metadata.xml parsing
@@ -428,6 +925,20 @@ static size_t aggregate_fine_lod_subtrees(
 // Main conversion entry point
 // ============================================================
 int convert_osgb(const ConvertOptions& opts) {
+    if (opts.tile_read_timeout > 0 && !opts.skip_bad_tiles) {
+        LOG_E("--tile-read-timeout requires --skip-bad-tiles");
+        return 1;
+    }
+    if (opts.tile_read_timeout > 0 && opts.hlod_only) {
+        LOG_E("--tile-read-timeout is not supported together with --hlod-only");
+        return 1;
+    }
+#ifdef _WIN32
+    if (opts.tile_read_timeout > 0) {
+        LOG_E("--tile-read-timeout is currently supported on Linux only");
+        return 1;
+    }
+#endif
     if (opts.hlod_only && !opts.enable_top_reconstruct) {
         LOG_E("hlod_only requires enable_top_reconstruct");
         return 1;
@@ -525,10 +1036,10 @@ int convert_osgb(const ConvertOptions& opts) {
     int max_lvl = (opts.max_lvl != 100) ? opts.max_lvl : cfg_max_lvl;
 
     LOG_I("Conversion parameters: center=(%.10f, %.10f), max_lvl=%d", center_x, center_y, max_lvl);
-    LOG_I("Features: texture_compress=%d, meshopt=%d, draco=%d, unlit=%d, top_reconstruct=%d, hlod_only=%d, fine_merge=%d, skip_bad_tiles=%d",
+    LOG_I("Features: texture_compress=%d, meshopt=%d, draco=%d, unlit=%d, top_reconstruct=%d, hlod_only=%d, fine_merge=%d, skip_bad_tiles=%d, tile_read_timeout=%d, tile_reader_processes=%d",
           opts.enable_texture_compress, opts.enable_meshopt, opts.enable_draco, opts.enable_unlit,
           opts.enable_top_reconstruct, opts.hlod_only, opts.enable_fine_merge,
-          opts.skip_bad_tiles);
+          opts.skip_bad_tiles, opts.tile_read_timeout, opts.tile_reader_processes);
 
     // ============================================================
     // 4. Find and convert all tiles
@@ -586,23 +1097,9 @@ int convert_osgb(const ConvertOptions& opts) {
         }
     };
 
-    // ============================================================
-    // Phase 1: Build tile trees in parallel (top-level only)
-    //           Each thread recursively builds a full osg_tree via get_all_tree().
-    // ============================================================
-    struct TreeResult {
-        osg_tree root;
-        std::string stem;
-        std::string out_tile_dir;
-    };
-
     std::mutex trees_mutex;
-    std::vector<TreeResult> all_trees;
+    std::vector<Phase1TreeResult> all_trees;
 
-    struct BadInput {
-        std::string path;
-        std::string reason;
-    };
     std::mutex bad_inputs_mutex;
     std::vector<BadInput> bad_inputs;
     TreeFailureCallback record_bad_input =
@@ -612,10 +1109,11 @@ int convert_osgb(const ConvertOptions& opts) {
             bad_inputs.push_back({path, reason});
         };
 
-    // Collect tasks first, then dispatch (parallel or serial).
-    // Phase 1 is I/O-bound: osgDB::readNodeFiles() has a global mutex,
-    // so we cap I/O concurrency to 4 threads even in parallel mode.
+    // Collect jobs first, then dispatch through either the legacy thread path
+    // or the Linux timeout-safe persistent process pool.
+    // Legacy Phase 1 is I/O-bound, so it remains capped at 4 threads.
     std::vector<std::function<void()>> phase1_tasks;
+    std::vector<Phase1Job> phase1_jobs;
 
     for (auto& entry : fs::directory_iterator(data_dir)) {
         if (!entry.is_directory()) continue;
@@ -626,11 +1124,16 @@ int convert_osgb(const ConvertOptions& opts) {
 
         if (!fs::exists(osgb_file) || fs::is_directory(osgb_file)) {
             LOG_E("No OSGB file in tile dir: %s", tile_dir.string().c_str());
+            if (opts.skip_bad_tiles)
+                record_bad_input(osgb_file.string(), "top-level OSGB file missing");
             continue;
         }
 
         fs::path out_tile_dir = out_dir / "Data" / stem;
         if (!opts.hlod_only) fs::create_directories(out_tile_dir);
+
+        phase1_jobs.push_back({
+            osgb_file.string(), stem, out_tile_dir.string()});
 
         phase1_tasks.push_back([&trees_mutex, &all_trees, &opts,
                                 record_bad_input,
@@ -696,7 +1199,15 @@ int convert_osgb(const ConvertOptions& opts) {
         });
     }
 
-    if (opts.enable_parallel) {
+    if (opts.tile_read_timeout > 0) {
+#ifndef _WIN32
+        if (!run_phase1_process_pool(
+                phase1_jobs, opts, all_trees, bad_inputs)) {
+            LOG_E("Phase 1 reader process pool failed");
+            return 1;
+        }
+#endif
+    } else if (opts.enable_parallel) {
         unsigned int n_threads = opts.num_threads > 0
             ? (unsigned int)opts.num_threads
             : std::thread::hardware_concurrency();
