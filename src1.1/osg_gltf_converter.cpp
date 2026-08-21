@@ -2169,27 +2169,33 @@ SpatialGrid build_spatial_grid(
 }
 
 double calc_level_ratio(int level, double base_ratio, int branching_factor) {
-    // Each level covers branching_factor times the area, so retain the same
-    // fraction of detail. For the historical quadtree this is 1/4 per level;
-    // for a 16-tree it is 1/16.
-    const double per_level_ratio = 1.0 / std::max(1, branching_factor);
-    double r = base_ratio * std::pow(per_level_ratio, level);
-    return std::max(0.01, r);
+    // Treat base_ratio as the reduction applied per equivalent quadtree depth.
+    // Dividing by the full branching factor made a 16-tree jump directly from
+    // 50% to 3.125%, then to 1%, which removed small disconnected components
+    // and made higher HLODs look progressively shattered.
+    const double clamped_base = std::clamp(base_ratio, 0.01, 1.0);
+    const int branch_side = std::max(
+        2, static_cast<int>(std::sqrt(static_cast<double>(branching_factor))));
+    const int equivalent_quadtree_level = std::max(1, static_cast<int>(std::lround(
+        std::max(1, level) * std::log2(static_cast<double>(branch_side)))));
+    const double quality_floor = std::min(0.10, clamped_base);
+    return std::max(quality_floor,
+                    std::pow(clamped_base, equivalent_quadtree_level));
 }
 
 int calc_hlod_texture_max_size(int level, int top_texture_max_size,
                                int branching_factor) {
-    int result = top_texture_max_size;
-    const int branch_side = std::max(
-        2, static_cast<int>(std::sqrt(static_cast<double>(branching_factor))));
-    const int equivalent_quadtree_level = static_cast<int>(std::lround(
-        level * std::log2(static_cast<double>(branch_side))));
-    const int steps = std::max(0, equivalent_quadtree_level - 1);
-    if (result > 32) {
-        for (int step = 0; step < steps && result > 32; ++step)
-            result = std::max(32, result / 2);
-    }
-    return result;
+    // This value is both the final atlas limit and the maximum sampling-grid
+    // dimension used by reconstruct_top_surface().  Reducing it again at each
+    // hierarchy level made a configured value of 512 become 256 for L1, 64
+    // for L0 and only 32 for the root of a 16-way HLOD.  At that point the
+    // surface had already lost most of its geometry and colour detail before
+    // KTX2 compression was applied.  Treat the option as the real limit for
+    // every emitted HLOD; coarser levels are already reduced by their larger
+    // --hlod-surface-error.
+    (void)level;
+    (void)branching_factor;
+    return top_texture_max_size;
 }
 
 struct HlodIntermediateEntry {

@@ -45,6 +45,7 @@ struct ConvertOptions {
     int  hlod_branching_factor = 16; // spatial children per HLOD node (perfect square, e.g. 4 or 16)
     int  hlod_max_source_tiles = 16;  // max source tiles merged into one HLOD GLB (0=unlimited)
     double simplify_ratio = 0.5;       // meshopt target_ratio (1.0=no simplify)
+    double hlod_surface_error = 1.0;   // base XY sampling spacing for reconstructed HLOD surfaces
     int  draco_pos_bits = 11;          // Draco position quantization bits
     int  draco_normal_bits = 10;       // Draco normal quantization bits
     int  draco_uv_bits = 12;           // Draco texcoord quantization bits

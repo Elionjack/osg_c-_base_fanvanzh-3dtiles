@@ -423,12 +423,14 @@ src/ 和 src1.1/ 现在共享完整的网格处理管线。核心差异仅在于
 | `--hlod-only` | 仅生成 `Data/HLOD/*.glb` 和只引用 HLOD 的 `tileset.json`；自动启用顶部重建，用于快速验证 | off |
 | `--split-json` | 主 JSON 保留 HLOD 索引，每个源瓦片 LOD 树写入独立 `subtilesets/<stem>.json` | off |
 | `--skip-bad-tiles` | 跳过损坏的 OSGB 子节点或顶层格网，继续转换并写出 `failed_tiles.txt` | off |
+| `--tile-read-timeout` | Linux Phase 1 单个顶层格网读取超时秒数；超时后终止并替换对应读取进程（需同时启用 `--skip-bad-tiles`，0=关闭） | 0 |
+| `--tile-reader-processes` | 启用读取超时时使用的 Linux 持久读取子进程数量 | 4 |
 | `--no-fine-merge` | 禁用最细层小子树聚合；Fine Merge 默认开启 | off |
 | `--fine-merge-max-sources` | 单个 Fine Merge 最多合并的叶 OSGB 数量 | 16 |
 | `--fine-merge-max-input-mb` | 单个 Fine Merge 允许的源文件总体积上限（MB） | 64 |
 | `--hlod-max-source-tiles` | 单个可绘制 HLOD 最多独立合并的源粗模数量；超过后作为纯索引节点（0=无限制） | 256 |
 | `--max-lvl` | 转换并写入 tileset 的最大源 LOD 层级 | 100 |
-| `--top-texture-max-size` | Root GLB 纹理最大尺寸（0=不限制） | 512 |
+| `--top-texture-max-size` | 每个 HLOD 代理的纹理及重建栅格最大边长 | 512 |
 | `--simplify-ratio` | Meshopt 简化目标比例（1.0=不简化） | 0.5 |
 | `--draco-pos-bits` | Draco 位置量化位数 | 11 |
 | `--draco-normal-bits` | Draco 法向量化位数 | 10 |
@@ -440,21 +442,43 @@ src/ 和 src1.1/ 现在共享完整的网格处理管线。核心差异仅在于
 | `--geoid` | 大地水准面模型：`none`/`egm84`/`egm96`/`egm2008` | none |
 | `--geoid-path` | 大地水准面数据文件路径 | 自动 |
 
+Linux 损坏数据自动隔离示例：
+
+```bash
+--skip-bad-tiles --tile-read-timeout 300 --tile-reader-processes 4
+```
+
+启用读取超时后，Phase 1 使用持久子进程代替原来的读取线程。某个
+`Tile_X_Y` 超时、崩溃或读取异常时，只跳过该顶层格网并重启对应子进程；
+其余格网继续执行。每个格网的子进程输出最多转发 64 KiB，额外输出会被
+丢弃并记录抑制字节数，避免损坏文件持续刷大日志。`--threads` 仍控制
+Phase 2 等转换线程，不会被 `--tile-reader-processes` 替代。
+
 ### src1.1 HLOD 单 primitive 单次压缩
+
+HLOD 最终代理现在使用 2.5D 顶面重建，不再对合并后的倾斜摄影碎网格按固定
+三角形比例做最终简化。源三角形从 +Z 方向栅格化，每个采样点保留最高表面，
+并从源 atlas 采样颜色烘焙到新代理纹理。`--hlod-surface-error` 控制最细 HLOD
+的基础采样间距（模型单位，默认 `1.0`），每升一级间距扩大一倍；
+`--top-texture-max-size` 是每一级最终代理表面的真实纹理及栅格边长上限，不再随
+层级二次递减；较粗层仍由逐级增大的 surface error 控制细节。各 HLOD 的 XY
+栅格锚定到同一世界坐标格点，边缘保留两格窄补边，避免相邻 L0/L1 因各自 bounds
+和步长不同而产生裂缝。`--simplify-ratio` 仍作用于普通子瓦片，但不再控制 HLOD
+最终代理。
 
 启用 `--enable-top-reconstruct` 后，`src1.1` 先收集一个 HLOD 内的全部 geometry
 和纹理，使用无损内存载体完成合并，然后按以下顺序处理：
 
-1. 按 `--top-texture-max-size` 和原有层级规则缩放各源纹理；
-2. 合并为一张 atlas，并将全部 geometry 合并为一个 primitive；
-3. 按 `--simplify-ratio` 和原有层级比例对合并网格简化一次；
-4. 按 `--ktx2-quality` 将最终 atlas 编码一次 KTX2；
+1. 将源纹理合并为只用于采样的临时 atlas；
+2. 从 +Z 方向把源三角形栅格化为由空间误差控制的最高表面；
+3. 从临时 atlas 采样并烘焙一张与新表面 UV 对应的代理纹理；
+4. 按 `--ktx2-quality` 将代理纹理及其 mipmap 编码一次 KTX2；
 5. 按 `--draco-pos-bits`、`--draco-normal-bits`、`--draco-uv-bits`
    对最终单 primitive 编码一次 Draco。
 
-不再逐 primitive 预先简化/Draco，也不再对输出做第二次简化和压缩。默认
-POSITION 量化恢复为 11-bit，普通细节 GLB 流程不变。每个成功写出的 HLOD GLB
-均恰好包含一个 primitive；最终合并失败时不会静默写出多 primitive HLOD。
+不再逐 primitive 预先简化/Draco，也不再对 HLOD 代理做 meshopt 三角形比例
+简化。普通细节 GLB 流程不变。每个成功写出的 HLOD GLB 均恰好包含一个
+primitive；表面重建失败时不会静默回退到碎网格简化结果。
 
 复现 v8 后处理效果的 Linux 示例：
 
