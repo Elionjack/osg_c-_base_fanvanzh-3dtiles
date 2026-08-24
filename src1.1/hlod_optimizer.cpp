@@ -409,353 +409,6 @@ static std::vector<Group> merge_geometry(
     return groups;
 }
 
-struct SurfaceProxy {
-    Group group;
-    std::vector<unsigned char> texture;
-    int texture_size = 0;
-    double effective_spacing = 0.0;
-};
-
-static std::array<unsigned char, 3> sample_rgb(
-    const std::vector<unsigned char>& image, int size, float u, float v) {
-    const double x = std::clamp(static_cast<double>(u), 0.0, 1.0) * (size - 1);
-    const double y = std::clamp(static_cast<double>(v), 0.0, 1.0) * (size - 1);
-    const int x0 = static_cast<int>(std::floor(x));
-    const int y0 = static_cast<int>(std::floor(y));
-    const int x1 = std::min(size - 1, x0 + 1);
-    const int y1 = std::min(size - 1, y0 + 1);
-    const double tx = x - x0;
-    const double ty = y - y0;
-    std::array<unsigned char, 3> result{};
-    for (int channel = 0; channel < 3; ++channel) {
-        const auto value = [&](int px, int py) {
-            return static_cast<double>(image[
-                (static_cast<size_t>(py) * size + px) * 3 + channel]);
-        };
-        const double top = value(x0, y0) * (1.0 - tx) + value(x1, y0) * tx;
-        const double bottom = value(x0, y1) * (1.0 - tx) + value(x1, y1) * tx;
-        result[channel] = static_cast<unsigned char>(std::clamp(
-            top * (1.0 - ty) + bottom * ty, 0.0, 255.0));
-    }
-    return result;
-}
-
-// Reconstruct a stable far-distance proxy as a 2.5D top surface. Source
-// triangles are rasterized from +Z, the highest hit wins, and its source atlas
-// colour is baked into a new texture. This replaces topology decimation for
-// HLODs: grid spacing is controlled by a spatial error instead of a triangle
-// ratio, so disconnected photogrammetry fragments cannot consume one another's
-// simplification budget.
-static SurfaceProxy reconstruct_top_surface(
-    const Group& source, const std::vector<unsigned char>& source_atlas,
-    int source_atlas_size, int requested_max_dimension,
-    double requested_spacing) {
-    if (source.vertices.empty() || source.indices.size() < 3)
-        throw std::runtime_error("surface reconstruction input is empty");
-    if (source_atlas_size <= 0 || source_atlas.size() !=
-            static_cast<size_t>(source_atlas_size) * source_atlas_size * 3)
-        throw std::runtime_error("surface reconstruction atlas is invalid");
-
-    float min_x = source.vertices[0].px;
-    float max_x = min_x;
-    float min_y = source.vertices[0].py;
-    float max_y = min_y;
-    for (const Vertex& vertex : source.vertices) {
-        min_x = std::min(min_x, vertex.px);
-        max_x = std::max(max_x, vertex.px);
-        min_y = std::min(min_y, vertex.py);
-        max_y = std::max(max_y, vertex.py);
-    }
-    const double source_width = std::max(1e-6, static_cast<double>(max_x - min_x));
-    const double source_height = std::max(1e-6, static_cast<double>(max_y - min_y));
-    const int max_dimension = requested_max_dimension > 0
-        ? std::clamp(requested_max_dimension, 128, 1024)
-        : 1024;
-
-    // All independently reconstructed tiles at a level must use the same XY
-    // lattice.  Deriving step_x/step_y from each tile's slightly different
-    // geometry bounds made neighbouring boundary vertices miss one another,
-    // which showed up as cracks in L0/L1.  Use a square, world-anchored grid.
-    // When the requested spacing does not fit the texture budget, grow it by
-    // powers of two so normal full-sized siblings still choose the same step.
-    const double base_spacing = std::max(1e-6, requested_spacing);
-    const double minimum_spacing = std::max(source_width, source_height) /
-                                   std::max(1, max_dimension - 3);
-    double spacing_multiplier = 1.0;
-    while (base_spacing * spacing_multiplier < minimum_spacing)
-        spacing_multiplier *= 2.0;
-    double spacing = base_spacing * spacing_multiplier;
-
-    double grid_min_x = 0.0;
-    double grid_min_y = 0.0;
-    int columns = 0;
-    int rows = 0;
-    for (;;) {
-        grid_min_x = std::floor(static_cast<double>(min_x) / spacing) * spacing;
-        grid_min_y = std::floor(static_cast<double>(min_y) / spacing) * spacing;
-        const double grid_max_x = std::ceil(static_cast<double>(max_x) / spacing) * spacing;
-        const double grid_max_y = std::ceil(static_cast<double>(max_y) / spacing) * spacing;
-        columns = static_cast<int>(std::llround((grid_max_x - grid_min_x) / spacing)) + 1;
-        rows = static_cast<int>(std::llround((grid_max_y - grid_min_y) / spacing)) + 1;
-        if (columns <= max_dimension && rows <= max_dimension) break;
-        spacing *= 2.0;
-    }
-    columns = std::max(2, columns);
-    rows = std::max(2, rows);
-    const double step_x = spacing;
-    const double step_y = spacing;
-    const size_t sample_count = static_cast<size_t>(columns) * rows;
-    const float missing = -std::numeric_limits<float>::infinity();
-    std::vector<float> heights(sample_count, missing);
-    std::vector<unsigned char> colours(sample_count * 3, 96);
-
-    auto sample_index = [columns](int x, int y) {
-        return static_cast<size_t>(y) * columns + x;
-    };
-
-    size_t rasterized_triangles = 0;
-    for (size_t triangle = 0; triangle + 2 < source.indices.size(); triangle += 3) {
-        const unsigned int ia = source.indices[triangle];
-        const unsigned int ib = source.indices[triangle + 1];
-        const unsigned int ic = source.indices[triangle + 2];
-        if (ia >= source.vertices.size() || ib >= source.vertices.size() ||
-            ic >= source.vertices.size())
-            continue;
-        const Vertex& a = source.vertices[ia];
-        const Vertex& b = source.vertices[ib];
-        const Vertex& c = source.vertices[ic];
-        const double denominator =
-            (b.py - c.py) * (a.px - c.px) +
-            (c.px - b.px) * (a.py - c.py);
-        if (std::abs(denominator) < 1e-12) continue;
-
-        const double triangle_min_x = std::min({a.px, b.px, c.px});
-        const double triangle_max_x = std::max({a.px, b.px, c.px});
-        const double triangle_min_y = std::min({a.py, b.py, c.py});
-        const double triangle_max_y = std::max({a.py, b.py, c.py});
-        const int first_x = std::clamp(
-            static_cast<int>(std::floor((triangle_min_x - grid_min_x) / step_x)) - 1,
-            0, columns - 1);
-        const int last_x = std::clamp(
-            static_cast<int>(std::ceil((triangle_max_x - grid_min_x) / step_x)) + 1,
-            0, columns - 1);
-        const int first_y = std::clamp(
-            static_cast<int>(std::floor((triangle_min_y - grid_min_y) / step_y)) - 1,
-            0, rows - 1);
-        const int last_y = std::clamp(
-            static_cast<int>(std::ceil((triangle_max_y - grid_min_y) / step_y)) + 1,
-            0, rows - 1);
-        bool hit = false;
-        for (int y = first_y; y <= last_y; ++y) {
-            const double py = grid_min_y + y * step_y;
-            for (int x = first_x; x <= last_x; ++x) {
-                const double px = grid_min_x + x * step_x;
-                const double wa = ((b.py - c.py) * (px - c.px) +
-                                   (c.px - b.px) * (py - c.py)) / denominator;
-                const double wb = ((c.py - a.py) * (px - c.px) +
-                                   (a.px - c.px) * (py - c.py)) / denominator;
-                const double wc = 1.0 - wa - wb;
-                constexpr double kInsideTolerance = -1e-6;
-                if (wa < kInsideTolerance || wb < kInsideTolerance ||
-                    wc < kInsideTolerance)
-                    continue;
-                const float z = static_cast<float>(wa * a.pz + wb * b.pz + wc * c.pz);
-                const size_t index = sample_index(x, y);
-                if (z <= heights[index]) continue;
-                heights[index] = z;
-                const float u = static_cast<float>(wa * a.u + wb * b.u + wc * c.u);
-                const float v = static_cast<float>(wa * a.v + wb * b.v + wc * c.v);
-                const auto colour = sample_rgb(source_atlas, source_atlas_size, u, v);
-                for (int channel = 0; channel < 3; ++channel)
-                    colours[index * 3 + channel] = colour[channel];
-                hit = true;
-            }
-        }
-        if (hit) ++rasterized_triangles;
-    }
-
-    // Close only one-cell sampling cracks. Requiring five neighbours avoids
-    // flooding genuine courtyards or regions that have no source surface.
-    for (int pass = 0; pass < 2; ++pass) {
-        auto filled_heights = heights;
-        auto filled_colours = colours;
-        for (int y = 1; y + 1 < rows; ++y) {
-            for (int x = 1; x + 1 < columns; ++x) {
-                const size_t index = sample_index(x, y);
-                if (std::isfinite(heights[index])) continue;
-                double sum_height = 0.0;
-                double sum_colour[3] = {0.0, 0.0, 0.0};
-                int neighbours = 0;
-                for (int oy = -1; oy <= 1; ++oy) {
-                    for (int ox = -1; ox <= 1; ++ox) {
-                        if (ox == 0 && oy == 0) continue;
-                        const size_t neighbour = sample_index(x + ox, y + oy);
-                        if (!std::isfinite(heights[neighbour])) continue;
-                        sum_height += heights[neighbour];
-                        for (int channel = 0; channel < 3; ++channel)
-                            sum_colour[channel] += colours[neighbour * 3 + channel];
-                        ++neighbours;
-                    }
-                }
-                if (neighbours < 5) continue;
-                filled_heights[index] = static_cast<float>(sum_height / neighbours);
-                for (int channel = 0; channel < 3; ++channel)
-                    filled_colours[index * 3 + channel] = static_cast<unsigned char>(
-                        std::clamp(sum_colour[channel] / neighbours, 0.0, 255.0));
-            }
-        }
-        heights.swap(filled_heights);
-        colours.swap(filled_colours);
-    }
-
-    // Source OSGB roots are commonly clipped exactly at tile boundaries.  A
-    // globally aligned grid can therefore leave its outermost sample just
-    // outside the source triangle even though the neighbour reaches the same
-    // lattice point.  Extend only the two-sample outer rim; unlike general
-    // hole filling this does not flood courtyards or holes inside the tile.
-    for (int pass = 0; pass < 2; ++pass) {
-        auto filled_heights = heights;
-        auto filled_colours = colours;
-        for (int y = 0; y < rows; ++y) {
-            for (int x = 0; x < columns; ++x) {
-                if (x > 1 && x + 2 < columns && y > 1 && y + 2 < rows) continue;
-                const size_t index = sample_index(x, y);
-                if (std::isfinite(heights[index])) continue;
-                double sum_height = 0.0;
-                double sum_colour[3] = {0.0, 0.0, 0.0};
-                int neighbours = 0;
-                for (int oy = -1; oy <= 1; ++oy) {
-                    for (int ox = -1; ox <= 1; ++ox) {
-                        if (ox == 0 && oy == 0) continue;
-                        const int sx = x + ox;
-                        const int sy = y + oy;
-                        if (sx < 0 || sx >= columns || sy < 0 || sy >= rows) continue;
-                        const size_t neighbour = sample_index(sx, sy);
-                        if (!std::isfinite(heights[neighbour])) continue;
-                        sum_height += heights[neighbour];
-                        for (int channel = 0; channel < 3; ++channel)
-                            sum_colour[channel] += colours[neighbour * 3 + channel];
-                        ++neighbours;
-                    }
-                }
-                if (neighbours < 2) continue;
-                filled_heights[index] = static_cast<float>(sum_height / neighbours);
-                for (int channel = 0; channel < 3; ++channel)
-                    filled_colours[index * 3 + channel] = static_cast<unsigned char>(
-                        std::clamp(sum_colour[channel] / neighbours, 0.0, 255.0));
-            }
-        }
-        heights.swap(filled_heights);
-        colours.swap(filled_colours);
-    }
-
-    SurfaceProxy result;
-    result.effective_spacing = std::max(step_x, step_y);
-    std::vector<unsigned int> vertex_index(sample_count,
-                                            std::numeric_limits<unsigned int>::max());
-    auto height_at = [&](int x, int y, float fallback) {
-        if (x < 0 || x >= columns || y < 0 || y >= rows) return fallback;
-        const float value = heights[sample_index(x, y)];
-        return std::isfinite(value) ? value : fallback;
-    };
-    for (int y = 0; y < rows; ++y) {
-        for (int x = 0; x < columns; ++x) {
-            const size_t index = sample_index(x, y);
-            if (!std::isfinite(heights[index])) continue;
-            Vertex vertex;
-            vertex.px = static_cast<float>(grid_min_x + x * step_x);
-            vertex.py = static_cast<float>(grid_min_y + y * step_y);
-            vertex.pz = heights[index];
-            const double dz_dx = (height_at(x + 1, y, vertex.pz) -
-                                  height_at(x - 1, y, vertex.pz)) /
-                                 ((x > 0 && x + 1 < columns) ? 2.0 * step_x : step_x);
-            const double dz_dy = (height_at(x, y + 1, vertex.pz) -
-                                  height_at(x, y - 1, vertex.pz)) /
-                                 ((y > 0 && y + 1 < rows) ? 2.0 * step_y : step_y);
-            const double length = std::sqrt(dz_dx * dz_dx + dz_dy * dz_dy + 1.0);
-            vertex.nx = static_cast<float>(-dz_dx / length);
-            vertex.ny = static_cast<float>(-dz_dy / length);
-            vertex.nz = static_cast<float>(1.0 / length);
-            vertex.u = static_cast<float>(x) / (columns - 1);
-            vertex.v = static_cast<float>(y) / (rows - 1);
-            vertex_index[index] = static_cast<unsigned int>(result.group.vertices.size());
-            result.group.vertices.push_back(vertex);
-        }
-    }
-
-    const unsigned int invalid = std::numeric_limits<unsigned int>::max();
-    auto emit = [&](unsigned int a, unsigned int b, unsigned int c) {
-        if (a == invalid || b == invalid || c == invalid) return;
-        result.group.indices.push_back(a);
-        result.group.indices.push_back(b);
-        result.group.indices.push_back(c);
-    };
-    for (int y = 0; y + 1 < rows; ++y) {
-        for (int x = 0; x + 1 < columns; ++x) {
-            const unsigned int v00 = vertex_index[sample_index(x, y)];
-            const unsigned int v10 = vertex_index[sample_index(x + 1, y)];
-            const unsigned int v01 = vertex_index[sample_index(x, y + 1)];
-            const unsigned int v11 = vertex_index[sample_index(x + 1, y + 1)];
-            const int valid = static_cast<int>(v00 != invalid) +
-                              static_cast<int>(v10 != invalid) +
-                              static_cast<int>(v01 != invalid) +
-                              static_cast<int>(v11 != invalid);
-            if (valid == 4) {
-                emit(v00, v10, v11);
-                emit(v00, v11, v01);
-            } else if (valid == 3) {
-                if (v11 == invalid) emit(v00, v10, v01);
-                else if (v01 == invalid) emit(v00, v10, v11);
-                else if (v10 == invalid) emit(v00, v11, v01);
-                else emit(v10, v11, v01);
-            }
-        }
-    }
-    if (result.group.indices.empty())
-        throw std::runtime_error("surface reconstruction produced no triangles");
-
-    result.texture_size = std::max(columns, rows);
-    result.texture.assign(
-        static_cast<size_t>(result.texture_size) * result.texture_size * 3, 96);
-    for (int ty = 0; ty < result.texture_size; ++ty) {
-        const int gy = static_cast<int>(std::lround(
-            static_cast<double>(ty) * (rows - 1) / (result.texture_size - 1)));
-        for (int tx = 0; tx < result.texture_size; ++tx) {
-            const int gx = static_cast<int>(std::lround(
-                static_cast<double>(tx) * (columns - 1) / (result.texture_size - 1)));
-            size_t source_index = sample_index(gx, gy);
-            if (!std::isfinite(heights[source_index])) {
-                bool found = false;
-                for (int radius = 1; radius <= 8 && !found; ++radius) {
-                    for (int oy = -radius; oy <= radius && !found; ++oy) {
-                        for (int ox = -radius; ox <= radius; ++ox) {
-                            const int sx = gx + ox;
-                            const int sy = gy + oy;
-                            if (sx < 0 || sx >= columns || sy < 0 || sy >= rows) continue;
-                            const size_t candidate = sample_index(sx, sy);
-                            if (!std::isfinite(heights[candidate])) continue;
-                            source_index = candidate;
-                            found = true;
-                            break;
-                        }
-                    }
-                }
-            }
-            const size_t destination =
-                (static_cast<size_t>(ty) * result.texture_size + tx) * 3;
-            for (int channel = 0; channel < 3; ++channel)
-                result.texture[destination + channel] = colours[source_index * 3 + channel];
-        }
-    }
-    std::cout << "  HLOD surface: source_triangles="
-              << source.indices.size() / 3
-              << " rasterized=" << rasterized_triangles
-              << " grid=" << columns << "x" << rows
-              << " spacing=" << result.effective_spacing
-              << " output_triangles=" << result.group.indices.size() / 3 << "\n";
-    return result;
-}
-
 static void simplify_group(Group& group, double ratio, double max_error,
                            bool lock_border = true) {
     if (group.indices.size() < 6 || group.vertices.empty() || ratio >= 0.999) return;
@@ -1091,7 +744,7 @@ static tinygltf::Model build_output(
 bool optimize_hlod_glb_buffer(const std::string& input_glb,
                               std::string& output_glb,
                               int atlas_cell_size,
-                              double surface_error,
+                              double ratio,
                               bool enable_texture_compress,
                               int ktx2_quality,
                               int draco_position_bits,
@@ -1117,20 +770,23 @@ bool optimize_hlod_glb_buffer(const std::string& input_glb,
         if (atlas_size / grid < 4)
             throw std::runtime_error("atlas is too small for the material count");
 
-        auto source_atlases = build_atlas_pixels(input, atlas_count, atlas_size, grid);
-        auto source_groups = merge_geometry(input, atlas_count, atlas_size, grid);
-        if (source_groups.size() != 1 || source_atlases.size() != 1)
-            throw std::runtime_error("HLOD surface reconstruction requires one source atlas");
-        SurfaceProxy surface = reconstruct_top_surface(
-            source_groups.front(), source_atlases.front(), atlas_size,
-            atlas_cell_size, surface_error);
-        std::vector<Group> groups;
-        groups.push_back(std::move(surface.group));
-        std::vector<std::vector<unsigned char>> atlases;
-        atlases.push_back(std::move(surface.texture));
+        auto atlases = build_atlas_pixels(input, atlas_count, atlas_size, grid);
+        auto groups = merge_geometry(input, atlas_count, atlas_size, grid);
+        // Keep each HLOD within a browser-friendly decoded/GPU size. The
+        // component-wise simplifier protects small disconnected objects while
+        // the absolute error bound prevents higher-level spatial extent from
+        // increasing geometric damage.
+        constexpr double kHlodSimplifyMaxError = 0.25;
+        constexpr size_t kHlodMaxTriangles = 1000000;
+        for (auto& group : groups) {
+            const size_t before = group.indices.size();
+            simplify_hlod_components(group, ratio, kHlodSimplifyMaxError,
+                                     kHlodMaxTriangles);
+            std::cout << "  HLOD geometry indices: " << before << " -> "
+                      << group.indices.size() << "\n";
+        }
         tinygltf::Model output = build_output(
-            groups, atlases, surface.texture_size,
-            enable_texture_compress, ktx2_quality,
+            groups, atlases, atlas_size, enable_texture_compress, ktx2_quality,
             draco_position_bits, draco_normal_bits, draco_uv_bits);
         if (output.meshes.empty() || output.meshes[0].primitives.size() != 1)
             throw std::runtime_error("optimizer did not produce exactly one primitive");
@@ -1159,8 +815,7 @@ int main(int argc, char** argv) {
             std::string output_bytes;
             std::string optimize_error;
             if (!optimize_hlod_glb_buffer(
-                    input_bytes, output_bytes, options.atlas_size,
-                    options.max_error,
+                    input_bytes, output_bytes, options.atlas_size, options.ratio,
                     false, 128, 20, 8, 10, &optimize_error))
                 throw std::runtime_error(optimize_error);
             fs::create_directories(options.output.parent_path());

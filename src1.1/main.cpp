@@ -48,7 +48,6 @@ struct HardcodedConfig {
     bool hlod_only;
     int  top_texture_max_size;
     double simplify_ratio;
-    double hlod_surface_error;
     int  draco_pos_bits;
     int  draco_normal_bits;
     int  draco_uv_bits;
@@ -86,7 +85,6 @@ static const HardcodedConfig g_config = {
     /* hlod_only     */ false,
     /* top_texture_max_size */ 512,
     /* simplify_ratio */ 0.5,
-    /* hlod_surface_error */ 1.0,
     /* draco_pos_bits */ 11,
     /* draco_normal_bits */ 10,
     /* draco_uv_bits */ 12,
@@ -324,10 +322,9 @@ static void print_usage(const char* prog) {
         "  --enable-unlit          Enable KHR_materials_unlit (default: on for OSGB)\n"
         "  --enable-top-reconstruct  Build a multi-level spatial HLOD hierarchy\n"
         "  --hlod-only            Generate only HLOD GLBs and an HLOD-only tileset.json\n"
-        "  --top-texture-max-size N  Max texture/grid dim for every HLOD (default: 512)\n"
+        "  --top-texture-max-size N  Max texture dim for root GLB (default: 512, 0=no limit)\n"
         "  --hlod-branching-factor N  Children per HLOD node (default: 16; perfect square >= 4)\n"
-        "  --simplify-ratio R      Regular-tile meshopt ratio; HLOD proxies use surface error\n"
-        "  --hlod-surface-error M  Base HLOD surface sampling error in model units (default: 1.0)\n"
+        "  --simplify-ratio R      Meshopt target_ratio (default: 0.5, 1.0=no simplify)\n"
         "  --draco-pos-bits N      Draco position quant bits (default: 11)\n"
         "  --draco-normal-bits N   Draco normal quant bits (default: 10)\n"
         "  --draco-uv-bits N       Draco UV quant bits (default: 12)\n"
@@ -388,7 +385,6 @@ int main(int argc, char* argv[]) {
     opts.hlod_only               = g_config.hlod_only;
     opts.top_texture_max_size    = g_config.top_texture_max_size;
     opts.simplify_ratio          = g_config.simplify_ratio;
-    opts.hlod_surface_error      = g_config.hlod_surface_error;
     opts.draco_pos_bits          = g_config.draco_pos_bits;
     opts.draco_normal_bits       = g_config.draco_normal_bits;
     opts.draco_uv_bits           = g_config.draco_uv_bits;
@@ -480,12 +476,6 @@ int main(int argc, char* argv[]) {
             opts.top_texture_max_size = std::stoi(argv[++i]);
         } else if (arg == "--simplify-ratio" && i + 1 < argc) {
             opts.simplify_ratio = std::stod(argv[++i]);
-        } else if (arg == "--hlod-surface-error" && i + 1 < argc) {
-            opts.hlod_surface_error = std::stod(argv[++i]);
-            if (!(opts.hlod_surface_error > 0.0)) {
-                fprintf(stderr, "--hlod-surface-error must be > 0\n");
-                return 1;
-            }
         } else if (arg == "--draco-pos-bits" && i + 1 < argc) {
             opts.draco_pos_bits = std::stoi(argv[++i]);
         } else if (arg == "--draco-normal-bits" && i + 1 < argc) {

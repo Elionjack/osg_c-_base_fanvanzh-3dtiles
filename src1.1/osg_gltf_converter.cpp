@@ -2185,17 +2185,17 @@ double calc_level_ratio(int level, double base_ratio, int branching_factor) {
 
 int calc_hlod_texture_max_size(int level, int top_texture_max_size,
                                int branching_factor) {
-    // This value is both the final atlas limit and the maximum sampling-grid
-    // dimension used by reconstruct_top_surface().  Reducing it again at each
-    // hierarchy level made a configured value of 512 become 256 for L1, 64
-    // for L0 and only 32 for the root of a 16-way HLOD.  At that point the
-    // surface had already lost most of its geometry and colour detail before
-    // KTX2 compression was applied.  Treat the option as the real limit for
-    // every emitted HLOD; coarser levels are already reduced by their larger
-    // --hlod-surface-error.
-    (void)level;
-    (void)branching_factor;
-    return top_texture_max_size;
+    int result = top_texture_max_size;
+    const int branch_side = std::max(
+        2, static_cast<int>(std::sqrt(static_cast<double>(branching_factor))));
+    const int equivalent_quadtree_level = static_cast<int>(std::lround(
+        level * std::log2(static_cast<double>(branch_side))));
+    const int steps = std::max(0, equivalent_quadtree_level - 1);
+    if (result > 32) {
+        for (int step = 0; step < steps && result > 32; ++step)
+            result = std::max(32, result / 2);
+    }
+    return result;
 }
 
 struct HlodIntermediateEntry {

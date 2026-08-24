@@ -7,7 +7,7 @@
 bool optimize_hlod_glb_buffer(const std::string& input_glb,
                               std::string& output_glb,
                               int atlas_cell_size,
-                              double surface_error,
+                              double ratio,
                               bool enable_texture_compress,
                               int ktx2_quality,
                               int draco_position_bits,

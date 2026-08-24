@@ -1606,17 +1606,18 @@ int convert_osgb(const ConvertOptions& opts) {
                     // texture compression and Draco exactly once.
                     if (ok && !glb_buf.empty()) {
                         const int hlod_level = node.level + 1;
+                        const double target_ratio = opts.enable_meshopt
+                            ? calc_level_ratio(hlod_level, opts.simplify_ratio,
+                                               opts.hlod_branching_factor)
+                            : 1.0;
                         const int atlas_cell_size = calc_hlod_texture_max_size(
                             hlod_level, opts.top_texture_max_size,
                             opts.hlod_branching_factor);
-                        const double surface_error = opts.hlod_surface_error *
-                            std::pow(2.0, std::max(0, hlod_level - 1));
                         std::string optimized_glb;
                         std::string optimize_error;
                         if (!optimize_hlod_glb_buffer(
                                 glb_buf, optimized_glb, atlas_cell_size,
-                                surface_error,
-                                opts.enable_texture_compress,
+                                target_ratio, opts.enable_texture_compress,
                                 opts.ktx2_quality, opts.draco_pos_bits,
                                 opts.draco_normal_bits, opts.draco_uv_bits,
                                 &optimize_error)) {
@@ -1625,8 +1626,8 @@ int convert_osgb(const ConvertOptions& opts) {
                             ok = false;
                             glb_buf.clear();
                         } else {
-                            LOG_I("HLOD surface finalized: %s, one primitive, texture-max=%d, surface-error=%.3f, Draco=%d/%d/%d, %zu -> %zu bytes",
-                                  glb_name.c_str(), atlas_cell_size, surface_error,
+                            LOG_I("HLOD finalized once: %s, one primitive, atlas-cell=%d, ratio=%.4f, Draco=%d/%d/%d, %zu -> %zu bytes",
+                                  glb_name.c_str(), atlas_cell_size, target_ratio,
                                   opts.draco_pos_bits, opts.draco_normal_bits,
                                   opts.draco_uv_bits, glb_buf.size(), optimized_glb.size());
                             glb_buf.swap(optimized_glb);
