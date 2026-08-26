@@ -1,0 +1,14 @@
+{
+  "name": "glb-size-compressor",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Iteratively simplify Draco GLB files to a hard size limit",
+  "dependencies": {
+    "@gltf-transform/core": "^4.2.1",
+    "@gltf-transform/extensions": "^4.2.1",
+    "@gltf-transform/functions": "^4.2.1",
+    "draco3dgltf": "^1.5.7",
+    "meshoptimizer": "^0.24.0"
+  }
+}

@@ -418,9 +418,11 @@ src/ 和 src1.1/ 现在共享完整的网格处理管线。核心差异仅在于
 | `--enable-simplify` | 启用 meshoptimizer 网格简化 | off |
 | `--enable-unlit` | 启用 KHR_materials_unlit 扩展 | on |
 | `--enable-top-reconstruct` | 构建多级空间 HLOD（逐级合并生成简化 GLB） | off |
+| `--use-git-head-top-reconstruct` | 顶层重建改用 Git HEAD 版逻辑：由底层粗模逐级合并子层中间模型；仅在启用顶部重建时生效 | off |
+| `--git-head-top-reconstruct-level-offset N` | 顶层重建顺延量。非 Git HEAD 模式下，跳过 Root 后的 N 个编号源 LOD 再构建第一层 HLOD（例如 Root→L14→…，N=5 从 L19 开始）；Git HEAD 模式下仍表示简化率和纹理尺寸的构建等级偏移。须启用顶部重建 | 0 |
 | `--hlod-branching-factor` | 每个 HLOD 节点的最大子节点数，须为不小于 4 的完全平方数（4=2×2，16=4×4） | 16 |
 | `--no-parallel` | 禁用多线程 tile 转换（默认开启并行） | off（即默认并行） |
-| `--hlod-only` | 仅生成 `Data/HLOD/*.glb` 和只引用 HLOD 的 `tileset.json`；自动启用顶部重建，用于快速验证 | off |
+| `--hlod-only` | 仅生成 `Data/HLOD/*.glb` 和只引用 HLOD 的 `tileset.json`；自动启用顶部重建，并只扫描实际被空间 HLOD 消费的源 LOD 深度 | off |
 | `--split-json` | 主 JSON 保留 HLOD 索引，每个源瓦片 LOD 树写入独立 `subtilesets/<stem>.json` | off |
 | `--skip-bad-tiles` | 跳过损坏的 OSGB 子节点或顶层格网，继续转换并写出 `failed_tiles.txt` | off |
 | `--tile-read-timeout` | Linux Phase 1 单个顶层格网读取超时秒数；超时后终止并替换对应读取进程（需同时启用 `--skip-bad-tiles`，0=关闭） | 0 |
@@ -428,7 +430,7 @@ src/ 和 src1.1/ 现在共享完整的网格处理管线。核心差异仅在于
 | `--no-fine-merge` | 禁用最细层小子树聚合；Fine Merge 默认开启 | off |
 | `--fine-merge-max-sources` | 单个 Fine Merge 最多合并的叶 OSGB 数量 | 16 |
 | `--fine-merge-max-input-mb` | 单个 Fine Merge 允许的源文件总体积上限（MB） | 64 |
-| `--hlod-max-source-tiles` | 单个可绘制 HLOD 最多独立合并的源粗模数量；超过后作为纯索引节点（0=无限制） | 256 |
+| `--hlod-max-source-tiles` | 兼容参数；逐级源 LOD HLOD 不再按源瓦片数量丢弃可绘制代理 | 16 |
 | `--max-lvl` | 转换并写入 tileset 的最大源 LOD 层级 | 100 |
 | `--top-texture-max-size` | 每个 HLOD 代理的纹理及重建栅格最大边长 | 512 |
 | `--simplify-ratio` | Meshopt 简化目标比例（1.0=不简化） | 0.5 |
@@ -604,25 +606,27 @@ Step 4.2: build_quadtree()
   └── geometricError 以全局源瓦片基准逐级乘以 1.55
        │
        ▼
-Step 4.3: 逐级合并生成 GLB
-  ├── Level 0 从本区域 coarsest OSGB 生成粗模
-  ├── Level 1+ 合并直接子节点的未压缩中间粗模
-  │   - N=16 时每升一级继续按 1/16 简化
-  │   - N=4 时每升一级继续按 1/4 简化
+Step 4.3: 自顶向下按源 LOD 前沿逐级生成 GLB
+  ├── root.glb 合并所有瓦片目录的最粗 OSGB（源深度 0）
+  ├── 下一空间层合并对应区域内各瓦片的次粗 OSGB（源深度 1）
+  ├── 再下一空间层使用次次粗 OSGB（源深度 2），依此类推
+  │   - 每个 HLOD 直接读取其对应源 LOD，不再重复合并子层最粗代理
+  │   - 分支深度不足时停留在该分支最细的可用 OSGB，避免 REPLACE 空洞
   │   - 纹理去重（hash 采样）
-  │   - 子节点失败时回退到该子区域的原始 OSGB，避免区域缺失
   └── 输出: Data/HLOD/root.glb, L0_X+0000_Y+0000.glb, ...
        │
        ▼
 Step 5: encode_quadtree_json()
-  ├── Level 0 节点: content = HLOD GLB + children = PagedLOD 子树
+  ├── Level 0 节点: content = HLOD GLB + children = 下一未消费的 PagedLOD 层
   └── 内部节点: content = HLOD GLB + children = 子 quadtree 节点
 ```
 
 **关键设计点：**
-- 叶子节点保留 PagedLOD 原始 GLB（不修改），作为 HLOD level-0 的 children
+- HLOD 层与各瓦片目录的相对粗细层一一对应：根=最粗、子层=次粗、孙层=次次粗
+- 接回原始 PagedLOD 时跳过已由 HLOD 消费的粗层，避免同一粗模连续重复显示
+- `--hlod-only` 先探测各瓦片目录的最粗节点，根据实际空间 HLOD 层数计算所需源深度，只扫描这些被消费的 PagedLOD 层；更深且不会参与 HLOD 的节点不读取，也不会写入 `failed_tiles.txt`
+- 普通输出模式仍完整扫描源 PagedLOD 树（再由 `--max-lvl` 等规则裁剪），以保证后续细节子瓦片完整输出
 - 无 content 的索引层会被压平，并使用高 geometricError 强制 Cesium 继续细化
-- 可绘制 HLOD 独立合并的源粗模数量由 `--hlod-max-source-tiles` 控制；更高层为纯索引
 - tile 包围盒始终覆盖其可绘制内容和全部后代，避免精细子瓦片被父节点错误裁剪
 - 合并后的 GLB 写入 `Data/HLOD/` 目录
 - tileset.json root 直接使用 quadtree 结构（替代 flat children 列表）

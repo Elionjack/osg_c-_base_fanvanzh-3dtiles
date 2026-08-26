@@ -1,0 +1,757 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Cesium 3D Tiles Demo (No Ion)</title>
+  <link href="Cesium/Widgets/widgets.css" rel="stylesheet" />
+  <script src="Cesium/Cesium.js"></script>
+  <style>
+    html, body {
+      height: 100%;
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+    }
+
+    #cesiumContainer {
+      width: 100vw;
+      height: 100vh;
+      display: block;
+    }
+
+    /* 报错可视化面板样式 */
+    #errorPanel {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      width: 400px;
+      max-height: 40%;
+      background: rgba(30, 30, 30, 0.85);
+      color: #ff4d4f;
+      border: 1px solid #ff4d4f;
+      border-radius: 4px;
+      font-family: monospace;
+      font-size: 12px;
+      z-index: 9999;
+      display: none; /* 默认隐藏，有错误才显示 */
+      flex-direction: column;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+    }
+
+    #errorHeader {
+      background: #ff4d4f;
+      color: #fff;
+      padding: 6px 10px;
+      font-weight: bold;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    #errorClose {
+      cursor: pointer;
+      font-weight: bold;
+    }
+
+    #errorContent {
+      padding: 10px;
+      overflow-y: auto;
+      flex: 1;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+
+    .error-item {
+      margin-bottom: 10px;
+      border-bottom: 1px dashed rgba(255, 77, 79, 0.3);
+      padding-bottom: 8px;
+    }
+
+    .error-tag-json {
+      background: #f50;
+      color: #fff;
+      padding: 2px 4px;
+      border-radius: 2px;
+      font-weight: bold;
+      margin-right: 5px;
+    }
+
+    .error-tag-tile {
+      background: #fa8c16;
+      color: #fff;
+      padding: 2px 4px;
+      border-radius: 2px;
+      font-weight: bold;
+      margin-right: 5px;
+    }
+
+    /* ========== 调试面板 ========== */
+    #debugToggle {
+      position: absolute; top: 10px; right: 10px; z-index: 9998;
+      background: rgba(30,30,30,0.85); color: #40a9ff;
+      border: 1px solid #40a9ff; border-radius: 4px;
+      padding: 4px 10px; font-family: monospace; font-size: 12px;
+      cursor: pointer; user-select: none;
+    }
+    #debugToggle:hover { background: rgba(64,169,255,0.2); }
+
+    #debugPanel {
+      position: absolute; top: 40px; right: 10px; width: 340px; max-height: 55%;
+      background: rgba(30,30,30,0.88); color: #e8e8e8;
+      border: 1px solid #40a9ff; border-radius: 4px;
+      font-family: monospace; font-size: 11px; z-index: 9997;
+      display: flex; flex-direction: column;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+    }
+    #debugHeader {
+      background: #40a9ff; color: #fff; padding: 5px 8px;
+      font-weight: bold; font-size: 12px; display: flex;
+      justify-content: space-between; align-items: center;
+      cursor: move; flex-shrink: 0;
+    }
+    #debugClose { cursor: pointer; font-size: 14px; }
+    #debugClose:hover { color: #002140; }
+    #debugContent {
+      padding: 8px; overflow-y: auto; flex: 1;
+      white-space: pre-wrap; line-height: 1.6;
+    }
+    #debugContent .section {
+      color: #40a9ff; font-weight: bold; margin-top: 6px; margin-bottom: 2px;
+      border-bottom: 1px solid rgba(64,169,255,0.25); padding-bottom: 2px;
+    }
+    #debugContent .section:first-child { margin-top: 0; }
+    #debugContent .label { color: #aaa; }
+    #debugContent .value { color: #fff; }
+    #debugContent .warn { color: #faad14; }
+    #debugContent .hlod { color: #73d13d; }
+    #debugContent .tile { color: #ffa940; }
+
+    /* ========== 层级控制 ========== */
+    #ctrlTable { width: 100%; border-collapse: collapse; margin: 4px 0; font-size: 10px; }
+    #ctrlTable th { background: rgba(250,173,20,0.12); color: #faad14; padding: 2px 3px; border-bottom: 1px solid rgba(250,173,20,0.3); white-space: nowrap; }
+    #ctrlTable td { padding: 1px 3px; text-align: center; border-bottom: 1px solid rgba(255,255,255,0.04); white-space: nowrap; }
+    #ctrlTable tr.disabled td { opacity: 0.35; }
+    #ctrlTable tr.disabled td:nth-child(1) { text-decoration: line-through; }
+    #ctrlTable input[type="checkbox"] { cursor: pointer; transform: scale(1.05); }
+    #ctrlTable input.ctrl-ge {
+      width: 52px; background: rgba(255,255,255,0.07); border: 1px solid rgba(255,255,255,0.12);
+      color: #fff; padding: 1px 3px; text-align: center; font-family: monospace; font-size: 10px; border-radius: 2px;
+    }
+    #ctrlTable input.ctrl-ge:focus { outline: none; border-color: #faad14; }
+    .ctrl-preset { margin-top: 4px; text-align: center; line-height: 2; border-top: 1px solid rgba(255,255,255,0.06); padding-top: 3px; }
+    .ctrl-preset button {
+      background: rgba(250,173,20,0.1); border: 1px solid rgba(250,173,20,0.25);
+      color: #faad14; padding: 1px 5px; margin: 1px; font-family: monospace; font-size: 10px;
+      cursor: pointer; border-radius: 2px;
+    }
+    .ctrl-preset button:hover { background: rgba(250,173,20,0.25); }
+
+    #rootStatus {
+      position: absolute; top: 10px; left: 50%; transform: translateX(-50%);
+      z-index: 10000; padding: 5px 12px; border-radius: 4px;
+      font-family: monospace; font-size: 12px; font-weight: bold;
+      color: #fff; background: rgba(30,30,30,0.88); border: 1px solid #888;
+      pointer-events: none; white-space: nowrap;
+    }
+    #rootStatus.waiting { color: #d9d9d9; border-color: #888; }
+    #rootStatus.loaded { color: #91d5ff; border-color: #1890ff; }
+    #rootStatus.rendering { color: #b7eb8f; border-color: #52c41a; background: rgba(19,80,25,0.9); }
+    #rootStatus.failed { color: #ff7875; border-color: #ff4d4f; background: rgba(90,20,20,0.9); }
+  </style>
+</head>
+<body>
+  <div id="cesiumContainer"></div>
+  <div id="rootStatus" class="waiting">ROOT 未加载</div>
+
+  <div id="errorPanel">
+    <div id="errorHeader">
+      <span>Cesium 资源加载错误监控</span>
+      <span id="errorClose" onclick="document.getElementById('errorPanel').style.display='none'">✕</span>
+    </div>
+    <div id="errorContent"></div>
+  </div>
+
+  <!-- ========== 调试面板 ========== -->
+  <div id="debugToggle" onclick="toggleDebug()">⚙ 调试</div>
+  <div id="debugPanel">
+    <div id="debugHeader">
+      <span>🔍 加载信息</span>
+      <span id="debugClose" onclick="hideDebug()">✕</span>
+    </div>
+    <div id="debugContent"></div>
+    <div id="ctrlWrap" style="display:none; flex-shrink:0; border-top:1px solid rgba(250,173,20,0.25); padding:6px 8px;">
+      <span style="color:#faad14;font-weight:bold;font-size:11px;">🎮 层级控制</span>
+      <div id="ctrlTableWrap" style="max-height:260px;overflow-y:auto;margin-top:4px;"></div>
+      <div id="ctrlPresets" class="ctrl-preset"></div>
+    </div>
+  </div>
+
+  <script src="/camera-config.js"></script>
+  <script>
+    // ========== 报错工具逻辑 ==========
+    const errorPanel = document.getElementById("errorPanel");
+    const errorContent = document.getElementById("errorContent");
+    const rootStatus = document.getElementById("rootStatus");
+    let rootLoaded = false;
+    let rootFailed = false;
+    let rootStatusMode = "";
+
+    function setRootStatus(mode, text) {
+      if (rootStatusMode === mode && rootStatus.textContent === text) return;
+      rootStatusMode = mode;
+      rootStatus.className = mode;
+      rootStatus.textContent = text;
+    }
+
+    function logError(type, message, detailUrl = "") {
+      errorPanel.style.display = "flex"; // 显示面板
+
+      const item = document.createElement("div");
+      item.className = "error-item";
+
+      const tagSpan = document.createElement("span");
+      if (type === "JSON") {
+        tagSpan.className = "error-tag-json";
+        tagSpan.innerText = "主 JSON 错误";
+      } else {
+        tagSpan.className = "error-tag-tile";
+        tagSpan.innerText = "子瓦片错误";
+      }
+
+      const timeSpan = document.createElement("span");
+      timeSpan.style.color = "#aaa";
+      timeSpan.innerText = ` [${new Date().toLocaleTimeString()}]\n`;
+
+      const msgDiv = document.createElement("div");
+      msgDiv.style.marginTop = "5px";
+      msgDiv.style.color = "#fff";
+      msgDiv.innerText = message;
+
+      item.appendChild(tagSpan);
+      item.appendChild(timeSpan);
+      item.appendChild(msgDiv);
+
+      if (detailUrl) {
+        const urlDiv = document.createElement("div");
+        urlDiv.style.color = "#40a9ff";
+        urlDiv.style.marginTop = "3px";
+        urlDiv.innerText = `请求路径: ${detailUrl}`;
+        item.appendChild(urlDiv);
+      }
+
+      errorContent.appendChild(item);
+      errorContent.scrollTop = errorContent.scrollHeight; // 滚动到底部
+    }
+
+    // ========== 读取 URL 查询参数中的模型路径 ==========
+    const params = new URLSearchParams(window.location.search);
+    const MODEL_URL = params.get("model") || "/tiles/tileset.json";
+
+    const tileMatrixSetID = "EPSG:3857_map_3857";
+
+    // GeoServer GWC 的 TileMatrix 标签
+    const tileMatrixLabels = [];
+    for (let i = 0; i <= 21; i++) {
+      tileMatrixLabels.push(tileMatrixSetID + ":" + i);
+    }
+
+    const wmtsProvider = new Cesium.WebMapTileServiceImageryProvider({
+      url: "https://whdz.whkc.com.cn:9009/geoserver/gwc/service/wmts",
+      layer: "map_3857",
+      style: "",
+      format: "image/png",
+      tileMatrixSetID: tileMatrixSetID,
+      tileMatrixLabels: tileMatrixLabels,
+      tilingScheme: new Cesium.WebMercatorTilingScheme(),
+      tileWidth: 256,
+      tileHeight: 256,
+      minimumLevel: 0,
+      maximumLevel: 21
+    });
+
+    const viewer = new Cesium.Viewer("cesiumContainer", {
+      terrainProvider: new Cesium.EllipsoidTerrainProvider(),
+      baseLayer: new Cesium.ImageryLayer(wmtsProvider),
+      baseLayerPicker: false,
+      geocoder: false,
+      timeline: false,
+      animation: false,
+      homeButton: false,
+      sceneModePicker: false,
+      navigationHelpButton: false,
+      fullscreenButton: false
+    });
+
+    // 添加 3D Tiles 模型
+    console.log("正在加载 3D Tiles 模型: " + MODEL_URL);
+
+    Cesium.Cesium3DTileset.fromUrl(MODEL_URL, {
+      // Favor responsive navigation over immediately loading maximum detail.
+      maximumScreenSpaceError: 32,
+
+      // Retain recently visited regions so zooming out, moving, and zooming
+      // back in does not immediately download and decode the same tiles.
+      cacheBytes: 384 * 1024 * 1024,
+      maximumCacheOverflowBytes: 128 * 1024 * 1024,
+
+      // Start fetching the destination region during pan/zoom.  The previous
+      // true setting deliberately deferred many requests until motion ended,
+      // which caused a visible multi-second pause after changing regions.
+      cullRequestsWhileMoving: true,
+      cullRequestsWhileMovingMultiplier: 60,
+
+      // Relax detail away from the camera and outside the center of attention.
+      dynamicScreenSpaceError: true,
+      dynamicScreenSpaceErrorDensity: 0.00278,
+      dynamicScreenSpaceErrorFactor: 8,
+      foveatedScreenSpaceError: true,
+      foveatedConeSize: 0.15,
+      foveatedMinimumScreenSpaceErrorRelaxation: 16,
+      foveatedTimeDelay: 0.2,
+
+      // Warm the destination and adjacent spatial cells to avoid an empty
+      // wait immediately after a flight or a small camera move.
+      preloadWhenHidden: false,
+      preloadFlightDestinations: false,
+      loadSiblings: false
+    })
+      .then(function(tileset) {
+        viewer.scene.primitives.add(tileset);
+
+        // 相机定位：如果通过 server 参数设置了 CAM_HEIGHT，则飞到指定高度俯视
+        if (typeof CAM_HEIGHT === "number" && CAM_HEIGHT > 0) {
+          const center = tileset.boundingSphere.center;
+          const centerCarto = Cesium.Cartographic.fromCartesian(center);
+          const camPos = Cesium.Cartesian3.fromRadians(
+            centerCarto.longitude,
+            centerCarto.latitude,
+            centerCarto.height + CAM_HEIGHT
+          );
+          viewer.camera.flyTo({
+            destination: camPos,
+            orientation: {
+              heading: Cesium.Math.toRadians(0),
+              pitch: Cesium.Math.toRadians(-90),
+              roll: 0
+            },
+            duration: 1
+          });
+        } else {
+          viewer.zoomTo(tileset);
+        }
+
+        // ==========================================
+        // 核心：监听单个瓦片（glb/b3dm等）加载失败的事件
+        // ==========================================
+        tileset.tileFailed.addEventListener(function(error) {
+          console.error("单个瓦片加载失败:", error);
+          logError("TILE", error.message, error.url);
+          var failedUrl = error && error.url ? String(error.url) : "";
+          if (/(?:^|\/)root\.glb(?:[?#]|$)/i.test(failedUrl)) {
+            rootFailed = true;
+            setRootStatus("failed", "ROOT 加载失败");
+          }
+        });
+
+        tileset.tileLoad.addEventListener(function(tile) {
+          if (tile === tileset.root) {
+            rootLoaded = true;
+            rootFailed = false;
+            setRootStatus("loaded", "ROOT 已加载（当前未显示）");
+            console.log("ROOT 已加载:", tile);
+          }
+        });
+
+        // 传给调试面板
+        debugTileset = tileset;
+
+      })
+      .catch(function(error) {
+        // ==========================================
+        // 核心：主 tileset.json 加载或解析失败
+        // ==========================================
+        console.error("3D Tiles 主文件加载失败:", error);
+        logError("JSON", error.message || error.toString() || "未找到文件或跨域限制", MODEL_URL);
+      });
+
+    // ========== 调试面板 ==========
+    let debugTileset = null;
+    let rootFallbackModel = null;
+    let rootFallbackLoading = false;
+    let rootFallbackFailed = false;
+    let rootFallbackWanted = false;
+    let emptySelectionFrames = 0;
+
+    const debugPanel = document.getElementById("debugPanel");
+    const debugContent = document.getElementById("debugContent");
+    const debugHeader = document.getElementById("debugHeader");
+
+    // 拖动
+    let isDragging = false, dX = 0, dY = 0, pL = 0, pT = 0;
+    debugHeader.addEventListener("mousedown", function(e) {
+      if (e.target.id === "debugClose") return;
+      isDragging = true; dX = e.clientX; dY = e.clientY;
+      var r = debugPanel.getBoundingClientRect();
+      pL = r.left; pT = r.top;
+      debugPanel.style.transition = "none";
+      e.preventDefault();
+    });
+    window.addEventListener("mousemove", function(e) {
+      if (!isDragging) return;
+      debugPanel.style.left = (pL + e.clientX - dX) + "px";
+      debugPanel.style.top  = (pT + e.clientY - dY) + "px";
+      debugPanel.style.right = "auto";
+    });
+    window.addEventListener("mouseup", function() { isDragging = false; });
+
+    function hideDebug() {
+      debugPanel.style.display = "none";
+      document.getElementById("debugToggle").style.display = "block";
+    }
+    function showDebug() {
+      debugPanel.style.display = "flex";
+      document.getElementById("debugToggle").style.display = "none";
+    }
+    function toggleDebug() {
+      if (debugPanel.style.display === "none") showDebug(); else hideDebug();
+    }
+    // 初始可见
+    document.getElementById("debugToggle").style.display = "none";
+
+    function getTileLod(tile) {
+      if (!tile) return null;
+      // 从多个来源获取 content URI 字符串
+      var s = "";
+      // _contentUri 是 Cesium 内部存储的原始 URI
+      if (tile._contentUri) {
+        s = typeof tile._contentUri === "string" ? tile._contentUri : (tile._contentUri.url || tile._contentUri._url || "");
+      }
+      // 回退：从 header 里取
+      if (!s && tile._header && tile._header.content && tile._header.content.uri) {
+        s = tile._header.content.uri;
+      }
+      // 再回退：已加载的 content
+      if (!s && tile.content) {
+        var u = tile.content.uri;
+        if (u) s = typeof u === "string" ? u : (u.url || u._url || "");
+      }
+      if (!s) return null;
+
+      // 根 HLOD 单独标记为 ROOT，避免与真正的 L0_X...glb 混淆。
+      if (/(?:^|\/)root\.glb/.test(s)) return { lvl: -1, type: "HLOD" };
+      // 提取 L{n} — 文件名格式如 L3_X-050.glb 或 Tile_xxx_L22_00000.glb
+      var m = s.match(/[\/_]L(\d+)[_.]/);
+      if (!m) return null;
+      var type = s.indexOf("HLOD") !== -1 ? "HLOD" : "Tile";
+      return { lvl: parseInt(m[1]), type: type };
+    }
+
+    // Cesium may occasionally skip the complete tileset at a distant view even
+    // though its ROOT is loaded, inside the frustum and still many pixels wide.
+    // Keep a standalone copy of root.glb as a last-resort display path. It is
+    // shown only while the normal tileset has selected no tiles, so it cannot
+    // overlap the regular HLOD/LOD rendering.
+    function rootIsOnScreen(t) {
+      var sphere = t && t.root && t.root.boundingSphere;
+      if (!sphere) return false;
+
+      var visibility = viewer.scene.frameState.cullingVolume.computeVisibility(sphere);
+      if (visibility === Cesium.Intersect.OUTSIDE) return false;
+
+      var point = Cesium.SceneTransforms.worldToWindowCoordinates(viewer.scene, sphere.center);
+      if (!point) return false;
+
+      var canvas = viewer.scene.canvas;
+      return point.x >= 0 && point.y >= 0 &&
+        point.x <= canvas.clientWidth && point.y <= canvas.clientHeight;
+    }
+
+    function getRootContentUrl(root) {
+      if (root && root.content) {
+        var contentUrl = root.content.url || root.content.uri;
+        if (contentUrl) return String(contentUrl);
+      }
+      if (root && root._contentResource && root._contentResource.url) {
+        return String(root._contentResource.url);
+      }
+      return "";
+    }
+
+    async function loadRootFallback(t) {
+      if (rootFallbackModel || rootFallbackLoading || rootFallbackFailed) return;
+
+      var rootUrl = getRootContentUrl(t.root);
+      if (!rootUrl) {
+        rootFallbackFailed = true;
+        console.error("ROOT 兜底加载失败：无法取得 root.glb 地址");
+        return;
+      }
+
+      rootFallbackLoading = true;
+      try {
+        // Match Model3DTileContent's coordinate-system settings exactly.
+        // 3D Tiles defaults its glTF forward axis to X and this dataset declares
+        // asset.gltfUpAxis = Z; a standalone Model otherwise assumes normal
+        // glTF Y-up, which rotates the model and also offsets its local origin.
+        var sourceModel = t.root.content && t.root.content._model;
+        var sourceMatrix = sourceModel && sourceModel.modelMatrix;
+        var transform = Cesium.Matrix4.clone(
+          sourceMatrix || t.root.computedTransform || t.root._computedTransform,
+          new Cesium.Matrix4()
+        );
+        var upAxis = Cesium.defined(t._gltfUpAxis)
+          ? t._gltfUpAxis
+          : Cesium.Axis.Z;
+        var model = await Cesium.Model.fromGltfAsync({
+          url: rootUrl,
+          modelMatrix: transform,
+          upAxis: upAxis,
+          forwardAxis: Cesium.Axis.X,
+          show: false,
+          cull: false,
+          allowPicking: false,
+          incrementallyLoadTextures: true
+        });
+        rootFallbackModel = viewer.scene.primitives.add(model);
+        rootFallbackModel.show = rootFallbackWanted;
+        console.log("ROOT 独立兜底已加载:", rootUrl);
+        viewer.scene.requestRender();
+      } catch (error) {
+        rootFallbackFailed = true;
+        console.error("ROOT 独立兜底加载失败:", error);
+        logError("ROOT", error.message || String(error), rootUrl);
+      } finally {
+        rootFallbackLoading = false;
+      }
+    }
+
+    function updateRootFallback(t, selectedTiles) {
+      var noTilesSelected = selectedTiles.length === 0;
+      var eligible = t.show && t.root.contentReady === true &&
+        noTilesSelected && rootIsOnScreen(t);
+
+      emptySelectionFrames = eligible ? emptySelectionFrames + 1 : 0;
+      rootFallbackWanted = eligible && emptySelectionFrames >= 3;
+
+      if (rootFallbackModel) {
+        rootFallbackModel.show = rootFallbackWanted;
+      } else if (rootFallbackWanted) {
+        loadRootFallback(t);
+      }
+    }
+
+    viewer.scene.postRender.addEventListener(function() {
+      var t = debugTileset;
+      if (!t || !t.root) {
+        debugContent.innerHTML = '<span class="warn">等待模型加载...</span>';
+        return;
+      }
+      var sel = t._selectedTiles || [];
+      updateRootFallback(t, sel);
+
+      var rootSelected = sel.indexOf(t.root) >= 0;
+      var fallbackShowing = !!(rootFallbackModel && rootFallbackModel.show);
+      if (rootSelected || fallbackShowing) {
+        rootLoaded = true;
+        rootFailed = false;
+        setRootStatus(
+          "rendering",
+          fallbackShowing ? "ROOT 兜底显示中" : "ROOT 正在显示"
+        );
+      } else if (!rootFailed) {
+        if (rootLoaded || t.root.contentReady === true) {
+          rootLoaded = true;
+          setRootStatus("loaded", "ROOT 已加载（当前未显示）");
+        } else {
+          setRootStatus("waiting", "ROOT 未加载");
+        }
+      }
+      var cam = viewer.camera;
+      var c = Cesium.Cartographic.fromCartesian(cam.position, Cesium.Ellipsoid.WGS84, new Cesium.Cartographic());
+      var lon = Cesium.Math.toDegrees(c.longitude).toFixed(6);
+      var lat = Cesium.Math.toDegrees(c.latitude).toFixed(6);
+      var alt = c.height.toFixed(1);
+      var dist = 0;
+      if (t.boundingSphere) dist = Cesium.Cartesian3.distance(cam.position, t.boundingSphere.center);
+      var fov = cam.frustum instanceof Cesium.PerspectiveFrustum ? Cesium.Math.toDegrees(cam.frustum.fovy).toFixed(1) : "?";
+      var rootGe = t.root.geometricError != null ? t.root.geometricError.toFixed(0) : "?";
+
+      var hSet = new Set(), tiSet = new Set();
+      for (var i = 0; i < sel.length; i++) {
+        var info = getTileLod(sel[i]);
+        if (info) {
+          if (info.type === "HLOD") hSet.add(info.lvl); else tiSet.add(info.lvl);
+        }
+      }
+      var toArr = function(s) { var a = Array.from(s).sort(function(x,y){return x-y;}); return a.length ? a.map(function(v){return v === -1 ? "ROOT" : "L"+v;}).join(", ") : "-"; };
+      var hStr = toArr(hSet), tiStr = toArr(tiSet);
+
+      var statsHtml = "";
+      var sp = t._statisticsPerPass;
+      if (sp && sp.length > 0) {
+        var s = sp[0];
+        statsHtml =
+          '<span class="label">  visited  : </span><span class="value">' + s.visited + '</span>\n' +
+          '<span class="label">  selected : </span><span class="value">' + s.selected + '</span>\n' +
+          '<span class="label">  commands : </span><span class="value">' + s.numberOfCommands + '</span>\n' +
+          '<span class="label">  pending  : </span><span class="value">' + s.numberOfPendingRequests + '</span>\n' +
+          '<span class="label">  ready    : </span><span class="value">' + s.numberOfTilesWithContentReady + '</span>\n' +
+          '<span class="label">  geometry : </span><span class="value">' + (s.geometryByteLength / 1048576).toFixed(2) + ' MB</span>\n' +
+          '<span class="label">  textures : </span><span class="value">' + (s.texturesByteLength / 1048576).toFixed(2) + ' MB</span>\n';
+      }
+
+      debugContent.innerHTML =
+        '<span class="section">📷 相机</span>\n' +
+        '<span class="label">  经度 : </span><span class="value">' + lon + '°</span>\n' +
+        '<span class="label">  纬度 : </span><span class="value">' + lat + '°</span>\n' +
+        '<span class="label">  高度 : </span><span class="value">' + alt + ' m</span>\n' +
+        '<span class="label">  FOV  : </span><span class="value">' + fov + '°</span>\n' +
+        '<span class="label">  距中心 : </span><span class="value">' + dist.toFixed(0) + ' m</span>\n' +
+        '\n' +
+        '<span class="section">📦 瓦片</span>\n' +
+        '<span class="label">  已加载 : </span><span class="value">' + (t.tilesLoaded != null ? t.tilesLoaded : "?") + '</span>\n' +
+        '<span class="label">  选中   : </span><span class="value">' + sel.length + '</span>\n' +
+        '<span class="label">  根 GE  : </span><span class="value">' + rootGe + '</span>\n' +
+        '\n' +
+        '<span class="section">🎯 当前 LOD</span>\n' +
+        '<span class="label">  <span class="hlod">HLOD</span> : </span><span class="value">' + hStr + '</span>\n' +
+        '<span class="label">  <span class="tile">Tile</span> : </span><span class="value">' + tiStr + '</span>\n' +
+        (statsHtml ? '\n<span class="section">📊 渲染统计</span>\n' + statsHtml : "");
+    });
+
+    // ========== 层级控制 ==========
+    var lvConfigs = [];
+    var ctrlBuilt = false;
+
+    function getTileUri(tile) {
+      var s = "";
+      if (tile._contentUri) s = typeof tile._contentUri === "string" ? tile._contentUri : (tile._contentUri.url || tile._contentUri._url || "");
+      if (!s && tile._header && tile._header.content && tile._header.content.uri) s = tile._header.content.uri;
+      if (!s && tile.content) { var u = tile.content.uri; if (u) s = typeof u === "string" ? u : (u.url || u._url || ""); }
+      return s || null;
+    }
+
+    function tileKey(tile) {
+      var s = getTileUri(tile);
+      if (!s) return null;
+      if (/(?:^|\/)root\.glb/.test(s)) return { key: "HLOD_ROOT", lvl: -1, type: "HLOD" };
+      var m = s.match(/[\/_]L(\d+)[_.]/);
+      if (!m) return null;
+      return { key: (s.indexOf("HLOD") !== -1 ? "HLOD" : "Tile") + "_" + m[1], lvl: parseInt(m[1]), type: s.indexOf("HLOD") !== -1 ? "HLOD" : "Tile" };
+    }
+
+    function buildConfigs() {
+      var t = debugTileset;
+      if (!t || !t.root) return;
+      var map = new Map();
+      function walk(tile) {
+        var k = tileKey(tile);
+        if (k && !map.has(k.key)) {
+          map.set(k.key, { key: k.key, lvl: k.lvl, type: k.type, enabled: true,
+            geVal: tile.geometricError != null ? tile.geometricError : 0,
+            origGe: tile.geometricError != null ? tile.geometricError : 0 });
+        }
+        for (var i = 0; i < tile.children.length; i++) walk(tile.children[i]);
+      }
+      walk(t.root);
+      var arr = [];
+      map.forEach(function(v) { arr.push(v); });
+      arr.sort(function(a, b) { return a.type !== b.type ? (a.type === "HLOD" ? -1 : 1) : a.lvl - b.lvl; });
+      // merge with existing user settings
+      for (var i = 0; i < arr.length; i++) {
+        for (var j = 0; j < lvConfigs.length; j++) {
+          if (lvConfigs[j].key === arr[i].key) { arr[i].enabled = lvConfigs[j].enabled; arr[i].geVal = lvConfigs[j].geVal; break; }
+        }
+      }
+      lvConfigs = arr;
+    }
+
+    function applyConfigs() {
+      var t = debugTileset;
+      if (!t || !t.root) return;
+      function walk(tile) {
+        var k = tileKey(tile);
+        if (k && tile.geometricError != null) {
+          var cfg = null;
+          for (var i = 0; i < lvConfigs.length; i++) { if (lvConfigs[i].key === k.key) { cfg = lvConfigs[i]; break; } }
+          if (cfg) { tile.geometricError = cfg.enabled ? cfg.geVal : 999999; }
+        }
+        for (var j = 0; j < tile.children.length; j++) walk(tile.children[j]);
+      }
+      walk(t.root);
+    }
+
+    function buildCtrlTable() {
+      buildConfigs();
+      var wrap = document.getElementById("ctrlTableWrap");
+      var presets = document.getElementById("ctrlPresets");
+      if (!lvConfigs || lvConfigs.length === 0) {
+        wrap.innerHTML = '<span style="color:#666;">等待分析...</span>';
+        if (!ctrlBuilt) document.getElementById("ctrlWrap").style.display = "block";
+        return;
+      }
+      if (!ctrlBuilt) { document.getElementById("ctrlWrap").style.display = "block"; ctrlBuilt = true; }
+
+      var h = '<table id="ctrlTable"><thead><tr><th>层</th><th>显示</th><th>GE</th></tr></thead><tbody>';
+      var curType = "";
+      for (var i = 0; i < lvConfigs.length; i++) {
+        var cfg = lvConfigs[i];
+        if (cfg.type !== curType) {
+          curType = cfg.type;
+          h += '<tr><td colspan="3" style="color:#faad14;text-align:center;font-weight:bold;padding:3px 0;">── ' + (curType === "HLOD" ? "🏗️ HLOD" : "🧱 Tile") + ' ──</td></tr>';
+        }
+        h += '<tr' + (cfg.enabled ? "" : " class='disabled'") + '>';
+        h += '<td style="color:#40a9ff;">' + (cfg.lvl === -1 ? 'ROOT' : 'L' + cfg.lvl) + '</td>';
+        h += '<td><input type="checkbox" ' + (cfg.enabled ? "checked" : "") + ' onchange="toggleLv(\'' + cfg.key + '\',this.checked)"></td>';
+        h += '<td><input class="ctrl-ge" type="number" value="' + cfg.geVal + '" step="1" min="0" onchange="setLvGe(\'' + cfg.key + '\',parseFloat(this.value))"></td>';
+        h += '</tr>';
+      }
+      h += '</tbody></table>';
+      wrap.innerHTML = h;
+
+      presets.innerHTML =
+        '<button onclick="presetAll()">全部显示</button>' +
+        '<button onclick="presetHLOD()">仅 HLOD</button>' +
+        '<button onclick="presetTile()">仅 Tile</button>' +
+        '<button onclick="presetReset()">重置 GE</button>';
+    }
+
+    function toggleLv(key, on) {
+      for (var i = 0; i < lvConfigs.length; i++) { if (lvConfigs[i].key === key) { lvConfigs[i].enabled = on; break; } }
+      applyConfigs(); buildCtrlTable();
+    }
+    function setLvGe(key, val) {
+      if (isNaN(val) || val < 0) val = 0;
+      for (var i = 0; i < lvConfigs.length; i++) { if (lvConfigs[i].key === key) { lvConfigs[i].geVal = val; break; } }
+      applyConfigs();
+    }
+    function presetAll() {
+      for (var i = 0; i < lvConfigs.length; i++) lvConfigs[i].enabled = true;
+      applyConfigs(); buildCtrlTable();
+    }
+    function presetHLOD() {
+      for (var i = 0; i < lvConfigs.length; i++) lvConfigs[i].enabled = (lvConfigs[i].type === "HLOD");
+      applyConfigs(); buildCtrlTable();
+    }
+    function presetTile() {
+      for (var i = 0; i < lvConfigs.length; i++) lvConfigs[i].enabled = (lvConfigs[i].type === "Tile");
+      applyConfigs(); buildCtrlTable();
+    }
+    function presetReset() {
+      for (var i = 0; i < lvConfigs.length; i++) { lvConfigs[i].enabled = true; lvConfigs[i].geVal = lvConfigs[i].origGe; }
+      applyConfigs(); buildCtrlTable();
+    }
+
+    // 延迟初始化，等 subtileset 加载
+    setTimeout(function() {
+      var tries = 0;
+      function init() {
+        buildConfigs();
+        if (lvConfigs.length < 2 && tries < 20) { tries++; setTimeout(init, 500); return; }
+        buildCtrlTable();
+      }
+      init();
+    }, 800);
+  </script>
+</body>
+</html>

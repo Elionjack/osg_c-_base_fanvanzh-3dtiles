@@ -19,6 +19,11 @@ cmake_install.cmake
 
 # Temp files
 _tmp_*.txt
+tmp/
+output/
+__pycache__/
+*_backup_before_git_*/
+*_backup_before_remote_*/
 
 # Local Node dependencies/cache for the GLB compression tool
 压缩/node_modules/

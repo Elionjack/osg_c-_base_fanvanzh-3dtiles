@@ -45,6 +45,8 @@ struct HardcodedConfig {
     bool enable_draco;
     bool enable_unlit;
     bool enable_top_reconstruct;
+    bool use_git_head_top_reconstruct;
+    int  git_head_top_reconstruct_level_offset;
     bool hlod_only;
     int  top_texture_max_size;
     double simplify_ratio;
@@ -82,6 +84,8 @@ static const HardcodedConfig g_config = {
     /* draco        */ true,
     /* unlit        */ true,
     /* top_reconstruct */ false,
+    /* git_head_top_reconstruct */ false,
+    /* git_head_top_reconstruct_level_offset */ 0,
     /* hlod_only     */ false,
     /* top_texture_max_size */ 512,
     /* simplify_ratio */ 0.5,
@@ -321,6 +325,8 @@ static void print_usage(const char* prog) {
         "  --enable-lod            Enable Level of Detail\n"
         "  --enable-unlit          Enable KHR_materials_unlit (default: on for OSGB)\n"
         "  --enable-top-reconstruct  Build a multi-level spatial HLOD hierarchy\n"
+        "  --use-git-head-top-reconstruct  Use the Git HEAD top-reconstruction algorithm (default: off)\n"
+        "  --git-head-top-reconstruct-level-offset N  Non-Git: skip N numbered source LODs after Root; Git HEAD: shift build quality by N levels (default: 0)\n"
         "  --hlod-only            Generate only HLOD GLBs and an HLOD-only tileset.json\n"
         "  --top-texture-max-size N  Max texture dim for root GLB (default: 512, 0=no limit)\n"
         "  --hlod-branching-factor N  Children per HLOD node (default: 16; perfect square >= 4)\n"
@@ -382,6 +388,8 @@ int main(int argc, char* argv[]) {
     opts.enable_draco            = g_config.enable_draco;
     opts.enable_unlit            = g_config.enable_unlit;
     opts.enable_top_reconstruct  = g_config.enable_top_reconstruct || g_config.hlod_only;
+    opts.use_git_head_top_reconstruct = g_config.use_git_head_top_reconstruct;
+    opts.git_head_top_reconstruct_level_offset = g_config.git_head_top_reconstruct_level_offset;
     opts.hlod_only               = g_config.hlod_only;
     opts.top_texture_max_size    = g_config.top_texture_max_size;
     opts.simplify_ratio          = g_config.simplify_ratio;
@@ -469,6 +477,10 @@ int main(int argc, char* argv[]) {
             opts.max_lvl = std::stoi(argv[++i]);
         } else if (arg == "--enable-top-reconstruct" || arg == "--enable-top_reconstruct") {
             opts.enable_top_reconstruct = true;
+        } else if (arg == "--use-git-head-top-reconstruct") {
+            opts.use_git_head_top_reconstruct = true;
+        } else if (arg == "--git-head-top-reconstruct-level-offset" && i + 1 < argc) {
+            opts.git_head_top_reconstruct_level_offset = std::stoi(argv[++i]);
         } else if (arg == "--hlod-only") {
             opts.hlod_only = true;
             opts.enable_top_reconstruct = true;
