@@ -54,13 +54,17 @@ struct osg_tree {
     bool content_written = false;
 };
 
-// Get full OSGB tile tree starting from a root file. In tolerant mode,
-// malformed descendants are omitted and reported through on_failure.
+// Get an OSGB tile tree starting from a root file. max_depth=-1 discovers the
+// full tree; 0 loads only root; 1 loads root and its direct children. In
+// tolerant mode, malformed descendants are omitted and reported through
+// on_failure.
 using TreeFailureCallback = std::function<void(const std::string&, const std::string&)>;
 osg_tree get_all_tree(
     std::string& file_name,
     bool skip_bad_nodes = false,
-    const TreeFailureCallback& on_failure = {});
+    const TreeFailureCallback& on_failure = {},
+    int max_depth = -1,
+    bool compute_bounds = false);
 
 // Core: convert a pre-loaded OSG Node to GLB buffer.
 // Unlike osgb2glb_buf(), this does NOT call osgDB::readNodeFiles() —
@@ -164,7 +168,7 @@ struct GridCell {
     std::string stem;            // e.g. "Tile_-001_+050"
     int grid_x = 0;              // parsed grid X coordinate
     int grid_y = 0;              // parsed grid Y coordinate
-    std::string coarsest_path;   // coarsest OSGB path in this cell
+    std::vector<std::string> source_paths; // OSGB inputs selected at reconstruction depth
     TileBox bbox;                // bounding box
     double geometricError = 0.0; // geometric error
     std::string glb_uri;         // URI to existing GLB (e.g. "./Tile_-001_+050.glb")
@@ -190,7 +194,7 @@ struct QuadNode {
     bool has_content = false;    // true = has geometry (content in tileset)
     std::vector<QuadNode> children; // 0-N spatial child nodes
     std::vector<std::string> leaf_stems;           // level=0: tile stems under this node
-    std::vector<std::string> leaf_coarsest_paths;  // level=0: coarsest OSGB paths under this node
+    std::vector<std::string> leaf_source_paths;    // level=0: selected OSGB inputs under this node
     HlodIntermediatePtr intermediate; // uncompressed coarse model for direct parent merge
 };
 
@@ -205,9 +209,9 @@ bool parse_tile_grid_coords(const std::string& stem, int& out_x, int& out_y);
 // Build spatial grid from tile results (Phase 3 output)
 SpatialGrid build_spatial_grid(
     const std::vector<std::string>& tile_stems,
-    const std::vector<std::string>& coarsest_paths,
+    const std::vector<std::vector<std::string>>& source_paths,
     const std::vector<TileBox>& bboxes,
-    const std::vector<double>& coarsest_ges);
+    const std::vector<double>& source_ges);
 
 // Calculate simplification ratio for a given hierarchy level.
 double calc_level_ratio(int level, double base_ratio, int branching_factor = 4);
@@ -255,6 +259,12 @@ nlohmann::json encode_quadtree_json(
 // Returns the coarsest-LOD file for a tile tree: the tree root
 // (file without _Lxx suffix). Optionally outputs its geometricError.
 std::string find_coarsest_node(const osg_tree& tree, double* out_ge = nullptr);
+
+// Collect all source files at a requested tree depth. A branch shorter than
+// the requested depth contributes its deepest available node.
+void collect_reconstruct_sources(const osg_tree& tree, int depth,
+                                 std::vector<std::string>& out_paths,
+                                 double* out_ge = nullptr);
 
 // Build a merged root-level GLB from multiple OSGB files.
 // Loads each file, applies SVD coordinate correction, merges all

@@ -41,6 +41,7 @@ struct ConvertOptions {
 
     // Root tile reconstruction (merge coarsest LODs into overview GLB)
     bool enable_top_reconstruct = false;
+    int  top_reconstruct_depth = 0;   // 0=root, 1=root children, 2=grandchildren
     int  top_texture_max_size = 512;  // max texture dimension for root GLB (0=no limit)
     int  hlod_branching_factor = 16; // spatial children per HLOD node (perfect square, e.g. 4 or 16)
     int  hlod_max_source_tiles = 16;  // max source tiles merged into one HLOD GLB (0=unlimited)

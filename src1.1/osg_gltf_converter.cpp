@@ -273,7 +273,9 @@ public:
 osg_tree get_all_tree(
     std::string& file_name,
     bool skip_bad_nodes,
-    const TreeFailureCallback& on_failure) {
+    const TreeFailureCallback& on_failure,
+    int max_depth,
+    bool compute_bounds) {
     try {
         osg_tree root_tile;
         vector<string> fileNames = { file_name };
@@ -281,7 +283,9 @@ osg_tree get_all_tree(
         static bool logged = false;
         if (!logged) { log_osg_plugin_info(); logged = true; }
 
-        InfoVisitor infoVisitor(get_parent(file_name), false, /*skip_correction=*/true);
+        InfoVisitor infoVisitor(
+            get_parent(file_name), false,
+            /*skip_correction=*/!compute_bounds);
         {
             osg::ref_ptr<osg::Node> root = osgDB::readNodeFiles(fileNames);
             if (!root) {
@@ -294,19 +298,49 @@ osg_tree get_all_tree(
             root_tile.file_name = file_name;
             root_tile.type = 1;
             root->accept(infoVisitor);
+
+            if (compute_bounds) {
+                TileBox bbox;
+                bbox.min = {DBL_MAX, DBL_MAX, DBL_MAX};
+                bbox.max = {-DBL_MAX, -DBL_MAX, -DBL_MAX};
+                auto expand_geometry_bounds = [&](osg::Geometry* geometry) {
+                    if (!geometry) return;
+                    auto* vertices = dynamic_cast<osg::Vec3Array*>(
+                        geometry->getVertexArray());
+                    if (!vertices) return;
+                    for (const auto& vertex : *vertices) {
+                        bbox.min[0] = std::min(bbox.min[0], static_cast<double>(vertex.x()));
+                        bbox.min[1] = std::min(bbox.min[1], static_cast<double>(vertex.y()));
+                        bbox.min[2] = std::min(bbox.min[2], static_cast<double>(vertex.z()));
+                        bbox.max[0] = std::max(bbox.max[0], static_cast<double>(vertex.x()));
+                        bbox.max[1] = std::max(bbox.max[1], static_cast<double>(vertex.y()));
+                        bbox.max[2] = std::max(bbox.max[2], static_cast<double>(vertex.z()));
+                    }
+                };
+                for (auto* geometry : infoVisitor.geometry_array)
+                    expand_geometry_bounds(geometry);
+                for (auto* geometry : infoVisitor.other_geometry_array)
+                    expand_geometry_bounds(geometry);
+                if (is_valid_tile_box(bbox)) root_tile.bbox = std::move(bbox);
+            }
         }
     // NOTE: cached_node is NOT set here. Phase 1 only builds the file tree
     // structure (sub_node_names).  Phase 2 loads each tile from disk on demand
     // and frees it after conversion, keeping memory bounded.
 
-        for (auto& i : infoVisitor.sub_node_names) {
-            osg_tree tree = get_all_tree(i, skip_bad_nodes, on_failure);
-            if (!tree.file_name.empty()) {
-                if (tree.type == 0) {
-                    for (auto& node : tree.sub_nodes)
-                        root_tile.sub_nodes.push_back(node);
-                } else {
-                    root_tile.sub_nodes.push_back(tree);
+        if (max_depth != 0) {
+            const int child_max_depth = max_depth < 0 ? -1 : max_depth - 1;
+            for (auto& i : infoVisitor.sub_node_names) {
+                osg_tree tree = get_all_tree(
+                    i, skip_bad_nodes, on_failure, child_max_depth,
+                    compute_bounds);
+                if (!tree.file_name.empty()) {
+                    if (tree.type == 0) {
+                        for (auto& node : tree.sub_nodes)
+                            root_tile.sub_nodes.push_back(node);
+                    } else {
+                        root_tile.sub_nodes.push_back(tree);
+                    }
                 }
             }
         }
@@ -1789,6 +1823,31 @@ std::string find_coarsest_node(const osg_tree& tree, double* out_ge) {
     return tree.file_name;
 }
 
+static void collect_reconstruct_sources_impl(
+    const osg_tree& tree, int depth, std::vector<std::string>& paths,
+    double& max_ge) {
+    if (depth <= 0 || tree.sub_nodes.empty()) {
+        if (!tree.file_name.empty() &&
+            std::find(paths.begin(), paths.end(), tree.file_name) == paths.end()) {
+            paths.push_back(tree.file_name);
+        }
+        max_ge = std::max(max_ge, tree.geometricError);
+        return;
+    }
+    for (const auto& child : tree.sub_nodes) {
+        collect_reconstruct_sources_impl(child, depth - 1, paths, max_ge);
+    }
+}
+
+void collect_reconstruct_sources(const osg_tree& tree, int depth,
+                                 std::vector<std::string>& out_paths,
+                                 double* out_ge) {
+    out_paths.clear();
+    double max_ge = 0.0;
+    collect_reconstruct_sources_impl(tree, std::max(0, depth), out_paths, max_ge);
+    if (out_ge) *out_ge = max_ge;
+}
+
 // Merge multiple coarsest-LOD OSGB files into a single root GLB.
 // Each file is loaded independently, its geometry SVD-corrected by
 // InfoVisitor, and all primitives are packed into one tinygltf::Model.
@@ -2137,12 +2196,12 @@ bool parse_tile_grid_coords(const std::string& stem, int& out_x, int& out_y) {
 
 SpatialGrid build_spatial_grid(
     const std::vector<std::string>& tile_stems,
-    const std::vector<std::string>& coarsest_paths,
+    const std::vector<std::vector<std::string>>& source_paths,
     const std::vector<TileBox>& bboxes,
-    const std::vector<double>& coarsest_ges)
+    const std::vector<double>& source_ges)
 {
     SpatialGrid grid;
-    size_t n = std::min({tile_stems.size(), coarsest_paths.size(), bboxes.size(), coarsest_ges.size()});
+    size_t n = std::min({tile_stems.size(), source_paths.size(), bboxes.size(), source_ges.size()});
 
     for (size_t i = 0; i < n; i++) {
         GridCell cell;
@@ -2152,14 +2211,16 @@ SpatialGrid build_spatial_grid(
                   cell.stem.c_str());
             continue;
         }
-        cell.coarsest_path = coarsest_paths[i];
+        cell.source_paths = source_paths[i];
         cell.bbox = bboxes[i];
-        cell.geometricError = coarsest_ges[i];  // Inherit from coarsest PagedLOD tile
+        cell.geometricError = source_ges[i];
 
         // GLB URI for the coarsest tile: "./Tile_-001_+050.glb"
         // This is the relative path within the tile's output directory
-        std::string glb_name = replace(get_file_name(cell.coarsest_path), ".osgb", ".glb");
-        cell.glb_uri = "./" + glb_name;
+        if (!cell.source_paths.empty()) {
+            std::string glb_name = replace(get_file_name(cell.source_paths.front()), ".osgb", ".glb");
+            cell.glb_uri = "./" + glb_name;
+        }
 
         grid[cell.grid_x][cell.grid_y] = std::move(cell);
     }
@@ -2606,11 +2667,11 @@ bool build_merged_glb(
 void collect_leaf_paths(const QuadNode& node, const SpatialGrid& grid,
                                std::vector<std::string>& paths) {
     if (node.level == 0) {
-        // Level 0 node: leaf_coarsest_paths are the coarsest OSGB paths
-        // of the grid cells directly under this node.
+        // Level 0 node: leaf_source_paths are the selected OSGB inputs of the
+        // grid cells directly under this node.
         paths.insert(paths.end(),
-                     node.leaf_coarsest_paths.begin(),
-                     node.leaf_coarsest_paths.end());
+                     node.leaf_source_paths.begin(),
+                     node.leaf_source_paths.end());
     } else {
         for (const auto& child : node.children) {
             collect_leaf_paths(child, grid, paths);
@@ -2654,7 +2715,9 @@ static QuadNode build_quadtree_impl(const SpatialGrid& grid,
                 TileBox cell_bbox = cell.bbox;
                 expend_box(node.bbox, cell_bbox);
                 node.leaf_stems.push_back(cell.stem);
-                node.leaf_coarsest_paths.push_back(cell.coarsest_path);
+                node.leaf_source_paths.insert(node.leaf_source_paths.end(),
+                                              cell.source_paths.begin(),
+                                              cell.source_paths.end());
             }
         }
 

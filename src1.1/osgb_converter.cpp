@@ -943,6 +943,11 @@ int convert_osgb(const ConvertOptions& opts) {
         LOG_E("hlod_only requires enable_top_reconstruct");
         return 1;
     }
+    if (opts.top_reconstruct_depth < 0) {
+        LOG_E("--top-reconstruct-depth must be >= 0; got %d",
+              opts.top_reconstruct_depth);
+        return 1;
+    }
     if (opts.enable_top_reconstruct) {
         if (opts.hlod_branching_factor < 4) {
             LOG_E("--hlod-branching-factor must be a perfect square >= 4 (for example 4, 9, or 16); got %d",
@@ -1006,6 +1011,8 @@ int convert_osgb(const ConvertOptions& opts) {
     // Parse JSON config override
     double cfg_x = 0, cfg_y = 0, cfg_offset = 0;
     int cfg_max_lvl = 100;
+    int cfg_top_reconstruct_depth = 0;
+    bool has_cfg_top_reconstruct_depth = false;
     bool has_cfg = false;
     if (!opts.config_json.empty()) {
         try {
@@ -1014,6 +1021,10 @@ int convert_osgb(const ConvertOptions& opts) {
             if (cfg.contains("y")) { cfg_y = cfg["y"].get<double>(); has_cfg = true; }
             if (cfg.contains("offset")) cfg_offset = cfg["offset"].get<double>();
             if (cfg.contains("max_lvl")) cfg_max_lvl = cfg["max_lvl"].get<int>();
+            if (cfg.contains("top_reconstruct_depth")) {
+                cfg_top_reconstruct_depth = cfg["top_reconstruct_depth"].get<int>();
+                has_cfg_top_reconstruct_depth = true;
+            }
         } catch (...) {
             LOG_E("Failed to parse config JSON: %s", opts.config_json.c_str());
         }
@@ -1034,8 +1045,18 @@ int convert_osgb(const ConvertOptions& opts) {
     }
 
     int max_lvl = (opts.max_lvl != 100) ? opts.max_lvl : cfg_max_lvl;
+    const int top_reconstruct_depth =
+        (opts.top_reconstruct_depth != 0 || !has_cfg_top_reconstruct_depth)
+            ? opts.top_reconstruct_depth
+            : cfg_top_reconstruct_depth;
+    if (top_reconstruct_depth < 0) {
+        LOG_E("top_reconstruct_depth must be >= 0; got %d",
+              top_reconstruct_depth);
+        return 1;
+    }
 
-    LOG_I("Conversion parameters: center=(%.10f, %.10f), max_lvl=%d", center_x, center_y, max_lvl);
+    LOG_I("Conversion parameters: center=(%.10f, %.10f), max_lvl=%d, top_reconstruct_depth=%d",
+          center_x, center_y, max_lvl, top_reconstruct_depth);
     LOG_I("Features: texture_compress=%d, meshopt=%d, draco=%d, unlit=%d, top_reconstruct=%d, hlod_only=%d, fine_merge=%d, skip_bad_tiles=%d, tile_read_timeout=%d, tile_reader_processes=%d",
           opts.enable_texture_compress, opts.enable_meshopt, opts.enable_draco, opts.enable_unlit,
           opts.enable_top_reconstruct, opts.hlod_only, opts.enable_fine_merge,
@@ -1136,13 +1157,14 @@ int convert_osgb(const ConvertOptions& opts) {
             osgb_file.string(), stem, out_tile_dir.string()});
 
         phase1_tasks.push_back([&trees_mutex, &all_trees, &opts,
+                                top_reconstruct_depth,
                                 record_bad_input,
                                 osgb_path = osgb_file.string(),
                                 stem,
                                 out_path = out_tile_dir.string()]() {
             try {
                 osg_tree root;
-                if (opts.hlod_only) {
+                if (opts.hlod_only && top_reconstruct_depth == 0) {
                     // HLOD consumes only the coarsest root OSGB for each spatial
                     // source tile. Avoid discovering/loading its PagedLOD children.
                     // Use the existing GLB conversion path once to preserve the
@@ -1170,10 +1192,14 @@ int convert_osgb(const ConvertOptions& opts) {
                     root.type = 1;
                     root.bbox = std::move(bbox);
                 } else {
-                    LOG_I("Phase 1 - Building tree: %s", osgb_path.c_str());
+                    const int discovery_depth =
+                        opts.hlod_only ? top_reconstruct_depth : -1;
+                    LOG_I("Phase 1 - Building tree: %s (max_depth=%d)",
+                          osgb_path.c_str(), discovery_depth);
                     std::string path_copy = osgb_path;
                     root = get_all_tree(
-                        path_copy, opts.skip_bad_tiles, record_bad_input);
+                        path_copy, opts.skip_bad_tiles, record_bad_input,
+                        discovery_depth, opts.hlod_only);
                 }
                 if (root.file_name.empty()) {
                     LOG_E("Failed to read: %s", osgb_path.c_str());
@@ -1232,13 +1258,13 @@ int convert_osgb(const ConvertOptions& opts) {
         }
         for (auto& f : futures) f.get();
         LOG_I(opts.hlod_only
-                  ? "Phase 1 HLOD-only complete: %zu coarsest sources loaded (parallel, %u I/O threads)"
+                  ? "Phase 1 HLOD-only complete: %zu source trees loaded (parallel, %u I/O threads)"
                   : "Phase 1 complete: %zu tile trees built (parallel, %u I/O threads)",
               all_trees.size(), p1_threads);
     } else {
         for (auto& task : phase1_tasks) task();
         LOG_I(opts.hlod_only
-                  ? "Phase 1 HLOD-only complete: %zu coarsest sources loaded (serial)"
+                  ? "Phase 1 HLOD-only complete: %zu source trees loaded (serial)"
                   : "Phase 1 complete: %zu tile trees built (serial)",
               all_trees.size());
     }
@@ -1328,7 +1354,8 @@ int convert_osgb(const ConvertOptions& opts) {
     }
 
     if (opts.hlod_only) {
-        LOG_I("Phase 2 HLOD-only: bounds already loaded; no detail tree scan or detail GLB writes");
+        LOG_I("Phase 2 HLOD-only: source depth %d loaded; no detail GLB writes",
+              top_reconstruct_depth);
     } else if (opts.enable_parallel) {
         const size_t CHUNK_SIZE = 16;
         size_t num_chunks = (all_tiles.size() + CHUNK_SIZE - 1) / CHUNK_SIZE;
@@ -1517,17 +1544,24 @@ int convert_osgb(const ConvertOptions& opts) {
     bool has_hlod = false;
     if (opts.enable_top_reconstruct) {
         std::vector<std::string> tile_stems;
-        std::vector<std::string> coarsest_paths;
+        std::vector<std::vector<std::string>> reconstruct_source_paths;
         std::vector<TileBox> tile_bboxes;
-        std::vector<double> coarsest_ges;
+        std::vector<double> reconstruct_source_ges;
 
         for (auto& tr : all_trees) {
             if (!is_valid_tile_box(tr.root.bbox)) continue;
+            std::vector<std::string> paths;
+            double source_ge = 0.0;
+            collect_reconstruct_sources(
+                tr.root, top_reconstruct_depth, paths, &source_ge);
+            if (paths.empty()) {
+                LOG_W("Top reconstruction: no source at depth %d for %s; skipping",
+                      top_reconstruct_depth, tr.stem.c_str());
+                continue;
+            }
             tile_stems.push_back(tr.stem);
-
-            double coarsest_ge = 0.0;
-            coarsest_paths.push_back(find_coarsest_node(tr.root, &coarsest_ge));
-            coarsest_ges.push_back(coarsest_ge);
+            reconstruct_source_paths.push_back(std::move(paths));
+            reconstruct_source_ges.push_back(source_ge);
             TileBox bbox;
             bbox.max = tr.root.bbox.max;
             bbox.min = tr.root.bbox.min;
@@ -1536,7 +1570,8 @@ int convert_osgb(const ConvertOptions& opts) {
 
         if (!tile_stems.empty()) {
             SpatialGrid grid = build_spatial_grid(
-                tile_stems, coarsest_paths, tile_bboxes, coarsest_ges);
+                tile_stems, reconstruct_source_paths, tile_bboxes,
+                reconstruct_source_ges);
             quadtree_root = build_quadtree(grid, opts.hlod_branching_factor);
             has_hlod = quadtree_root.has_content || !quadtree_root.children.empty();
 
@@ -1555,7 +1590,7 @@ int convert_osgb(const ConvertOptions& opts) {
                     std::vector<std::string> source_paths;
                     std::vector<HlodIntermediatePtr> child_intermediates;
                     if (node.level == 0) {
-                        source_paths = node.leaf_coarsest_paths;
+                        source_paths = node.leaf_source_paths;
                     } else {
                         for (auto& child : node.children) {
                             if (child.intermediate) {

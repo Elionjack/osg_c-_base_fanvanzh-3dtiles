@@ -46,6 +46,7 @@ struct HardcodedConfig {
     bool enable_unlit;
     bool enable_top_reconstruct;
     bool hlod_only;
+    int  top_reconstruct_depth;
     int  top_texture_max_size;
     double simplify_ratio;
     int  draco_pos_bits;
@@ -83,6 +84,7 @@ static const HardcodedConfig g_config = {
     /* unlit        */ true,
     /* top_reconstruct */ false,
     /* hlod_only     */ false,
+    /* top_reconstruct_depth */ 0,
     /* top_texture_max_size */ 512,
     /* simplify_ratio */ 0.5,
     /* draco_pos_bits */ 11,
@@ -322,6 +324,7 @@ static void print_usage(const char* prog) {
         "  --enable-unlit          Enable KHR_materials_unlit (default: on for OSGB)\n"
         "  --enable-top-reconstruct  Build a multi-level spatial HLOD hierarchy\n"
         "  --hlod-only            Generate only HLOD GLBs and an HLOD-only tileset.json\n"
+        "  --top-reconstruct-depth N  Source depth for top reconstruction (0=root, 1=children, 2=grandchildren)\n"
         "  --top-texture-max-size N  Max texture dim for root GLB (default: 512, 0=no limit)\n"
         "  --hlod-branching-factor N  Children per HLOD node (default: 16; perfect square >= 4)\n"
         "  --simplify-ratio R      Meshopt target_ratio (default: 0.5, 1.0=no simplify)\n"
@@ -383,6 +386,7 @@ int main(int argc, char* argv[]) {
     opts.enable_unlit            = g_config.enable_unlit;
     opts.enable_top_reconstruct  = g_config.enable_top_reconstruct || g_config.hlod_only;
     opts.hlod_only               = g_config.hlod_only;
+    opts.top_reconstruct_depth   = g_config.top_reconstruct_depth;
     opts.top_texture_max_size    = g_config.top_texture_max_size;
     opts.simplify_ratio          = g_config.simplify_ratio;
     opts.draco_pos_bits          = g_config.draco_pos_bits;
@@ -472,6 +476,8 @@ int main(int argc, char* argv[]) {
         } else if (arg == "--hlod-only") {
             opts.hlod_only = true;
             opts.enable_top_reconstruct = true;
+        } else if (arg == "--top-reconstruct-depth" && i + 1 < argc) {
+            opts.top_reconstruct_depth = std::stoi(argv[++i]);
         } else if (arg == "--top-texture-max-size" && i + 1 < argc) {
             opts.top_texture_max_size = std::stoi(argv[++i]);
         } else if (arg == "--simplify-ratio" && i + 1 < argc) {
