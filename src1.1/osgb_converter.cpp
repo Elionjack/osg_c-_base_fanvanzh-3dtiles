@@ -20,7 +20,6 @@
 #include <functional>
 #include <memory>
 #include <cmath>
-#include <limits>
 #include <cstdint>
 #include <cerrno>
 #include <cstdio>
@@ -834,119 +833,6 @@ static size_t prune_above_max_level(osg_tree& tree, int max_lvl) {
     return removed;
 }
 
-// Return the drawable PagedLOD files at a relative coarse-to-fine depth.
-// Depth 0 is the tile-directory root, depth 1 is its next-coarser frontier,
-// and so on. Structural group nodes do not consume a LOD depth. If one branch
-// ends before the requested depth, retain its finest available drawable so a
-// REPLACE refinement can never make that part of the tile disappear.
-static void collect_source_lod_paths(
-    const osg_tree& tree, int relative_depth, std::vector<std::string>& paths)
-{
-    if (tree.type == 0) {
-        for (const auto& child : tree.sub_nodes)
-            collect_source_lod_paths(child, relative_depth, paths);
-        return;
-    }
-
-    // type=2 is the non-PagedLOD geometry from the same source file. Loading
-    // the type=1 OSGB already gives the HLOD merger the intended coarse model,
-    // so do not add the same file a second time here.
-    if (tree.type != 1) return;
-
-    std::vector<const osg_tree*> next_lod;
-    std::function<void(const osg_tree&)> collect_next;
-    collect_next = [&](const osg_tree& candidate) {
-        if (candidate.type == 1) {
-            next_lod.push_back(&candidate);
-        } else if (candidate.type == 0) {
-            for (const auto& child : candidate.sub_nodes)
-                collect_next(child);
-        }
-    };
-    for (const auto& child : tree.sub_nodes)
-        collect_next(child);
-
-    if (relative_depth > 0 && !next_lod.empty()) {
-        for (const osg_tree* child : next_lod)
-            collect_source_lod_paths(*child, relative_depth - 1, paths);
-        return;
-    }
-
-    auto append_unique = [&paths](const std::string& path) {
-        if (!path.empty()
-            && std::find(paths.begin(), paths.end(), path) == paths.end()) {
-            paths.push_back(path);
-        }
-    };
-    if (!tree.aggregate_sources.empty()) {
-        for (const auto& source : tree.aggregate_sources)
-            append_unique(source);
-    } else {
-        append_unique(tree.file_name);
-    }
-}
-
-static void collect_hlod_leaf_stems(
-    const QuadNode& node, std::vector<std::string>& stems)
-{
-    if (node.level == 0) {
-        stems.insert(stems.end(), node.leaf_stems.begin(), node.leaf_stems.end());
-        return;
-    }
-    for (const auto& child : node.children)
-        collect_hlod_leaf_stems(child, stems);
-}
-
-// The spatial hierarchy height determines exactly how many relative source
-// LOD frontiers progressive HLOD can consume. This mirrors build_quadtree():
-// branching 4 pads to powers of 2, branching 16 to powers of 4, etc.
-static int calculate_hlod_source_max_depth(
-    const std::vector<Phase1TreeResult>& trees, int branching_factor)
-{
-    bool initialized = false;
-    int min_x = 0, max_x = 0, min_y = 0, max_y = 0;
-    for (const auto& tree : trees) {
-        if (!is_valid_tile_box(tree.root.bbox)) continue;
-        int x = 0, y = 0;
-        if (!parse_tile_grid_coords(tree.stem, x, y)) continue;
-        if (!initialized) {
-            min_x = max_x = x;
-            min_y = max_y = y;
-            initialized = true;
-        } else {
-            min_x = std::min(min_x, x);
-            max_x = std::max(max_x, x);
-            min_y = std::min(min_y, y);
-            max_y = std::max(max_y, y);
-        }
-    }
-    if (!initialized) return 0;
-
-    const long long width = static_cast<long long>(max_x) - min_x + 1;
-    const long long height = static_cast<long long>(max_y) - min_y + 1;
-    const long long max_dimension = std::max(width, height);
-    if (max_dimension <= 1) return 0;
-
-    const int branch_side = static_cast<int>(
-        std::sqrt(static_cast<double>(branching_factor)));
-    long long padded_size = branch_side;
-    int root_level = 0;
-    while (padded_size < max_dimension) {
-        if (padded_size > std::numeric_limits<long long>::max() / branch_side)
-            break;
-        padded_size *= branch_side;
-        ++root_level;
-    }
-    return root_level;
-}
-
-// In progressive (non-Git HEAD) mode, offset 0 preserves the historical
-// Root-first sequence. A positive offset means "skip N numbered LODs after
-// Root": for Root -> L14 -> L15 -> ... an offset of 5 starts at L19.
-static int progressive_source_lod_start_depth(int level_offset) {
-    return level_offset > 0 ? level_offset + 1 : 0;
-}
-
 static bool collect_finest_leaf_sources(
     const osg_tree& tree,
     size_t max_sources,
@@ -1057,16 +943,6 @@ int convert_osgb(const ConvertOptions& opts) {
         LOG_E("hlod_only requires enable_top_reconstruct");
         return 1;
     }
-    if (opts.git_head_top_reconstruct_level_offset < 0) {
-        LOG_E("--git-head-top-reconstruct-level-offset must be >= 0; got %d",
-              opts.git_head_top_reconstruct_level_offset);
-        return 1;
-    }
-    if (opts.git_head_top_reconstruct_level_offset > 0
-        && !opts.enable_top_reconstruct) {
-        LOG_E("--git-head-top-reconstruct-level-offset requires --enable-top-reconstruct (or --hlod-only)");
-        return 1;
-    }
     if (opts.enable_top_reconstruct) {
         if (opts.hlod_branching_factor < 4) {
             LOG_E("--hlod-branching-factor must be a perfect square >= 4 (for example 4, 9, or 16); got %d",
@@ -1160,10 +1036,9 @@ int convert_osgb(const ConvertOptions& opts) {
     int max_lvl = (opts.max_lvl != 100) ? opts.max_lvl : cfg_max_lvl;
 
     LOG_I("Conversion parameters: center=(%.10f, %.10f), max_lvl=%d", center_x, center_y, max_lvl);
-    LOG_I("Features: texture_compress=%d, meshopt=%d, draco=%d, unlit=%d, top_reconstruct=%d, git_head_top_reconstruct=%d, git_head_level_offset=%d, hlod_only=%d, fine_merge=%d, skip_bad_tiles=%d, tile_read_timeout=%d, tile_reader_processes=%d",
+    LOG_I("Features: texture_compress=%d, meshopt=%d, draco=%d, unlit=%d, top_reconstruct=%d, hlod_only=%d, fine_merge=%d, skip_bad_tiles=%d, tile_read_timeout=%d, tile_reader_processes=%d",
           opts.enable_texture_compress, opts.enable_meshopt, opts.enable_draco, opts.enable_unlit,
-          opts.enable_top_reconstruct, opts.use_git_head_top_reconstruct,
-          opts.git_head_top_reconstruct_level_offset, opts.hlod_only, opts.enable_fine_merge,
+          opts.enable_top_reconstruct, opts.hlod_only, opts.enable_fine_merge,
           opts.skip_bad_tiles, opts.tile_read_timeout, opts.tile_reader_processes);
 
     // ============================================================
@@ -1268,10 +1143,12 @@ int convert_osgb(const ConvertOptions& opts) {
             try {
                 osg_tree root;
                 if (opts.hlod_only) {
-                    // First pass: probe only the coarsest root for corrected
-                    // bounds. Once all successful roots are known, their actual
-                    // spatial hierarchy height determines a bounded tree scan.
-                    LOG_I("Phase 1 HLOD-only - Probing coarsest source: %s",
+                    // HLOD consumes only the coarsest root OSGB for each spatial
+                    // source tile. Avoid discovering/loading its PagedLOD children.
+                    // Use the existing GLB conversion path once to preserve the
+                    // exact corrected geometry bounds used by the normal pipeline;
+                    // discard the buffer and retain only the bounds for the grid.
+                    LOG_I("Phase 1 HLOD-only - Loading coarsest source: %s",
                           osgb_path.c_str());
                     std::string probe_glb;
                     MeshInfo minfo;
@@ -1366,85 +1243,6 @@ int convert_osgb(const ConvertOptions& opts) {
               all_trees.size());
     }
 
-    if (all_trees.empty()) {
-        LOG_E("No tile trees were built");
-        return 1;
-    }
-
-    // HLOD-only does not emit the ordinary detail tree. Discover only the
-    // relative source levels that the actual spatial HLOD can consume, rather
-    // than recursively opening every finest PagedLOD descendant.
-    if (opts.hlod_only && !opts.use_git_head_top_reconstruct) {
-        const int spatial_source_max_depth = calculate_hlod_source_max_depth(
-            all_trees, opts.hlod_branching_factor);
-        const int source_start_depth = progressive_source_lod_start_depth(
-            opts.git_head_top_reconstruct_level_offset);
-        const int source_max_depth = source_start_depth + spatial_source_max_depth;
-        LOG_I("Phase 1 HLOD-only bounded scan: %d spatial HLOD levels consume source depths %d..%d (offset=%d)",
-              spatial_source_max_depth + 1, source_start_depth, source_max_depth,
-              opts.git_head_top_reconstruct_level_offset);
-
-        if (source_max_depth > 0) {
-            auto scan_one_tree = [&](size_t index) {
-                auto& result = all_trees[index];
-                const TileBox root_bbox = result.root.bbox;
-                std::string path_copy = result.root.file_name;
-                osg_tree bounded_tree = get_all_tree(
-                    path_copy, opts.skip_bad_tiles, record_bad_input,
-                    source_max_depth);
-                if (bounded_tree.file_name.empty()) {
-                    LOG_E("Failed bounded HLOD source scan: %s", path_copy.c_str());
-                    result.root = {};
-                    return;
-                }
-                bounded_tree.bbox = root_bbox;
-                result.root = std::move(bounded_tree);
-            };
-
-            if (opts.enable_parallel) {
-                unsigned int n_threads = opts.num_threads > 0
-                    ? static_cast<unsigned int>(opts.num_threads)
-                    : std::thread::hardware_concurrency();
-                const unsigned int scan_threads = std::max(
-                    1u, std::min(n_threads, 4u));
-                Semaphore sem(scan_threads);
-                std::vector<std::future<void>> futures;
-                futures.reserve(all_trees.size());
-                for (size_t index = 0; index < all_trees.size(); ++index) {
-                    futures.push_back(std::async(
-                        std::launch::async, [&sem, &scan_one_tree, index]() {
-                            sem.acquire();
-                            try {
-                                scan_one_tree(index);
-                            } catch (...) {
-                                sem.release();
-                                throw;
-                            }
-                            sem.release();
-                        }));
-                }
-                for (auto& future : futures) future.get();
-            } else {
-                for (size_t index = 0; index < all_trees.size(); ++index)
-                    scan_one_tree(index);
-            }
-
-            all_trees.erase(
-                std::remove_if(
-                    all_trees.begin(), all_trees.end(),
-                    [](const Phase1TreeResult& result) {
-                        return result.root.file_name.empty();
-                    }),
-                all_trees.end());
-        }
-
-        size_t discovered_nodes = 0;
-        for (const auto& tree : all_trees)
-            discovered_nodes += count_tree_nodes(tree.root);
-        LOG_I("Phase 1 HLOD-only bounded scan complete: %zu source nodes retained across %zu tile directories",
-              discovered_nodes, all_trees.size());
-    }
-
     if (opts.skip_bad_tiles) {
         std::sort(bad_inputs.begin(), bad_inputs.end(),
                   [](const BadInput& a, const BadInput& b) {
@@ -1478,7 +1276,7 @@ int convert_osgb(const ConvertOptions& opts) {
     }
 
     if (all_trees.empty()) {
-        LOG_E("No usable tile trees remained after HLOD source scanning");
+        LOG_E("No tile trees were built");
         return 1;
     }
 
@@ -1530,7 +1328,7 @@ int convert_osgb(const ConvertOptions& opts) {
     }
 
     if (opts.hlod_only) {
-        LOG_I("Phase 2 HLOD-only: source LOD trees discovered; no detail GLB writes");
+        LOG_I("Phase 2 HLOD-only: bounds already loaded; no detail tree scan or detail GLB writes");
     } else if (opts.enable_parallel) {
         const size_t CHUNK_SIZE = 16;
         size_t num_chunks = (all_tiles.size() + CHUNK_SIZE - 1) / CHUNK_SIZE;
@@ -1674,11 +1472,6 @@ int convert_osgb(const ConvertOptions& opts) {
         }
 
         calc_geometric_error(tr.root);
-        if (opts.hlod_only) {
-            // Descendant bounds are intentionally not converted/probed in this
-            // mode, so derive the source-cell baseline from the valid root box.
-            tr.root.geometricError = get_geometric_error(tr.root.bbox);
-        }
 
         if (opts.hlod_only) {
             std::vector<double> box_full;
@@ -1718,8 +1511,7 @@ int convert_osgb(const ConvertOptions& opts) {
 
     // ============================================================
     // Phase 4: Multi-level spatial HLOD construction (if enabled)
-    //           Each top-down HLOD depth consumes the matching coarse-to-fine
-    //           source frontier: root=coarsest, child=next-coarsest, ...
+    //           Builds spatial grid -> configurable N-tree -> merged GLB per level
     // ============================================================
     QuadNode quadtree_root;
     bool has_hlod = false;
@@ -1755,12 +1547,6 @@ int convert_osgb(const ConvertOptions& opts) {
 
                 std::function<void(QuadNode&)> merge_node;
                 const int root_level = quadtree_root.level;
-                std::map<std::string, const osg_tree*> source_trees;
-                if (!opts.use_git_head_top_reconstruct) {
-                    for (const auto& tr : all_trees)
-                        source_trees[tr.stem] = &tr.root;
-                }
-
                 merge_node = [&](QuadNode& node) {
                     for (auto& child : node.children) {
                         merge_node(child);
@@ -1768,37 +1554,20 @@ int convert_osgb(const ConvertOptions& opts) {
 
                     std::vector<std::string> source_paths;
                     std::vector<HlodIntermediatePtr> child_intermediates;
-                    if (opts.use_git_head_top_reconstruct) {
-                        if (node.level == 0) {
-                            source_paths = node.leaf_coarsest_paths;
-                        } else {
-                            for (auto& child : node.children) {
-                                if (child.intermediate) {
-                                    child_intermediates.push_back(child.intermediate);
-                                } else {
-                                    collect_leaf_paths(child, grid, source_paths);
-                                }
-                            }
-                        }
+                    if (node.level == 0) {
+                        source_paths = node.leaf_coarsest_paths;
                     } else {
-                        std::vector<std::string> node_stems;
-                        collect_hlod_leaf_stems(node, node_stems);
-                        node.source_lod_depth = progressive_source_lod_start_depth(
-                            opts.git_head_top_reconstruct_level_offset)
-                            + root_level - node.level;
-                        for (const auto& stem : node_stems) {
-                            auto source_it = source_trees.find(stem);
-                            if (source_it == source_trees.end()) {
-                                LOG_W("HLOD merge: source tree not found for %s", stem.c_str());
-                                continue;
+                        for (auto& child : node.children) {
+                            if (child.intermediate) {
+                                child_intermediates.push_back(child.intermediate);
+                            } else {
+                                collect_leaf_paths(child, grid, source_paths);
                             }
-                            collect_source_lod_paths(
-                                *source_it->second, node.source_lod_depth, source_paths);
                         }
                     }
 
                     if (source_paths.empty() && child_intermediates.empty()) {
-                        LOG_W("HLOD merge: level %d node at (%d,%d) has no inputs, skipping",
+                        LOG_W("HLOD merge: level %d node at (%d,%d) has no coarse inputs, skipping",
                               node.level, node.grid_x, node.grid_y);
                         node.has_content = false;
                         return;
@@ -1815,32 +1584,20 @@ int convert_osgb(const ConvertOptions& opts) {
                         glb_name = buf;
                     }
 
-                    if (opts.use_git_head_top_reconstruct) {
-                        LOG_I("HLOD merge [Git HEAD]: %s (level=%d, branching=%d, %zu OSGB fallbacks, %zu direct child models, grid=(%d,%d) size=%d)",
-                              glb_name.c_str(), node.level, opts.hlod_branching_factor,
-                              source_paths.size(), child_intermediates.size(),
-                              node.grid_x, node.grid_y, node.grid_size);
-                    } else {
-                        LOG_I("HLOD merge: %s (spatial-level=%d, source-lod-depth=%d, branching=%d, %zu source OSGBs, grid=(%d,%d) size=%d)",
-                              glb_name.c_str(), node.level, node.source_lod_depth,
-                              opts.hlod_branching_factor, source_paths.size(),
-                              node.grid_x, node.grid_y, node.grid_size);
-                    }
+                    LOG_I("HLOD merge: %s (level=%d, branching=%d, %zu OSGB fallbacks, %zu direct child models, grid=(%d,%d) size=%d)",
+                          glb_name.c_str(), node.level, opts.hlod_branching_factor,
+                          source_paths.size(), child_intermediates.size(),
+                          node.grid_x, node.grid_y, node.grid_size);
 
                     std::string glb_buf;
                     TileBox merged_bbox;
-                    const int hlod_level = node.level + 1
-                        + (opts.use_git_head_top_reconstruct
-                            ? opts.git_head_top_reconstruct_level_offset
-                            : 0);
                     bool ok = build_merged_glb(
-                        source_paths, hlod_level, glb_buf, merged_bbox,
+                        source_paths, node.level + 1, glb_buf, merged_bbox,
                         opts.enable_texture_compress, opts.enable_meshopt,
                         opts.enable_draco, opts.enable_unlit,
                         opts.top_texture_max_size, opts.simplify_ratio,
                         opts.draco_pos_bits, opts.draco_normal_bits, opts.draco_uv_bits,
-                        opts.ktx2_quality, child_intermediates,
-                        opts.use_git_head_top_reconstruct ? &node.intermediate : nullptr,
+                        opts.ktx2_quality, child_intermediates, &node.intermediate,
                         opts.hlod_branching_factor);
 
                     // The carrier GLB above is deliberately unsimplified and
@@ -1848,6 +1605,7 @@ int convert_osgb(const ConvertOptions& opts) {
                     // first, then run the original level simplification,
                     // texture compression and Draco exactly once.
                     if (ok && !glb_buf.empty()) {
+                        const int hlod_level = node.level + 1;
                         const double target_ratio = opts.enable_meshopt
                             ? calc_level_ratio(hlod_level, opts.simplify_ratio,
                                                opts.hlod_branching_factor)
@@ -1876,9 +1634,8 @@ int convert_osgb(const ConvertOptions& opts) {
                         }
                     }
 
-                    if (opts.use_git_head_top_reconstruct) {
-                        for (auto& child : node.children)
-                            child.intermediate.reset();
+                    for (auto& child : node.children) {
+                        child.intermediate.reset();
                     }
 
                     if (ok && !glb_buf.empty()) {
@@ -1900,8 +1657,7 @@ int convert_osgb(const ConvertOptions& opts) {
                               node.level, node.grid_x, node.grid_y);
                         node.has_content = false;
                         node.glb_uri.clear();
-                        if (opts.use_git_head_top_reconstruct)
-                            node.intermediate.reset();
+                        node.intermediate.reset();
                     }
                 };
 
@@ -2028,8 +1784,7 @@ int convert_osgb(const ConvertOptions& opts) {
         json quadtree_json = encode_quadtree_json(
             quadtree_root, opts.hlod_only ? std::map<std::string, json>{} : tile_jsons_map,
             out_dir_str,
-            opts.enable_split_json,
-            opts.use_git_head_top_reconstruct);
+            opts.enable_split_json);
 
         // Add ECEF transform to root
         quadtree_json["transform"] = trans_vec;

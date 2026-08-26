@@ -39,17 +39,11 @@ struct ConvertOptions {
     int  fine_merge_max_sources = 16;  // max leaf OSGB files in one aggregate
     int  fine_merge_max_input_mb = 64; // max total source bytes in one aggregate
 
-    // Progressive top reconstruction: spatial HLOD depths consume matching
-    // source frontiers (coarsest, next-coarsest, next-next-coarsest, ...).
+    // Root tile reconstruction (merge coarsest LODs into overview GLB)
     bool enable_top_reconstruct = false;
-    bool use_git_head_top_reconstruct = false; // use the Git HEAD child-intermediate HLOD algorithm
-    // Non-Git mode: skip this many numbered source LOD frontiers after Root
-    // before building the first HLOD. Git HEAD mode: shift HLOD build-quality
-    // settings by this many levels (legacy behavior).
-    int  git_head_top_reconstruct_level_offset = 0;
     int  top_texture_max_size = 512;  // max texture dimension for root GLB (0=no limit)
     int  hlod_branching_factor = 16; // spatial children per HLOD node (perfect square, e.g. 4 or 16)
-    int  hlod_max_source_tiles = 16;  // compatibility option; progressive HLOD keeps all sources
+    int  hlod_max_source_tiles = 16;  // max source tiles merged into one HLOD GLB (0=unlimited)
     double simplify_ratio = 0.5;       // meshopt target_ratio (1.0=no simplify)
     int  draco_pos_bits = 11;          // Draco position quantization bits
     int  draco_normal_bits = 10;       // Draco normal quantization bits

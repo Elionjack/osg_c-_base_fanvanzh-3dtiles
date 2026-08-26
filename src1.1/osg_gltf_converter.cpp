@@ -273,8 +273,7 @@ public:
 osg_tree get_all_tree(
     std::string& file_name,
     bool skip_bad_nodes,
-    const TreeFailureCallback& on_failure,
-    int max_relative_depth) {
+    const TreeFailureCallback& on_failure) {
     try {
         osg_tree root_tile;
         vector<string> fileNames = { file_name };
@@ -300,20 +299,14 @@ osg_tree get_all_tree(
     // structure (sub_node_names).  Phase 2 loads each tile from disk on demand
     // and frees it after conversion, keeping memory bounded.
 
-        if (max_relative_depth != 0) {
-            const int child_max_depth = max_relative_depth > 0
-                ? max_relative_depth - 1
-                : -1;
-            for (auto& i : infoVisitor.sub_node_names) {
-                osg_tree tree = get_all_tree(
-                    i, skip_bad_nodes, on_failure, child_max_depth);
-                if (!tree.file_name.empty()) {
-                    if (tree.type == 0) {
-                        for (auto& node : tree.sub_nodes)
-                            root_tile.sub_nodes.push_back(node);
-                    } else {
-                        root_tile.sub_nodes.push_back(tree);
-                    }
+        for (auto& i : infoVisitor.sub_node_names) {
+            osg_tree tree = get_all_tree(i, skip_bad_nodes, on_failure);
+            if (!tree.file_name.empty()) {
+                if (tree.type == 0) {
+                    for (auto& node : tree.sub_nodes)
+                        root_tile.sub_nodes.push_back(node);
+                } else {
+                    root_tile.sub_nodes.push_back(tree);
                 }
             }
         }
@@ -2835,54 +2828,6 @@ bool has_tile_content(const nlohmann::json& tile) {
         && !tile["content"]["uri"].get_ref<const std::string&>().empty();
 }
 
-// Collect the drawable JSON frontier at a coarse-to-fine depth. Index-only
-// wrappers are transparent and do not consume a level. A short source branch
-// is clamped to its last drawable tile so REPLACE refinement preserves it.
-void collect_json_lod_frontier(
-    const nlohmann::json& tile, int target_depth,
-    std::vector<nlohmann::json>& frontier)
-{
-    if (!tile.is_object()) return;
-
-    const bool drawable = has_tile_content(tile);
-    const bool has_children = tile.contains("children")
-        && tile["children"].is_array()
-        && !tile["children"].empty();
-
-    if (drawable && target_depth <= 0) {
-        frontier.push_back(tile);
-        return;
-    }
-    if (!has_children) {
-        if (drawable) frontier.push_back(tile);
-        return;
-    }
-
-    const size_t before = frontier.size();
-    const int child_depth = drawable ? target_depth - 1 : target_depth;
-    for (const auto& child : tile["children"])
-        collect_json_lod_frontier(child, child_depth, frontier);
-
-    if (drawable && frontier.size() == before)
-        frontier.push_back(tile);
-}
-
-nlohmann::json make_frontier_root(
-    const nlohmann::json& original_root,
-    const std::vector<nlohmann::json>& frontier)
-{
-    if (frontier.empty()) return nlohmann::json();
-    if (frontier.size() == 1) return frontier.front();
-
-    nlohmann::json root;
-    root["geometricError"] = kIndexOnlyGeometricError;
-    root["refine"] = "REPLACE";
-    if (original_root.contains("boundingVolume"))
-        root["boundingVolume"] = original_root["boundingVolume"];
-    root["children"] = frontier;
-    return root;
-}
-
 // Recursively remove consecutive index-only child levels.  The current tile
 // is retained because it may be the root of a tileset and carry its transform,
 // but index-only children are replaced by their already-normalized children.
@@ -2930,12 +2875,10 @@ nlohmann::json encode_quadtree_json(
     const QuadNode& node,
     const std::map<std::string, nlohmann::json>& tile_jsons,
     const std::string& output_dir,
-    bool externalize_pagedlod,
-    bool use_git_head_top_reconstruct)
+    bool externalize_pagedlod)
 {
-    // Level 0: finest reconstructed spatial level. Its proxy has already
-    // consumed source_lod_depth, so attach each PagedLOD tree beginning at the
-    // next unconsumed coarse-to-fine frontier.
+    // Level 0: first merge level — generate JSON with HLOD content and
+    // PagedLOD root tiles as children (looked up from tile_jsons_map).
     if (node.level == 0) {
         nlohmann::json tile;
         tile["geometricError"] = node.geometricError;
@@ -2958,18 +2901,9 @@ nlohmann::json encode_quadtree_json(
             auto it = tile_jsons.find(stem);
             if (it == tile_jsons.end()) continue;
 
-            std::vector<nlohmann::json> frontier;
-            if (!use_git_head_top_reconstruct) {
-                collect_json_lod_frontier(
-                    it->second, node.source_lod_depth + 1, frontier);
-                if (frontier.empty()) continue;
-            }
-
             if (externalize_pagedlod && !output_dir.empty()) {
                 // --- Externalize: write subtilesets/<stem>.json ---
-                nlohmann::json tree_copy = use_git_head_top_reconstruct
-                    ? it->second
-                    : make_frontier_root(it->second, frontier);
+                nlohmann::json tree_copy = it->second;
 
                 // Rewrite content URIs so they resolve from subtilesets/
                 std::function<void(nlohmann::json&)> rewrite;
@@ -3002,21 +2936,17 @@ nlohmann::json encode_quadtree_json(
                 // Build a lightweight reference tile for the quadtree
                 nlohmann::json ref_tile;
                 // Use the tile's own boundingVolume if present, else fall back
-                if (it->second.contains("boundingVolume"))
-                    ref_tile["boundingVolume"] = it->second["boundingVolume"];
+                if (tree_copy.contains("boundingVolume"))
+                    ref_tile["boundingVolume"] = tree_copy["boundingVolume"];
                 else
                     ref_tile["boundingVolume"]["box"] = convert_bbox(node.bbox);
                 ref_tile["content"]["uri"] = "./subtilesets/" + stem + ".json";
-                ref_tile["geometricError"] = it->second.value("geometricError", 0.0);
+                ref_tile["geometricError"] = tree_copy.value("geometricError", 0.0);
                 ref_tile["refine"] = "REPLACE";
                 tile["children"].push_back(ref_tile);
             } else {
-                if (use_git_head_top_reconstruct) {
-                    tile["children"].push_back(it->second);
-                } else {
-                    for (auto& frontier_tile : frontier)
-                        tile["children"].push_back(std::move(frontier_tile));
-                }
+                // Original inline behavior
+                tile["children"].push_back(it->second);
             }
         }
         finalize_index_only_tile(tile);
@@ -3040,8 +2970,7 @@ nlohmann::json encode_quadtree_json(
         tile["children"] = nlohmann::json::array();
         for (const auto& child : node.children) {
             nlohmann::json child_json = encode_quadtree_json(
-                child, tile_jsons, output_dir, externalize_pagedlod,
-                use_git_head_top_reconstruct);
+                child, tile_jsons, output_dir, externalize_pagedlod);
             if (!child_json.empty()) {
                 tile["children"].push_back(child_json);
             }

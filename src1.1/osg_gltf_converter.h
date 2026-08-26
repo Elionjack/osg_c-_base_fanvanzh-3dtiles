@@ -54,16 +54,13 @@ struct osg_tree {
     bool content_written = false;
 };
 
-// Get an OSGB tile tree starting from a root file. max_relative_depth < 0
-// scans the complete tree; 0 reads only the root; positive values bound the
-// recursive PagedLOD scan. In tolerant mode malformed descendants are omitted
-// and reported through on_failure.
+// Get full OSGB tile tree starting from a root file. In tolerant mode,
+// malformed descendants are omitted and reported through on_failure.
 using TreeFailureCallback = std::function<void(const std::string&, const std::string&)>;
 osg_tree get_all_tree(
     std::string& file_name,
     bool skip_bad_nodes = false,
-    const TreeFailureCallback& on_failure = {},
-    int max_relative_depth = -1);
+    const TreeFailureCallback& on_failure = {});
 
 // Core: convert a pre-loaded OSG Node to GLB buffer.
 // Unlike osgb2glb_buf(), this does NOT call osgDB::readNodeFiles() —
@@ -186,7 +183,6 @@ struct QuadNode {
     int grid_y = 0;
     int grid_size = 0;           // square region side length in grid cells
     int level = 0;               // 0 = finest (leaf), higher = coarser
-    int source_lod_depth = 0;    // root=0 (coarsest), child=1, grandchild=2, ...
     std::string stem;            // tile stem (only for leaf nodes, e.g. "Tile_-001_+050")
     TileBox bbox;                // bounding box (union of children or from merge)
     double geometricError = 0.0;
@@ -254,8 +250,7 @@ nlohmann::json encode_quadtree_json(
     const QuadNode& node,
     const std::map<std::string, nlohmann::json>& tile_jsons,
     const std::string& output_dir = "",
-    bool externalize_pagedlod = false,
-    bool use_git_head_top_reconstruct = false);
+    bool externalize_pagedlod = false);
 
 // Returns the coarsest-LOD file for a tile tree: the tree root
 // (file without _Lxx suffix). Optionally outputs its geometricError.
